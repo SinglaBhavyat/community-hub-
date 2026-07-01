@@ -1,0 +1,199 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────
+// Community Hub — Firestore Security Rules
+//
+// This is the most likely root cause of "other authenticated users cannot
+// view Lost & Found posts": a rule that scoped `allow read` to the post's
+// own author (e.g. `resource.data.authorEmail == request.auth.token.email`)
+// instead of to any signed-in user. That makes onSnapshot() throw
+// permission-denied for everyone except the author, which the client then
+// shows as an empty/error feed.
+//
+// Fix: any authenticated user can READ lost_found posts; only the owner or
+// an admin can WRITE (create is allowed for any signed-in user, since
+// that's how new reports get submitted in the first place — but the
+// authorEmail/authorUid on the new doc must match the requester, so people
+// can't post on someone else's behalf).
+// ─────────────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.token.email)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.token.email)).data.role == 'admin';
+    }
+
+    function isOwner(data) {
+      return isSignedIn() && (
+        data.authorEmail == request.auth.token.email ||
+        data.authorUid   == request.auth.uid
+      );
+    }
+
+    // ── Lost & Found ─────────────────────────────────────────────────────
+    match /lost_found/{itemId} {
+      // Any authenticated user can view the feed — this is the fix for the
+      // "other users can't see posts" bug.
+      allow read: if isSignedIn();
+
+      // Anyone signed in can report an item, but only as themselves.
+      allow create: if isSignedIn() &&
+        request.resource.data.authorEmail == request.auth.token.email;
+
+      // Only the post's owner or an admin can edit/resolve/delete it.
+      // `resource.data` is the EXISTING document — this is what stops a
+      // non-owner from updating or deleting someone else's post even if
+      // they craft the request by hand.
+      allow update, delete: if isOwner(resource.data) || isAdmin();
+    }
+
+    // ── Reports (moderation queue) ───────────────────────────────────────
+    match /reports/{reportId} {
+      // Reports contain moderation-sensitive info (who reported whom) —
+      // only admins should be able to read the queue. Reporters get a
+      // client-side success toast on create; they don't need read access.
+      allow read: if isAdmin();
+
+      // Any signed-in user can file a report, but only attributed to
+      // themselves, and never pre-resolved.
+      allow create: if isSignedIn() &&
+        request.resource.data.reporterEmail == request.auth.token.email &&
+        request.resource.data.status == 'Pending';
+
+      // Only admins can update (dismiss/resolve) or delete reports.
+      allow update, delete: if isAdmin();
+    }
+
+    // ── Users ────────────────────────────────────────────────────────────
+    match /users/{userEmail} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.token.email == userEmail;
+      // Users can edit their own profile fields, but never their own role —
+      // that would let anyone self-promote to admin. Only an existing admin
+      // can change `role`.
+      allow update: if isAdmin() || (
+        isSignedIn() && request.auth.token.email == userEmail &&
+        request.resource.data.role == resource.data.role
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ── Messages ─────────────────────────────────────────────────────────
+    match /messages/{messageId} {
+      allow read: if isSignedIn() && (
+        resource.data.to   == request.auth.token.email ||
+        resource.data.from == request.auth.token.email
+      );
+      allow create: if isSignedIn() &&
+        request.resource.data.from == request.auth.token.email;
+      allow update, delete: if isSignedIn() &&
+        resource.data.to == request.auth.token.email;
+    }
+
+    // ── Audit logs (admin panel) ─────────────────────────────────────────
+    match /audit_logs/{logId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false; // audit trail is append-only
+    }
+
+    // ── Platform settings (admin panel) ──────────────────────────────────
+    // FIX: must be publicly readable (no auth required) because main.js
+    // reads the maintenanceMode flag BEFORE the user is signed in.
+    // If this requires isSignedIn(), the onSnapshot() in main.js gets
+    // permission-denied on every cold load, the listener errors out, and
+    // the homepage never renders (blank page).
+    match /platform_settings/{settingId} {
+      allow read: if true;          // public — only contains the maintenance flag
+      allow write: if isAdmin();
+    }
+
+    // ── Posts ─────────────────────────────────────────────────────────────
+    // FIX: missing rules caused permission-denied when the report modal
+    // tried to increment reportCount on a post doc, breaking the report
+    // submission flow entirely.
+    match /posts/{postId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+        request.resource.data.authorEmail == request.auth.token.email;
+      allow update: if isOwner(resource.data) || isAdmin() ||
+        // Allow any signed-in user to update only aggregate counters
+        // (upvotes, reportCount, commentCount) — not author/content fields.
+        (isSignedIn() &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
+      allow delete: if isOwner(resource.data) || isAdmin();
+    }
+
+    // ── Events & Polls ────────────────────────────────────────────────────
+    match /events/{eventId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+        request.resource.data.authorEmail == request.auth.token.email;
+      allow update: if isOwner(resource.data) || isAdmin() ||
+        (isSignedIn() &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
+      allow delete: if isOwner(resource.data) || isAdmin();
+    }
+
+
+    // ── Chats ─────────────────────────────────────────────────────────────
+    // FIX: chat.js reads/writes chats, chats/{id}/messages, and
+    // chats/{id}/typing — all were missing rules, causing permission-denied
+    // on recent chats, room messages, and send failures.
+    match /chats/{chatId} {
+      allow read: if isSignedIn() &&
+        (resource == null || resource.data.members.hasAny([request.auth.token.email]));
+      allow create: if isSignedIn() &&
+        request.resource.data.members.hasAny([request.auth.token.email]);
+      allow update: if isSignedIn() &&
+        resource.data.members.hasAny([request.auth.token.email]);
+      allow delete: if isSignedIn() &&
+        resource.data.members.hasAny([request.auth.token.email]);
+
+      // ── Messages subcollection ────────────────────────────────────────
+      match /messages/{messageId} {
+        allow read: if isSignedIn() &&
+          get(/databases/$(database)/documents/chats/$(chatId)).data.members
+            .hasAny([request.auth.token.email]);
+        allow create: if isSignedIn() &&
+          get(/databases/$(database)/documents/chats/$(chatId)).data.members
+            .hasAny([request.auth.token.email]) &&
+          request.resource.data.senderEmail == request.auth.token.email;
+        allow update, delete: if isSignedIn() && (
+          resource.data.senderEmail == request.auth.token.email ||
+          get(/databases/$(database)/documents/chats/$(chatId)).data.members
+            .hasAny([request.auth.token.email]) ||
+          isAdmin()
+        );
+      }
+
+      // ── Typing indicators subcollection ──────────────────────────────
+      match /typing/{userEmail} {
+        allow read: if isSignedIn() &&
+          get(/databases/$(database)/documents/chats/$(chatId)).data.members
+            .hasAny([request.auth.token.email]);
+        allow write: if isSignedIn() && request.auth.token.email == userEmail;
+      }
+    }
+
+    // ── Comments ──────────────────────────────────────────────────────────
+    match /comments/{commentId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+        request.resource.data.authorEmail == request.auth.token.email;
+      allow update: if isOwner(resource.data) || isAdmin() ||
+        (isSignedIn() &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['authorEmail', 'authorUid', 'content']));
+      allow delete: if isOwner(resource.data) || isAdmin();
+    }
+  }
+}

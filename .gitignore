@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Firebase local
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
+.runtimeconfig.json
+
+# Node (only relevant if you ever add tooling)
+node_modules/
+npm-debug.log*
+
+# Env
+.env
+.env.local

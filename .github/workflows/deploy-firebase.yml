@@ -1,0 +1,25 @@
+name: Deploy to Firebase Hosting
+
+# Requires a repo secret named FIREBASE_SERVICE_ACCOUNT containing the JSON
+# key of a Firebase service account with the "Firebase Hosting Admin" role.
+# See README.md for setup steps.
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy to Firebase Hosting (live channel)
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
+          channelId: live
+          projectId: community-45e72
