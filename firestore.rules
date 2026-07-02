@@ -184,15 +184,37 @@ service cloud.firestore {
       }
     }
 
-    // ── Comments ──────────────────────────────────────────────────────────
-    match /comments/{commentId} {
+    // ── Comments (subcollection under posts) ─────────────────────────────
+    // FIX: comments.js reads/writes posts/{postId}/comments/{commentId}
+    // (a subcollection), but the previous rule covered only a top-level
+    // /comments/{commentId} collection that the app never uses. Because
+    // Firestore denies by default when no rule matches, every addDoc/
+    // onSnapshot/updateDoc call on the subcollection threw permission-denied,
+    // making it impossible to post or view comments on any post.
+    //
+    // Secondary fix: the update rule now explicitly allows any signed-in
+    // user to update likes, likedBy, reactions, and replies — the fields
+    // that change when anyone likes or reacts to a comment — without being
+    // the comment's author.  It still blocks edits to author/text fields
+    // unless the requester is the owner or an admin.
+    match /posts/{postId}/comments/{commentId} {
+      // Any signed-in user can read comments on any post.
       allow read: if isSignedIn();
+
+      // Only the signed-in user can create a comment attributed to themselves.
       allow create: if isSignedIn() &&
         request.resource.data.authorEmail == request.auth.token.email;
+
+      // Owner and admin can change anything.
+      // Any other signed-in user may update ONLY social fields
+      // (likes, likedBy, reactions, replies, commentCount, pinned)
+      // but NOT the author identity or the comment text.
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['authorEmail', 'authorUid', 'content']));
+            .hasAny(['authorEmail', 'authorUid', 'text', 'author']));
+
+      // Only owner or admin can delete.
       allow delete: if isOwner(resource.data) || isAdmin();
     }
   }
