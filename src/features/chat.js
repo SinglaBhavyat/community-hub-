@@ -19,6 +19,8 @@ let activeRoomId         = null;
 let activeRoomDetails    = null;
 let cachedUsersHTML      = null;
 let cachedUsersData      = null;
+let cachedUsersAt        = 0;    // FIX: timestamp of last contacts fetch; cache expires after TTL
+const USERS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 let lastMessagesSnapshot = [];
 let typingTimeout        = null;
 let isCurrentlyTyping    = false;
@@ -38,6 +40,7 @@ let recordingCancelled   = false;  // FIX: use flag instead of clearing audioChu
 let emojiPickerVisible   = false;
 let forwardingMsgId      = null;
 let _hbInterval          = null;   // heartbeat interval ref for cleanup
+let _activeAudio         = null;   // FIX: was window._waAudio — keep audio state at module scope
 
 const TYPING_TTL_MS    = 6000;
 const EMOJI_LIST       = ['😀','😂','😍','🥰','😎','🤔','😮','😢','😡','👍','❤️','🙏','🎉','🔥','✅','💯','🤣','😭','😊','🥺','🤩','😴','🤯','💀','👋','🤝','💪','👀','🫡','🫶'];
@@ -280,10 +283,16 @@ export function teardownChat() {
     unsubscribeRecent();
     stopRecording(true);
     if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
+    // FIX: stop any playing voice note audio on teardown
+    if (_activeAudio && !_activeAudio.paused) { _activeAudio.pause(); }
+    _activeAudio      = null;
     activeRoomId      = null;
     activeRoomDetails = null;
     replyingTo        = null;
-    editingMsgId      = null;  // EXT: clear editing state on teardown
+    editingMsgId      = null;
+    // FIX: invalidate contacts cache on teardown so a fresh mount picks up new users
+    cachedUsersHTML   = null;
+    cachedUsersData   = null;
     // FIX: remove injected hidden file inputs on teardown to prevent accumulation
     document.querySelectorAll('[data-chat-input="true"]').forEach(el => el.remove());
     delete window.startDirectChat;
@@ -551,12 +560,24 @@ function extractFirstUrl(text) {
     return m ? m[0] : null;
 }
 
+// FIX (Security): Sanitize URLs before inserting into href/src attributes.
+// Rejects javascript:, data:, vbscript: and any other non-http(s) schemes.
+function safeUrl(url) {
+    if (typeof url !== 'string') return '';
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed)) return '';
+    return trimmed;
+}
+
 function buildLinkPreviewHTML(url) {
-    let hostname = url;
-    try { hostname = new URL(url).hostname; } catch { return ''; }
+    // FIX (Security): reject non-http(s) URLs before rendering preview
+    const safe = safeUrl(url);
+    if (!safe) return '';
+    let hostname = safe;
+    try { hostname = new URL(safe).hostname; } catch { return ''; }
     return `<div class="wa-link-preview">
         <span class="wa-link-domain">${sanitize(hostname)}</span>
-        <span class="wa-link-url">${sanitize(url)}</span>
+        <span class="wa-link-url">${sanitize(safe)}</span>
     </div>`;
 }
 
@@ -612,8 +633,12 @@ function buildMessageHTML(msg, index, messages, chatType) {
     if (msg.text) {
         const rawSafe    = sanitize(msg.text);
         const displayed  = searchActive ? highlightMatch(rawSafe, searchQueryText) : rawSafe;
-        const linkedText = displayed.replace(URL_REGEX, u =>
-            `<a href="${u}" target="_blank" rel="noopener" class="wa-link">${u}</a>`);
+        // FIX (Security): safeUrl() rejects non-http(s) schemes before inserting into href
+        const linkedText = displayed.replace(URL_REGEX, u => {
+            const safe = safeUrl(u);
+            if (!safe) return sanitize(u);
+            return `<a href="${safe}" target="_blank" rel="noopener noreferrer" class="wa-link">${sanitize(u)}</a>`;
+        });
         textHTML = `<span class="wa-msg-text">${linkedText}</span>`;
         const firstUrl = extractFirstUrl(msg.text);
         if (firstUrl && !msg.imageUrl && !msg.fileUrl) {
@@ -1554,15 +1579,37 @@ function stopAndSendRecording() {
 // FIX: replaced <button> inside <a> with plain <a> styled as button
 // ─────────────────────────────────────────────
 function openLightbox(url) {
+    // FIX (Security): use DOM APIs for src/href so no URL ends up injected via innerHTML
+    const safe = safeUrl(url);
+    if (!safe) return;
     document.getElementById('wa-lightbox')?.remove();
     const box = document.createElement('div');
     box.id = 'wa-lightbox';
-    box.innerHTML = `
-        <button class="wa-lb-close" id="wa-lb-close" aria-label="Close">✕</button>
-        <img src="${url}" alt="Full size image">
-        <a href="${url}" download target="_blank" class="wa-lb-download">⬇ Download</a>`;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'wa-lb-close';
+    closeBtn.id = 'wa-lb-close';
+    closeBtn.setAttribute('aria-label', 'Close');
+    closeBtn.textContent = '✕';
+
+    const img = document.createElement('img');
+    img.src = safe;  // assigned via property, not innerHTML
+    img.alt = 'Full size image';
+
+    const dlLink = document.createElement('a');
+    dlLink.href = safe;  // assigned via property, not innerHTML
+    dlLink.download = '';
+    dlLink.target = '_blank';
+    dlLink.rel = 'noopener noreferrer';
+    dlLink.className = 'wa-lb-download';
+    dlLink.textContent = '⬇ Download';
+
+    box.appendChild(closeBtn);
+    box.appendChild(img);
+    box.appendChild(dlLink);
     document.body.appendChild(box);
-    document.getElementById('wa-lb-close').addEventListener('click', () => box.remove());
+
+    closeBtn.addEventListener('click', () => box.remove());
     box.addEventListener('click', e => { if (e.target === box) box.remove(); });
 }
 
@@ -1878,11 +1925,13 @@ function renderMessages() {
         return;
     }
 
-    // Build date-grouped HTML
+    // FIX: lastMessagesSnapshot is newest-first (desc). The container uses flex-direction:column-reverse,
+    // so we iterate oldest-first (reversed) and insert date dividers before each new date group.
+    // This ensures dividers appear above the correct group in the rendered output.
+    const msgs = [...lastMessagesSnapshot].reverse(); // oldest → newest
     let html     = '';
     let lastDate = '';
-    lastMessagesSnapshot.forEach((msg, i) => {
-        // Date divider (messages are desc order so check date change)
+    msgs.forEach((msg, i) => {
         const dateKey = msg.createdAt?.toDate
             ? msg.createdAt.toDate().toDateString()
             : '';
@@ -1893,7 +1942,9 @@ function renderMessages() {
                 : '';
             html += `<div class="wa-date-divider">${label}</div>`;
         }
-        html += buildMessageHTML(msg, i, lastMessagesSnapshot, chatType);
+        // buildMessageHTML expects the original desc-order array and the original index for consecutive-sender detection
+        const origIndex = lastMessagesSnapshot.findIndex(m => m.id === msg.id);
+        html += buildMessageHTML(msg, origIndex, lastMessagesSnapshot, chatType);
     });
 
     chatContainer.innerHTML = html;
@@ -1962,7 +2013,11 @@ export function setupChat() {
 
     document.getElementById('btn-show-users')?.addEventListener('click', async () => {
         toggleTabs('btn-show-users', 'btn-show-recent', usersListContainer, recentList);
-        if (cachedUsersHTML) { usersListContent.innerHTML = cachedUsersHTML; return; }
+        // FIX: use cached data only if within TTL; otherwise re-fetch so new users appear
+        if (cachedUsersHTML && (Date.now() - cachedUsersAt) < USERS_CACHE_TTL_MS) {
+            usersListContent.innerHTML = cachedUsersHTML;
+            return;
+        }
         usersListContent.innerHTML = `<div class="flex justify-center py-10 text-sm text-gray-500">Loading contacts…</div>`;
         try {
             const snap = await getDocs(collection(db, 'users'));
@@ -1980,6 +2035,7 @@ export function setupChat() {
             });
             cachedUsersData = users;
             cachedUsersHTML = html || '<p class="text-gray-400 text-sm text-center py-8">No contacts found.</p>';
+            cachedUsersAt   = Date.now(); // FIX: record fetch time for TTL check
             usersListContent.innerHTML = cachedUsersHTML;
         } catch {
             usersListContent.innerHTML = '<p class="text-red-400 text-sm text-center py-8">Failed to load contacts.</p>';
@@ -2247,9 +2303,9 @@ export function setupChat() {
         document.getElementById('wa-reply-preview')?.remove();
         replyingTo   = null;
         editingMsgId = null;  // EXT: clear any in-progress edit when switching rooms
-        // FIX: mutate pinnedMessages in place, never reassign
+        // FIX: mutate both collections in place, never reassign
         pinnedMessages.splice(0, pinnedMessages.length);
-        starredMessages = new Set();
+        starredMessages.clear();
 
         activeRoomId      = chatType === 'group'
             ? targetEmail
@@ -2406,11 +2462,12 @@ export function setupChat() {
                 return;
             }
             lastMessagesSnapshot = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-            // FIX: use try/catch for localStorage; may be blocked in private browsing
+            // FIX: mutate starredMessages in place (never reassign); try/catch for private browsing
+            starredMessages.clear();
             try {
                 const savedStarred = JSON.parse(localStorage.getItem(`starred_${activeRoomId}`) || '[]');
-                starredMessages    = new Set(savedStarred);
-            } catch { starredMessages = new Set(); }
+                savedStarred.forEach(id => starredMessages.add(id));
+            } catch { /* blocked in private browsing — leave set empty */ }
             renderMessages();
             markMessagesSeenBy(activeRoomId);
         }, err => { console.error('[Chat] messages:', err); showToast('Error loading messages.', 'error'); });
@@ -2614,14 +2671,14 @@ export function setupChat() {
         if (voicePlayBtn) {
             const url = voicePlayBtn.dataset.voiceUrl;
             if (!url) return;
-            const existing = window._waAudio;
-            if (existing && !existing.paused) {
-                existing.pause();
+            // FIX: use module-level _activeAudio instead of window._waAudio
+            if (_activeAudio && !_activeAudio.paused) {
+                _activeAudio.pause();
                 voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
                 return;
             }
-            const audio      = new Audio(url);
-            window._waAudio  = audio;
+            const audio    = new Audio(safeUrl(url) || url);
+            _activeAudio   = audio;
             voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
             audio.play().catch(() => {});
             audio.addEventListener('ended', () => {
@@ -2846,12 +2903,13 @@ export function setupChat() {
         const t = lastMessagesSnapshot.find(m => m.id === tempId);
         if (!t) return;
         lastMessagesSnapshot = lastMessagesSnapshot.filter(m => m.id !== tempId);
+        // FIX: restore replyTo from the failed message so it's preserved on retry
+        if (t.replyTo) replyingTo = t.replyTo;
         await sendTextMessage(t.text);
     }
 
-    // Send on form submit
-    document.getElementById('chat-message-form')?.addEventListener('submit', async e => {
-        e.preventDefault();
+    // FIX: shared helper — was copy-pasted identically in both submit and keydown handlers
+    async function commitInput() {
         const text = input.value.trim();
         if (!text) return;
         // EXT: if in edit mode, update the existing message instead of sending new
@@ -2866,6 +2924,7 @@ export function setupChat() {
                 await updateDoc(doc(db, `chats/${activeRoomId}/messages`, idToEdit), {
                     text, edited: true, editedAt: serverTimestamp()
                 });
+                showToast('Message edited.', 'success');
             } catch { showToast('Failed to edit message.', 'error'); }
             return;
         }
@@ -2874,33 +2933,19 @@ export function setupChat() {
         input.style.height = 'auto';
         input.focus();
         sendTextMessage(text);
+    }
+
+    // Send on form submit
+    document.getElementById('chat-message-form')?.addEventListener('submit', async e => {
+        e.preventDefault();
+        await commitInput();
     });
 
     // Enter = send/edit, Shift+Enter = newline
     input.addEventListener('keydown', async e => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            const text = input.value.trim();
-            if (!text) return;
-            if (editingMsgId) {
-                const idToEdit = editingMsgId;
-                editingMsgId   = null;
-                document.getElementById('wa-reply-preview')?.remove();
-                input.value        = '';
-                input.style.height = 'auto';
-                input.focus();
-                try {
-                    await updateDoc(doc(db, `chats/${activeRoomId}/messages`, idToEdit), {
-                        text, edited: true, editedAt: serverTimestamp()
-                    });
-                } catch { showToast('Failed to edit message.', 'error'); }
-                return;
-            }
-            if (!activeRoomId) return;
-            input.value = '';
-            input.style.height = 'auto';
-            input.focus();
-            sendTextMessage(text);
+            await commitInput();
         }
     });
 
@@ -2953,8 +2998,15 @@ export function setupChat() {
     }
 
     // ── File upload ──────────────────────────────
+    // FIX (Security): 50 MB client-side limit to prevent accidental/malicious huge uploads
+    const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
     async function sendMediaFile(file) {
         if (!file || !activeRoomId) return;
+        if (file.size > MAX_UPLOAD_BYTES) {
+            showToast(`File too large (max 50 MB). Please choose a smaller file.`, 'error');
+            return;
+        }
         const roomId  = activeRoomId;
         const isImage = file.type?.startsWith('image/');
         const isVideo = file.type?.startsWith('video/');
@@ -3506,12 +3558,16 @@ export function setupChat() {
             const inviteContainer = document.getElementById('mem-tab-invite');
             inviteContainer.style.flexDirection = 'column';
             inviteContainer.style.gap = '14px';
-            const inviteLink = `${window.location.origin}${window.location.pathname}?joinGroup=${inviteCode}`;
+            // FIX (Security): sanitize inviteCode before inserting into innerHTML;
+            // inviteLink uses encodeURIComponent so the code can't break out of the query string
+            const safeInviteCode = sanitize(inviteCode);
+            const inviteLink = `${window.location.origin}${window.location.pathname}?joinGroup=${encodeURIComponent(inviteCode)}`;
+            const safeInviteLink = sanitize(inviteLink);
             inviteContainer.innerHTML = `
                 <div style="background:var(--wa-input-bg);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px">
                     <p style="font-size:12px;font-weight:700;color:var(--wa-sub);text-transform:uppercase;letter-spacing:.06em">Group Invite Code</p>
                     <div style="display:flex;align-items:center;gap:10px;background:var(--wa-panel);border:1.5px solid var(--wa-border);border-radius:10px;padding:10px 14px">
-                        <span id="invite-code-display" style="font-size:22px;font-weight:800;color:var(--wa-accent);letter-spacing:.2em;flex:1">${inviteCode}</span>
+                        <span id="invite-code-display" style="font-size:22px;font-weight:800;color:var(--wa-accent);letter-spacing:.2em;flex:1">${safeInviteCode}</span>
                         <button id="copy-invite-code" style="background:var(--wa-accent);border:none;color:#fff;font-size:12px;font-weight:700;padding:6px 12px;border-radius:8px;cursor:pointer">Copy</button>
                     </div>
                     <p style="font-size:12px;color:var(--wa-sub)">Share this code so others can request to join. Admins approve each request.</p>
@@ -3519,7 +3575,7 @@ export function setupChat() {
                 <div style="background:var(--wa-input-bg);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px">
                     <p style="font-size:12px;font-weight:700;color:var(--wa-sub);text-transform:uppercase;letter-spacing:.06em">Invite Link</p>
                     <div style="display:flex;align-items:center;gap:10px;background:var(--wa-panel);border:1.5px solid var(--wa-border);border-radius:10px;padding:10px 14px;overflow:hidden">
-                        <span style="font-size:12px;color:var(--wa-sub);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${inviteLink}</span>
+                        <span style="font-size:12px;color:var(--wa-sub);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${safeInviteLink}</span>
                         <button id="copy-invite-link" style="background:var(--wa-accent);border:none;color:#fff;font-size:12px;font-weight:700;padding:6px 12px;border-radius:8px;cursor:pointer;flex-shrink:0">Copy</button>
                     </div>
                 </div>
