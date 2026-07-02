@@ -1195,7 +1195,10 @@ export function setupComments() {
     summarizeBtn?.addEventListener('click', async () => {
         const commentNodes  = commentsList?.querySelectorAll('.comment-text-node');
         const commentsArray = Array.from(commentNodes || []).map(n => n.textContent.trim()).filter(Boolean);
-        if (!commentsArray.length) return;
+        if (!commentsArray.length) {
+            _safeToast("No comments to summarize yet.", "warn");
+            return;
+        }
 
         summarizeBtn.textContent = '✨ Thinking…';
         summarizeBtn.disabled    = true;
