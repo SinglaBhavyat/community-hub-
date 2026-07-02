@@ -839,7 +839,7 @@ export function setupComments() {
         commentsPage.dataset.currentPostId = postId;
         commentLimit = PAGE_SIZE;
 
-        if (summarizeBtn) summarizeBtn.classList.remove('hidden');
+        if (summarizeBtn) summarizeBtn.style.display = 'flex';
         if (summaryOutput) summaryOutput.classList.add('hidden');
         if (summaryText)   summaryText.innerHTML = '';
 
@@ -868,7 +868,7 @@ export function setupComments() {
 
                 if (snapshot.empty) {
                     commentsList.innerHTML = '<p class="text-slate-500 dark:text-slate-400 text-center py-8">No comments yet. Be the first!</p>';
-                    if (summarizeBtn) summarizeBtn.classList.add('hidden');
+                    if (summarizeBtn) summarizeBtn.style.display = 'none';
                     return;
                 }
 
@@ -1224,6 +1224,7 @@ export function setupComments() {
             summary = data?.candidates?.[0]?.content?.parts?.[0]?.text?.replace(/\n/g, '<br>') || null;
         } catch (err) {
             console.error('[comments] Summariser error:', err);
+            _safeToast('AI summary unavailable — showing offline preview.', 'warn');
             // Fallback: first two sentences of the top comment
             const top = commentsArray[0] || '';
             const sentences = top.match(/[^.!?]+[.!?]+/g) || [];
