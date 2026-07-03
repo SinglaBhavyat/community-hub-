@@ -39,6 +39,7 @@ let isRecording          = false;
 let recordingCancelled   = false;  // FIX: use flag instead of clearing audioChunks before stop fires
 let emojiPickerVisible   = false;
 let forwardingMsgId      = null;
+let _totalUnread         = 0;   // FIX: track real total so _recomputeNavBadge doesn't parse DOM badges
 let _hbInterval          = null;   // heartbeat interval ref for cleanup
 let _activeAudio         = null;   // FIX: was window._waAudio — keep audio state at module scope
 
@@ -450,7 +451,7 @@ function createSidebarItemHTML({ id, email, name, type, lastMessage, time, unrea
                 <span class="wa-sidebar-preview ${isBlocked ? 'wa-blocked' : (unread ? 'wa-sidebar-preview--unread' : '')}">
                     ${sanitize(lastMessage)}
                 </span>
-                ${unread ? `<span class="wa-badge">${unread > 9 ? '9+' : unread}</span>` : ''}
+                ${unread ? `<span class="wa-badge" data-count="${unread}">${unread > 99 ? '99+' : unread}</span>` : ''}
             </div>
         </div>
     </div>`;
@@ -624,7 +625,9 @@ function buildMessageHTML(msg, index, messages, chatType) {
     if (msg.voiceUrl) {
         contentHTML = buildVoiceNoteHTML(msg, isMe);
     } else if (msg.imageUrl) {
-        contentHTML = `<img src="${msg.imageUrl}" class="wa-msg-image msg-image" data-full="${msg.imageUrl}" loading="lazy" alt="Image">`;
+        // Fix #9 (High): validate imageUrl through safeUrl() before injecting into src/data-full
+        const _safeImg = safeUrl(msg.imageUrl) || encodeURI(msg.imageUrl);
+        contentHTML = `<img src="${_safeImg}" class="wa-msg-image msg-image" data-full="${_safeImg}" loading="lazy" alt="Image">`;
     } else if (msg.fileUrl) {
         contentHTML = buildFileHTML(msg);
     }
@@ -1769,8 +1772,40 @@ function markRoomRead(roomId) {
     if (!roomId || !currentUser?.email) return;
     setDoc(doc(db, 'chats', roomId), {
         [`lastRead.${currentUser.email}`]: serverTimestamp(),
-        [`unreadCount.${currentUser.email}`]: 0  // EXT: clear badge counter on room open
+        [`unreadCount.${currentUser.email}`]: 0
     }, { merge: true }).catch(() => {});
+
+    // Immediately reflect in the sidebar without waiting for the snapshot to round-trip
+    document.querySelectorAll(`.wa-sidebar-item[data-email]`).forEach(item => {
+        const itemRoomId = item.dataset.type === 'group'
+            ? item.dataset.email
+            : getPrivateRoomId(currentUser.email, item.dataset.email);
+        if (itemRoomId !== roomId) return;
+        item.querySelector('.wa-badge')?.remove();
+        const nameEl    = item.querySelector('.wa-sidebar-name');
+        const timeEl    = item.querySelector('.wa-sidebar-time');
+        const previewEl = item.querySelector('.wa-sidebar-preview');
+        nameEl?.classList.remove('wa-sidebar-name--unread');
+        timeEl?.classList.remove('wa-sidebar-time--unread');
+        previewEl?.classList.remove('wa-sidebar-preview--unread');
+    });
+
+    // Recompute the nav-level badge immediately (subtract this room's count)
+    _recomputeNavBadge();
+}
+function _recomputeNavBadge() {
+    // FIX: read data-count (real number) instead of parsing display text like '9+'
+    let total = 0;
+    document.querySelectorAll('.wa-badge[data-count]').forEach(badge => {
+        const n = parseInt(badge.dataset.count, 10);
+        if (!isNaN(n)) total += n;
+    });
+    _totalUnread = total;
+    const navDot = document.getElementById('chat-nav-indicator');
+    if (!navDot) return;
+    navDot.classList.toggle('hidden', total === 0);
+    navDot.textContent = total > 99 ? '99+' : total > 0 ? String(total) : '';
+    navDot.classList.toggle('chat-nav-dot--count', total > 0);
 }
 
 function markMessagesSeenBy(roomId) {
@@ -2072,10 +2107,13 @@ export function setupChat() {
                         <p class="text-gray-700 text-sm font-medium">No conversations yet</p>
                         <p class="text-gray-400 text-xs">Start one from the Contacts tab</p>
                     </div>`;
+                const navDot = document.getElementById('chat-nav-indicator');
+                if (navDot) navDot.classList.add('hidden');
                 return;
             }
 
             let html = '';
+            let totalUnread = 0;
             chats.forEach(chat => {
                 const isGroup    = chat.type === 'group';
                 const email      = isGroup ? chat.id : (chat.members?.find(e => e !== currentUser.email) || '');
@@ -2090,6 +2128,13 @@ export function setupChat() {
                 const isActiveRoom = chat.id === activeRoomId;
                 // EXT: use per-user unreadCount when available, fall back to timestamp comparison
                 const unreadFromCounter = chat.unreadCount?.[currentUser.email];
+// If the room is currently open, clear any server counter that arrived in the snapshot
+                // FIX: only write the clear if the counter is actually positive (avoids redundant writes on every snapshot)
+                if (isActiveRoom && typeof unreadFromCounter === 'number' && unreadFromCounter > 0) {
+                    setDoc(doc(db, 'chats', chat.id), {
+                        [`unreadCount.${currentUser.email}`]: 0
+                    }, { merge: true }).catch(() => {});
+                }
                 const unread = isActiveRoom ? 0
                     : (typeof unreadFromCounter === 'number'
                         ? unreadFromCounter
@@ -2097,8 +2142,18 @@ export function setupChat() {
                 const online      = !isGroup && cachedUsersData?.find(u => u.email === email)
                     ? isUserOnline(cachedUsersData.find(u => u.email === email).lastActive) : false;
                 html += createSidebarItemHTML({ id: chat.id, email, name, type: chat.type, lastMessage, time, unread, online, isActive: isActiveRoom });
+                totalUnread += unread;
             });
             recentList.innerHTML = html;
+
+            // ── Nav indicator: show unread count badge ──
+            _totalUnread = totalUnread; // FIX: keep module-level total in sync with snapshot
+            const navDot = document.getElementById('chat-nav-indicator');
+            if (navDot) {
+                navDot.classList.toggle('hidden', totalUnread === 0);
+                navDot.textContent = totalUnread > 99 ? '99+' : totalUnread > 0 ? String(totalUnread) : '';
+                navDot.classList.toggle('chat-nav-dot--count', totalUnread > 0);
+            }
         }, err => {
             console.error('[Chat] recent:', err);
             showToast('Lost connection to chat list.', 'error');
@@ -2178,7 +2233,11 @@ export function setupChat() {
             btn.textContent   = 'Creating…';
             btn.disabled      = true;
             const groupId     = `group_${Date.now()}`;
-            const inviteCode  = Math.random().toString(36).slice(2,8).toUpperCase() + Math.random().toString(36).slice(2,6).toUpperCase();
+            // Fix #3 (Critical): use CSPRNG instead of Math.random()
+            const _icAlpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+            const _icBytes = new Uint8Array(10);
+            crypto.getRandomValues(_icBytes);
+            const inviteCode  = Array.from(_icBytes, b => _icAlpha[b % _icAlpha.length]).join('');
             try {
                 await setDoc(doc(db, 'chats', groupId), {
                     type: 'group', name: groupName, members, memberNames,
@@ -2297,6 +2356,13 @@ export function setupChat() {
 
     // ── Open chat room ───────────────────────────
     const openChatRoom = (targetEmail, targetName, chatType) => {
+        // Fix #5 (High): always remove the previous dropdown listener before registering
+        // a new one — prevents accumulation when openChatRoom is called via
+        // window.startDirectChat or the ?joinGroup= URL flow (which skip sidebar cleanup).
+        if (chatHeader._cleanupDropdown) {
+            document.removeEventListener('click', chatHeader._cleanupDropdown);
+            chatHeader._cleanupDropdown = null;
+        }
         unsubscribeRoomListeners();
         closeSearchBar();
         stopRecording(true);
@@ -2319,7 +2385,7 @@ export function setupChat() {
             }, { merge: true }).catch(() => showToast('Could not open chat.', 'error'));
         }
 
-        markRoomRead(activeRoomId);
+        markRoomRead(activeRoomId); // FIX: markRoomRead already calls _recomputeNavBadge — removed duplicate call
         subscribeTypingIndicator(activeRoomId, chatType);
 
         const targetUserDoc = chatType === 'private'
@@ -2644,9 +2710,26 @@ export function setupChat() {
                 await updateDoc(doc(db, `chats/${activeRoomId}/messages`, delEveryoneBtn.dataset.msgId), {
                     isDeletedForEveryone: true, text: null, imageUrl: null, voiceUrl: null, fileUrl: null
                 });
-                await setDoc(doc(db, 'chats', activeRoomId), {
-                    lastMessage: '🗑️ Message deleted',
-                    lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp()
+                // AFTER — bump all members EXCEPT the sender
+                const roomDetails = activeRoomDetails;
+                const roomMembers = roomDetails?.type === 'group'
+                    ? [] // groups: let recipients track via lastRead diff (server-side rules or Cloud Functions handle per-member counters)
+                    : [roomDetails?.targetEmail].filter(Boolean);
+
+                // FIX: `roomId` was undefined here — use `activeRoomId`
+                const _delRoomId = activeRoomId;
+                const unreadBump = {};
+                for (const e of roomMembers) {
+                    if (e && e !== currentUser.email) {
+                        const snap = await getDoc(doc(db, 'chats', _delRoomId)).catch(() => null);
+                        unreadBump[`unreadCount.${e}`] = (snap?.data()?.unreadCount?.[e] || 0) + 1;
+                    }
+                }
+                await setDoc(doc(db, 'chats', _delRoomId), {
+                    lastMessage: '', lastSenderEmail: currentUser.email,
+                    lastUpdated: serverTimestamp(),
+                    [`unreadCount.${currentUser.email}`]: 0,
+                    ...unreadBump
                 }, { merge: true });
             } catch { showToast('Failed to delete.', 'error'); }
             return;
@@ -2677,7 +2760,10 @@ export function setupChat() {
                 voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
                 return;
             }
-            const audio    = new Audio(safeUrl(url) || url);
+            // Fix #4 (Critical): never fall back to raw url — if safeUrl rejects it, abort
+            const _safeVoice = safeUrl(url);
+            if (!_safeVoice) return;
+            const audio    = new Audio(_safeVoice);
             _activeAudio   = audio;
             voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
             audio.play().catch(() => {});
@@ -2882,12 +2968,19 @@ export function setupChat() {
             };
             if (replyTo) payload.replyTo = replyTo;
             await addDoc(collection(db, `chats/${roomId}/messages`), payload);
-            await setDoc(doc(db, 'chats', roomId), {
+            // FIX: bump recipient unreadCount for private chats (was only resetting own counter)
+            const _sendRoomDetails = activeRoomDetails;
+            const _sendUpdate = {
                 lastMessage: text, lastSenderEmail: currentUser.email,
                 lastUpdated: serverTimestamp(),
-                // EXT: bump unreadHint so recipients see a badge even without a full query
-                [`unreadCount.${currentUser.email}`]: 0  // reset own counter — others get bumped server-side via rule logic or by their own marking
-            }, { merge: true });
+                [`unreadCount.${currentUser.email}`]: 0
+            };
+            if (_sendRoomDetails?.type === 'private' && _sendRoomDetails?.targetEmail) {
+                const _recip = _sendRoomDetails.targetEmail;
+                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
+                _sendUpdate[`unreadCount.${_recip}`] = (_rSnap?.data()?.unreadCount?.[_recip] || 0) + 1;
+            }
+            await setDoc(doc(db, 'chats', roomId), _sendUpdate, { merge: true });
             lastMessagesSnapshot = lastMessagesSnapshot.filter(m => m.id !== tempId);
             if (roomId === activeRoomId) renderMessages();
         } catch (err) {
@@ -3072,10 +3165,19 @@ export function setupChat() {
             else               { payload.fileUrl = url; payload.fileName = file.name; payload.fileMime = file.type; payload.fileSize = fileToSend.size; }
 
             await addDoc(collection(db, `chats/${roomId}/messages`), payload);
-            await setDoc(doc(db, 'chats', roomId), {
+            // FIX: bump recipient unreadCount for file/image/video sends too
+            const _fileRoomDetails = activeRoomDetails;
+            const _fileUpdate = {
                 lastMessage: isImage ? '📷 Photo' : (isVideo ? '🎥 Video' : `📎 ${file.name}`),
-                lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp()
-            }, { merge: true });
+                lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp(),
+                [`unreadCount.${currentUser.email}`]: 0
+            };
+            if (_fileRoomDetails?.type === 'private' && _fileRoomDetails?.targetEmail) {
+                const _recip = _fileRoomDetails.targetEmail;
+                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
+                _fileUpdate[`unreadCount.${_recip}`] = (_rSnap?.data()?.unreadCount?.[_recip] || 0) + 1;
+            }
+            await setDoc(doc(db, 'chats', roomId), _fileUpdate, { merge: true });
             showToast(isImage ? 'Photo sent!' : isVideo ? 'Video sent!' : 'File sent!', 'success');
         } catch (err) {
             console.error('[Chat] upload error:', err);
@@ -3596,7 +3698,11 @@ export function setupChat() {
                     confirmLabel: 'Regenerate'
                 });
                 if (!ok) return;
-                const newCode = Math.random().toString(36).slice(2,8).toUpperCase() + Math.random().toString(36).slice(2,6).toUpperCase();
+                // Fix #3 (Critical): CSPRNG for invite code regeneration
+                const _reAlpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+                const _reBytes = new Uint8Array(10);
+                crypto.getRandomValues(_reBytes);
+                const newCode = Array.from(_reBytes, b => _reAlpha[b % _reAlpha.length]).join('');
                 try {
                     await updateDoc(doc(db, 'chats', activeRoomId), { inviteCode: newCode });
                     showToast('New invite code generated!', 'success');

@@ -155,8 +155,13 @@ service cloud.firestore {
         request.resource.data.members.hasAny([request.auth.token.email]);
       allow update: if isSignedIn() &&
         resource.data.members.hasAny([request.auth.token.email]);
-      allow delete: if isSignedIn() &&
-        resource.data.members.hasAny([request.auth.token.email]);
+      // Fix #2 (Critical): for group chats only admins/creator may delete the room;
+      // for private chats either member may delete (symmetric behaviour).
+      allow delete: if isSignedIn() && (
+        resource.data.type == 'private'
+          ? resource.data.members.hasAny([request.auth.token.email])
+          : (resource.data.createdBy == request.auth.token.email || isAdmin())
+      );
 
       // ── Messages subcollection ────────────────────────────────────────
       match /messages/{messageId} {
@@ -167,10 +172,20 @@ service cloud.firestore {
           get(/databases/$(database)/documents/chats/$(chatId)).data.members
             .hasAny([request.auth.token.email]) &&
           request.resource.data.senderEmail == request.auth.token.email;
-        allow update, delete: if isSignedIn() && (
+        // Fix #1 (Critical): only the sender or an admin may edit/delete message content.
+        // Members may update ONLY social fields (seenBy, reactions, deletedFor) — NOT
+        // text, imageUrl, voiceUrl, fileUrl, isDeletedForEveryone, senderEmail, senderName.
+        allow update: if isSignedIn() && (
           resource.data.senderEmail == request.auth.token.email ||
-          get(/databases/$(database)/documents/chats/$(chatId)).data.members
-            .hasAny([request.auth.token.email]) ||
+          isAdmin() ||
+          (get(/databases/$(database)/documents/chats/$(chatId)).data.members
+            .hasAny([request.auth.token.email]) &&
+            !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['text','imageUrl','voiceUrl','fileUrl','isDeletedForEveryone',
+                       'senderEmail','senderName']))
+        );
+        allow delete: if isSignedIn() && (
+          resource.data.senderEmail == request.auth.token.email ||
           isAdmin()
         );
       }

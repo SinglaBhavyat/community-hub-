@@ -363,6 +363,44 @@ header, nav, main, #report-modal, footer {
 .nav-link:hover, .nav-link.active { color: var(--ink); }
 .nav-link:hover::after, .nav-link.active::after { width: 100%; }
 
+.chat-nav-dot {
+    position: absolute;
+    top: -5px;
+    right: -8px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ef4444;
+    border: 2px solid var(--surface);
+    animation: chat-dot-pulse 2s ease-in-out infinite;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0px;
+    line-height: 1;
+    font-weight: 700;
+    color: #fff;
+    transition: width 0.15s, height 0.15s, font-size 0.15s, border-radius 0.15s;
+}
+/* When showing a count, grow into a pill */
+.chat-nav-dot.chat-nav-dot--count {
+    width: auto;
+    min-width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    font-size: 10px;
+    padding: 0 4px;
+    top: -8px;
+    right: -10px;
+    animation: chat-dot-pulse 2s ease-in-out infinite;
+}
+.chat-nav-dot.hidden { display: none; }
+
+@keyframes chat-dot-pulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50%       { transform: scale(1.25); opacity: 0.8; }
+}
+
 #secondary-navbar {
     background: var(--surface); /* fallback if color-mix() is unsupported */
     background: color-mix(in srgb, var(--surface) 55%, transparent);
