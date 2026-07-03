@@ -1,10 +1,11 @@
-import { db } from '../config/firebase.js';
+import { db, auth } from '../config/firebase.js';
 import { sanitize } from '../ui/templates.js';
 import {
   collection, onSnapshot, query,
   orderBy, addDoc, serverTimestamp,
   doc, updateDoc, deleteDoc,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
+import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
 import { uploadImage, uploadMediaFiles, getVideoThumbnail } from '../utils/storage.js';
 import { currentUser, onCurrentUserChange } from '../store/db.js';
 
@@ -1990,7 +1991,14 @@ export function setupLostFound() {
       startFeedListener();   // robust: get a fresh, correctly-authenticated listener
     });
 
-    startFeedListener();
+    // FIX: wait for Firebase Auth to confirm the token before opening the first
+    // Firestore listener. Calling startFeedListener() immediately meant the snapshot
+    // fired before request.auth was valid server-side → permission-denied.
+    // onAuthStateChanged is the canonical signal that the JWT is ready.
+    const _unsubLFAuth = onAuthStateChanged(auth, firebaseUser => {
+      _unsubLFAuth(); // one-shot
+      if (firebaseUser) startFeedListener();
+    });
 
     // ── Delegated events ──────────────────────────────────────────────────
 

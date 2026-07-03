@@ -1,9 +1,18 @@
 import { currentUser } from '../store/db.js';
 import { db } from '../config/firebase.js';
 import {
-    collection, query, where, getDocs, orderBy
+    collection, query, where, getDocs, orderBy, doc, getDoc
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 import { createPostCardHTML } from './templates.js';
+import { auth, googleProvider } from '../config/firebase.js';
+import { signOut, signInWithPopup } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
+
+// Page-visit hooks: modules can register callbacks for when specific pages are shown
+const _pageVisitHooks = new Map();
+export function onPageVisit(pageId, cb) {
+    if (!_pageVisitHooks.has(pageId)) _pageVisitHooks.set(pageId, []);
+    _pageVisitHooks.get(pageId).push(cb);
+}
 
 // ============================================================
 //  NAV SETUP
@@ -49,6 +58,31 @@ export function setupNavigation() {
         }
     });
 
+    // Switch account button — sign out then immediately re-trigger Google popup
+    const switchAccountBtn = document.getElementById('switch-account-btn');
+    if (switchAccountBtn) {
+        switchAccountBtn.addEventListener('click', async () => {
+            profileMenu?.classList.add('hidden');
+            try {
+                await signOut(auth);
+                // Small delay to let Firebase auth state propagate, then open picker
+                setTimeout(async () => {
+                    try {
+                        // Force account chooser by setting prompt parameter
+                        googleProvider.setCustomParameters({ prompt: 'select_account' });
+                        await signInWithPopup(auth, googleProvider);
+                    } catch (err) {
+                        if (err.code !== 'auth/popup-closed-by-user') {
+                            console.error('Switch account sign-in error:', err);
+                        }
+                    }
+                }, 400);
+            } catch (err) {
+                console.error('Switch account sign-out error:', err);
+            }
+        });
+    }
+
     // Scroll header effect
     window.addEventListener('scroll', () => {
         const header = document.getElementById('header');
@@ -86,13 +120,17 @@ export function showPage(pageId) {
     if (navbar) {
         const pagesWithNav = [
             'page-posts', 'page-create', 'page-lost-found', 'page-chat',
-            'page-help', 'page-comments', 'page-my-posts', 'page-profile',
+            'page-help', 'page-comments', 'page-my-posts', 'page-bookmarked-posts', 'page-profile',
             'page-achievements', 'page-ai-chat', 'page-user-profile', 'page-admin'
         ];
         navbar.classList.toggle('hidden', !currentUser || !pagesWithNav.includes(pageId));
     }
 
     window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    // Fire page-visit hooks
+    const hooks = _pageVisitHooks.get(pageId);
+    if (hooks) hooks.forEach(cb => { try { cb(); } catch (e) { console.error(e); } });
 }
 
 // ============================================================

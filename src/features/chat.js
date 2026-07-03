@@ -1,11 +1,12 @@
-import { db } from '../config/firebase.js';
+import { db, auth } from '../config/firebase.js';
 import { currentUser } from '../store/db.js';
+import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 import { sanitize } from '../ui/templates.js';
 import { uploadToCloudinary } from '../utils/storage.js';
 import {
     collection, doc, setDoc, addDoc, query, orderBy, onSnapshot,
     serverTimestamp, getDocs, limit, where, deleteDoc, updateDoc,
-    arrayUnion, arrayRemove, getDoc
+    arrayUnion, arrayRemove, getDoc, writeBatch, runTransaction
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
 // ─────────────────────────────────────────────
@@ -38,16 +39,18 @@ let recordingTimer       = null;
 let isRecording          = false;
 let recordingCancelled   = false;  // FIX: use flag instead of clearing audioChunks before stop fires
 let emojiPickerVisible   = false;
-let forwardingMsgId      = null;
+let forwardingMsgId      = null;   // NOTE: unused — openForwardModal receives msgId as parameter directly
 let _totalUnread         = 0;   // FIX: track real total so _recomputeNavBadge doesn't parse DOM badges
+let _pendingReadRooms    = new Set(); // FIX: rooms where markRoomRead fired but server timestamp not yet resolved
 let _hbInterval          = null;   // heartbeat interval ref for cleanup
 let _activeAudio         = null;   // FIX: was window._waAudio — keep audio state at module scope
+let _cleanupDropdown     = null;   // FIX #5: module-scope instead of DOM property
+let _lastTypingWriteMs   = 0;      // FIX #10: throttle typing writes to Firestore
 
 const TYPING_TTL_MS    = 6000;
 const EMOJI_LIST       = ['😀','😂','😍','🥰','😎','🤔','😮','😢','😡','👍','❤️','🙏','🎉','🔥','✅','💯','🤣','😭','😊','🥺','🤩','😴','🤯','💀','👋','🤝','💪','👀','🫡','🫶'];
 const REACTION_EMOJIS  = ['👍','❤️','😂','😮','😢','🙏'];
-// FIX: was undefined — REACTION_EMOJIS_SET is used in buildMessageHTML
-const REACTION_EMOJIS_SET = REACTION_EMOJIS;
+// REACTION_EMOJIS_SET removed — use REACTION_EMOJIS directly (they were the same reference)
 
 // ─────────────────────────────────────────────
 // STORAGE HELPERS  (FIX: properly await upload completion)
@@ -124,11 +127,14 @@ async function compressImageFile(file, maxDim = 1600, quality = 0.82) {
         const ext = outType === 'image/png' ? 'png' : 'jpg';
         const baseName = (file.name || 'image').replace(/\.[^./\\]+$/, '');
         return new File([blob], `${baseName}.${ext}`, { type: outType });
-    } catch {
+    } catch (err) {
+        console.warn('[Chat] Image compression failed, using original:', err);
         return file; // never block sending on a compression failure
     }
 }
 
+// NOTE: uploadFile is currently unused internally — sendMediaFile calls uploadBytesWithRetry
+// directly. Kept in case an external module imports it in future.
 async function uploadFile(file, folder = 'chats') {
     return uploadBytesWithRetry(file, folder, null, file.name);
 }
@@ -153,9 +159,10 @@ function getAttachInput(accept = 'image/*', id = 'chat-attach-input') {
     let el = document.getElementById(id);
     if (!el) {
         el = document.createElement('input');
-        el.type  = 'file';
-        el.accept = accept;
-        el.id    = id;
+        el.type     = 'file';
+        el.accept   = accept;
+        el.id       = id;
+        el.multiple = true; // FIXED: allow selecting multiple files at once
         el.className = 'hidden';
         el.setAttribute('data-chat-input', 'true');
         document.body.appendChild(el);
@@ -269,7 +276,7 @@ function unsubscribeRecent() {
 function clearTypingState() {
     if (typingTimeout) { clearTimeout(typingTimeout); typingTimeout = null; }
     isCurrentlyTyping  = false;
-    currentTypingLabel = null;
+    currentTypingLabel = null; // unused — reserved for future multi-user typing display
 }
 
 function writeTypingState(roomId, typing) {
@@ -277,6 +284,21 @@ function writeTypingState(roomId, typing) {
     setDoc(doc(db, `chats/${roomId}/typing`, currentUser.email), {
         typing, name: currentUser.name, updatedAt: serverTimestamp()
     }).catch(() => {});
+}
+
+// FIX #10: Throttle typing=true writes to Firestore (max 1 per 2 s).
+// typing=false always fires immediately so the indicator clears promptly.
+const TYPING_WRITE_THROTTLE_MS = 2000;
+function writeTypingStateThrottled(roomId, typing) {
+    if (!typing) {
+        _lastTypingWriteMs = 0;
+        writeTypingState(roomId, false);
+        return;
+    }
+    const now = Date.now();
+    if (now - _lastTypingWriteMs < TYPING_WRITE_THROTTLE_MS) return;
+    _lastTypingWriteMs = now;
+    writeTypingState(roomId, true);
 }
 
 export function teardownChat() {
@@ -355,7 +377,7 @@ function resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn) {
     unsubscribeRoomListeners();
     activeRoomId         = null;
     activeRoomDetails    = null;
-    lastMessagesSnapshot = [];
+    lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
     searchActive         = false;
     searchQueryText      = '';
     replyingTo           = null;
@@ -523,8 +545,9 @@ function buildVoiceNoteHTML(msg, isMe) {
     let seed  = 0;
     for (let i = 0; i < (msg.id || '').length; i++) seed = (seed * 31 + msg.id.charCodeAt(i)) >>> 0;
     const pseudoRand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return (seed >>> 0) / 4294967296; };
-    return `<div class="wa-voice-note" data-voice-url="${msg.voiceUrl}">
-        <button class="wa-voice-play-btn" data-voice-url="${msg.voiceUrl}">
+    const _safeVUrl = safeUrl(msg.voiceUrl || '') || '';
+    return `<div class="wa-voice-note" data-voice-url="${_safeVUrl}">
+        <button class="wa-voice-play-btn" data-voice-url="${_safeVUrl}">
             <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24" class="wa-play-icon">
                 <path d="M8 5v14l11-7z"/>
             </svg>
@@ -543,7 +566,10 @@ function buildFileHTML(msg) {
     const icon = getFileIcon(msg.fileMime || '');
     const name = sanitize(msg.fileName || 'File');
     const size = msg.fileSize ? `${(msg.fileSize / 1024).toFixed(1)} KB` : '';
-    return `<a href="${msg.fileUrl}" target="_blank" rel="noopener" class="wa-file-attachment">
+    // FIX: validate fileUrl through safeUrl() before inserting into href — same
+    // protection applied to imageUrl/voiceUrl everywhere else in the file.
+    const _safeFile = safeUrl(msg.fileUrl || '') || '#';
+    return `<a href="${_safeFile}" target="_blank" rel="noopener noreferrer" class="wa-file-attachment">
         <span class="wa-file-icon">${icon}</span>
         <div class="wa-file-info">
             <span class="wa-file-name">${name}</span>
@@ -570,6 +596,13 @@ function safeUrl(url) {
     return trimmed;
 }
 
+// FIX #14: CSS.escape polyfill for older WebViews
+function cssEscape(str) {
+    if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(str);
+    // FIX: polyfill had double-escaped backslashes; corrected to single-escape each special char
+    return str.replace(/([!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+}
+
 function buildLinkPreviewHTML(url) {
     // FIX (Security): reject non-http(s) URLs before rendering preview
     const safe = safeUrl(url);
@@ -592,7 +625,17 @@ function buildMessageHTML(msg, index, messages, chatType) {
     if (msg.deletedFor?.includes(currentUser.email)) return '';
 
     const isMe      = msg.senderEmail === currentUser.email;
-    const older     = messages[index + 1];
+    // FIX: skip messages hidden for current user (deletedFor) when finding the
+    // "older" neighbour — otherwise avatar/tail renders incorrectly when a message
+    // between two same-sender messages is deleted-for-me.
+    let older = null;
+    for (let _oi = index + 1; _oi < messages.length; _oi++) {
+        const _cand = messages[_oi];
+        if (_cand.deletedFor?.includes(currentUser.email)) continue;
+        if (_cand.senderEmail === 'system') continue; // system msgs don't break sender runs
+        older = _cand;
+        break;
+    }
     const isConsec  = older && older.senderEmail === msg.senderEmail;
     const isPending = msg._pending === true;
     const isFailed  = msg._failed  === true;
@@ -628,6 +671,11 @@ function buildMessageHTML(msg, index, messages, chatType) {
         // Fix #9 (High): validate imageUrl through safeUrl() before injecting into src/data-full
         const _safeImg = safeUrl(msg.imageUrl) || encodeURI(msg.imageUrl);
         contentHTML = `<img src="${_safeImg}" class="wa-msg-image msg-image" data-full="${_safeImg}" loading="lazy" alt="Image">`;
+    } else if (msg.fileUrl && msg.fileMime?.startsWith('video/')) {
+        // FIXED: render video files as an inline <video> player, not a raw file link
+        const _safeVid = safeUrl(msg.fileUrl) || '';
+        contentHTML = `<video class="wa-msg-video" src="${_safeVid}" controls preload="metadata"
+            style="max-width:260px;max-height:200px;border-radius:10px;display:block;background:#000"></video>`;
     } else if (msg.fileUrl) {
         contentHTML = buildFileHTML(msg);
     }
@@ -669,7 +717,7 @@ function buildMessageHTML(msg, index, messages, chatType) {
             </button>
             <div class="wa-msg-dropdown hidden msg-menu-dropdown">
                 <div class="wa-emoji-bar">
-                    ${REACTION_EMOJIS_SET.map(e =>
+                    ${REACTION_EMOJIS.map(e =>
                         `<button class="wa-emoji-pick msg-react-btn" data-msg-id="${msg.id}" data-emoji="${e}">${e}</button>`
                     ).join('')}
                 </div>
@@ -677,9 +725,9 @@ function buildMessageHTML(msg, index, messages, chatType) {
                     data-msg-id="${msg.id}"
                     data-sender="${sanitize(msg.senderName || '')}"
                     data-text="${sanitize(msg.text || '')}"
-                    data-image="${msg.imageUrl || ''}"
-                    data-voice="${msg.voiceUrl || ''}"
-                    data-file="${msg.fileUrl || ''}"
+                    data-image="${safeUrl(msg.imageUrl || '') || ''}"
+                    data-voice="${safeUrl(msg.voiceUrl || '') || ''}"
+                    data-file="${safeUrl(msg.fileUrl || '') || ''}"
                     data-filename="${sanitize(msg.fileName || '')}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"/></svg>
                     Reply
@@ -1225,8 +1273,16 @@ function ensureChatStyles() {
         .wa-voice-play-btn:hover { background: rgba(255,255,255,.4); }
         .wa-bubble--them .wa-voice-play-btn:hover { background: rgba(79,70,229,.18); }
         .wa-voice-waveform { display: flex; align-items: center; gap: 2px; flex: 1; height: 24px; }
-        .wa-wave-bar   { width: 3px; border-radius: 2px; background: rgba(255,255,255,.6); flex-shrink: 0; }
+        .wa-wave-bar   { width: 3px; border-radius: 2px; background: rgba(255,255,255,.6); flex-shrink: 0; transition: background .15s, transform .15s; }
         .wa-bubble--them .wa-wave-bar { background: #9ca3af; }
+        /* Waveform animation while playing */
+        .wa-voice-note.playing .wa-wave-bar { background: rgba(255,255,255,1); animation: waWavePlay .7s ease-in-out infinite alternate; }
+        .wa-bubble--them .wa-voice-note.playing .wa-wave-bar { background: var(--wa-accent); }
+        .wa-voice-note.playing .wa-wave-bar:nth-child(2n)   { animation-delay: .1s; }
+        .wa-voice-note.playing .wa-wave-bar:nth-child(3n)   { animation-delay: .2s; }
+        .wa-voice-note.playing .wa-wave-bar:nth-child(4n)   { animation-delay: .3s; }
+        .wa-voice-note.playing .wa-wave-bar:nth-child(5n)   { animation-delay: .15s; }
+        @keyframes waWavePlay { from { transform: scaleY(.5); } to { transform: scaleY(1.35); } }
         .wa-voice-duration { font-size: 11.5px; color: rgba(255,255,255,.75); white-space: nowrap; flex-shrink: 0; }
         .wa-bubble--them .wa-voice-duration { color: var(--wa-sub); }
 
@@ -1420,6 +1476,13 @@ function ensureChatStyles() {
         .wa-rec-timer { font-size: 14px; color: var(--wa-text); font-variant-numeric: tabular-nums; font-weight: 700; }
         .wa-rec-cancel { background: none; border: none; color: var(--wa-sub); cursor: pointer; font-size: 13px; padding: 5px 12px; border-radius: 8px; transition: background .1s, color .1s; margin-left: auto; }
         .wa-rec-cancel:hover { background: var(--wa-input-bg); color: var(--wa-danger); }
+        .wa-rec-send {
+            background: var(--wa-accent); border: none; color: #fff; cursor: pointer;
+            width: 36px; height: 36px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+            transition: background .15s, transform .1s; box-shadow: 0 2px 6px rgba(79,70,229,.35);
+        }
+        .wa-rec-send:hover { background: var(--wa-accent-dark, #4338ca); transform: scale(1.07); }
         .wa-rec-pause {
             background: var(--wa-input-bg); border: none; color: var(--wa-text);
             cursor: pointer; font-size: 14px; width: 30px; height: 30px; border-radius: 50%;
@@ -1557,16 +1620,17 @@ function stopRecording(cancel = false) {
     isRecording        = false;
     recordingCancelled = cancel;
     clearInterval(recordingTimer);
+    recordingTimer = null; // FIX: null after clear, consistent with _hbInterval pattern
     document.getElementById('wa-recording-bar')?.remove();
     const btn = document.getElementById('wa-mic-btn');
     if (btn) btn.classList.remove('recording');
-    // FIX: always call .stop() so onstop fires in both cancel AND send paths.
-    // Do NOT null out mediaRecorder here — onstop still needs it to release
-    // stream tracks. onstop nulls it after it finishes.
+    // FIX (voice): request final data flush before stopping so no chunk is dropped
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        if (!cancel && mediaRecorder.state === 'recording') {
+            try { mediaRecorder.requestData(); } catch (_e) { /* ignore */ }
+        }
         mediaRecorder.stop();
     } else {
-        // Already stopped (e.g. stream lost), clean up immediately
         mediaRecorder = null;
     }
 }
@@ -1651,8 +1715,8 @@ async function openForwardModal(msgId) {
         chats.forEach(c => {
             const isGroup = c.type === 'group';
             const name    = isGroup
-                ? c.name
-                : (c.memberNames?.find(n => n !== currentUser.name) || 'Unknown');
+                ? sanitize(c.name || '')
+                : sanitize(c.memberNames?.find(n => n !== currentUser.name) || 'Unknown'); // FIX #2: sanitize before innerHTML
             html += `<div class="wa-sidebar-item" data-fwd-room="${c.id}">
                 ${avatarEl(name, c.type || 'private', false, 40)}
                 <span style="color:var(--wa-text);font-size:14px;font-weight:500">${sanitize(name)}</span>
@@ -1675,10 +1739,29 @@ async function openForwardModal(msgId) {
                     if (msg.voiceUrl)  { payload.voiceUrl = msg.voiceUrl; payload.voiceDuration = msg.voiceDuration || 0; }
                     if (msg.fileUrl)   { payload.fileUrl  = msg.fileUrl;  payload.fileName = msg.fileName; payload.fileMime = msg.fileMime; }
                     await addDoc(collection(db, `chats/${toRoom}/messages`), payload);
-                    await setDoc(doc(db, 'chats', toRoom), {
+                    // FIX #15: getDoc instead of unsupported where('__name__')
+                    const _fwdTargetSnap = await getDoc(doc(db, 'chats', toRoom)).catch(() => null);
+                    const _fwdTargetData = _fwdTargetSnap?.data();
+                    const _fwdUpdate = {
                         lastMessage: msg.text || (msg.imageUrl ? '📷 Photo' : '📎 File'),
-                        lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp()
-                    }, { merge: true });
+                        lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp(),
+                        [`unreadCount.${currentUser.email}`]: 0
+                    };
+                    const _fwdMembers = _fwdTargetData?.members || [];
+                    if (_fwdTargetData?.type === 'private') {
+                        const _fwdRecip = _fwdMembers.find(e => e !== currentUser.email);
+                        if (_fwdRecip) {
+                            _fwdUpdate[`unreadCount.${_fwdRecip}`] = (_fwdTargetData?.unreadCount?.[_fwdRecip] || 0) + 1;
+                        }
+                    } else if (_fwdTargetData?.type === 'group') {
+                        // FIX #3: bump all group members except sender
+                        for (const _gm of _fwdMembers) {
+                            if (_gm && _gm !== currentUser.email) {
+                                _fwdUpdate[`unreadCount.${_gm}`] = (_fwdTargetData?.unreadCount?.[_gm] || 0) + 1;
+                            }
+                        }
+                    }
+                    await setDoc(doc(db, 'chats', toRoom), _fwdUpdate, { merge: true });
                     showToast('Message forwarded!', 'success');
                 } catch { showToast('Failed to forward.', 'error'); }
                 close();
@@ -1770,18 +1853,33 @@ function subscribeTypingIndicator(roomId, chatType) {
 // ─────────────────────────────────────────────
 function markRoomRead(roomId) {
     if (!roomId || !currentUser?.email) return;
+    // FIX: mark pending immediately so snapshot re-renders don't restore the badge
+    // before the serverTimestamp() resolves from null → real value
+    _pendingReadRooms.add(roomId);
     setDoc(doc(db, 'chats', roomId), {
         [`lastRead.${currentUser.email}`]: serverTimestamp(),
         [`unreadCount.${currentUser.email}`]: 0
-    }, { merge: true }).catch(() => {});
+    }, { merge: true }).then(() => {
+        _pendingReadRooms.delete(roomId);
+    }).catch(() => {
+        _pendingReadRooms.delete(roomId);
+    });
 
-    // Immediately reflect in the sidebar without waiting for the snapshot to round-trip
+    // Immediately reflect in the sidebar without waiting for the snapshot to round-trip.
+    // FIX: read and zero out the badge BEFORE removing it so _recomputeNavBadge gets
+    // an accurate total (the badge DOM node is gone by the time _recomputeNavBadge runs).
+    let clearedCount = 0;
     document.querySelectorAll(`.wa-sidebar-item[data-email]`).forEach(item => {
         const itemRoomId = item.dataset.type === 'group'
             ? item.dataset.email
             : getPrivateRoomId(currentUser.email, item.dataset.email);
         if (itemRoomId !== roomId) return;
-        item.querySelector('.wa-badge')?.remove();
+        const badge = item.querySelector('.wa-badge[data-count]');
+        if (badge) {
+            const n = parseInt(badge.dataset.count, 10);
+            if (!isNaN(n)) clearedCount += n;
+            badge.remove();
+        }
         const nameEl    = item.querySelector('.wa-sidebar-name');
         const timeEl    = item.querySelector('.wa-sidebar-time');
         const previewEl = item.querySelector('.wa-sidebar-preview');
@@ -1791,16 +1889,15 @@ function markRoomRead(roomId) {
     });
 
     // Recompute the nav-level badge immediately (subtract this room's count)
+    _totalUnread = Math.max(0, _totalUnread - clearedCount);
     _recomputeNavBadge();
 }
 function _recomputeNavBadge() {
-    // FIX: read data-count (real number) instead of parsing display text like '9+'
-    let total = 0;
-    document.querySelectorAll('.wa-badge[data-count]').forEach(badge => {
-        const n = parseInt(badge.dataset.count, 10);
-        if (!isNaN(n)) total += n;
-    });
-    _totalUnread = total;
+    // FIX: use the module-level _totalUnread counter (kept in sync by loadRecentChats
+    // snapshot and decremented in markRoomRead) instead of re-summing DOM badges.
+    // Re-reading the DOM here is unreliable because markRoomRead may have already
+    // removed the badge node for the just-opened room before this function runs.
+    const total = _totalUnread;
     const navDot = document.getElementById('chat-nav-indicator');
     if (!navDot) return;
     navDot.classList.toggle('hidden', total === 0);
@@ -1812,9 +1909,13 @@ function markMessagesSeenBy(roomId) {
     if (!roomId || !currentUser?.email) return;
     const unseen = lastMessagesSnapshot.filter(m =>
         m.senderEmail !== currentUser.email &&
+        m.senderEmail !== 'system' &&   // FIX: system messages have no seenBy — skip them
         !m.seenBy?.includes(currentUser.email) &&
-        !m.isDeletedForEveryone
+        !m.isDeletedForEveryone &&
+        !m._pending && !m._failed
     );
+    // FIX: skip the whole write loop if there's nothing to mark (saves Firestore reads on every snapshot)
+    if (!unseen.length) return;
     unseen.forEach(m => {
         updateDoc(doc(db, `chats/${roomId}/messages`, m.id), {
             seenBy: arrayUnion(currentUser.email)
@@ -1933,7 +2034,7 @@ function handleInputTyping() {
     if (!activeRoomId) return;
     if (!isCurrentlyTyping) {
         isCurrentlyTyping = true;
-        writeTypingState(activeRoomId, true);
+        writeTypingStateThrottled(activeRoomId, true);
     }
     if (typingTimeout) clearTimeout(typingTimeout);
     typingTimeout = setTimeout(() => {
@@ -1960,27 +2061,41 @@ function renderMessages() {
         return;
     }
 
-    // FIX: lastMessagesSnapshot is newest-first (desc). The container uses flex-direction:column-reverse,
-    // so we iterate oldest-first (reversed) and insert date dividers before each new date group.
-    // This ensures dividers appear above the correct group in the rendered output.
-    const msgs = [...lastMessagesSnapshot].reverse(); // oldest → newest
-    let html     = '';
-    let lastDate = '';
-    msgs.forEach((msg, i) => {
-        const dateKey = msg.createdAt?.toDate
-            ? msg.createdAt.toDate().toDateString()
-            : '';
-        if (dateKey && dateKey !== lastDate) {
-            lastDate = dateKey;
+    // lastMessagesSnapshot is newest-first (desc from Firestore).
+    // #chat-messages uses flex-direction:column-reverse, so the FIRST DOM child
+    // renders at the BOTTOM of the viewport. Iterating newest→oldest places the
+    // newest message at the bottom (correct chat behaviour).
+    //
+    // Date dividers: when iterating newest→oldest, emit the divider AFTER the
+    // last message of each day group (i.e. when the date changes or we reach the
+    // end of the list). In the DOM the divider sits after the group, but
+    // column-reverse flips it visually ABOVE the group — exactly where it belongs.
+    const msgs = lastMessagesSnapshot; // newest → oldest (no copy needed)
+    let html = '';
+
+    for (let i = 0; i < msgs.length; i++) {
+        const msg     = msgs[i];
+        const dateKey = msg.createdAt?.toDate ? msg.createdAt.toDate().toDateString() : '';
+
+        // buildMessageHTML receives index i which is the position in the
+        // newest-first array — used internally to find the "older" neighbour
+        // via index+1, which is correct for newest-first ordering.
+        html += buildMessageHTML(msg, i, msgs, chatType);
+
+        // After writing this message, check whether the next one belongs to a
+        // different day (or this is the last message). If so, close the current
+        // day group with its divider. column-reverse will render this divider
+        // visually ABOVE the group it follows in the DOM.
+        const nextMsg     = msgs[i + 1];
+        const nextDateKey = nextMsg?.createdAt?.toDate ? nextMsg.createdAt.toDate().toDateString() : null;
+
+        if (dateKey && dateKey !== nextDateKey) {
             const label = msg.createdAt?.toDate
                 ? msg.createdAt.toDate().toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })
                 : '';
-            html += `<div class="wa-date-divider">${label}</div>`;
+            if (label) html += `<div class="wa-date-divider">${label}</div>`;
         }
-        // buildMessageHTML expects the original desc-order array and the original index for consecutive-sender detection
-        const origIndex = lastMessagesSnapshot.findIndex(m => m.id === msg.id);
-        html += buildMessageHTML(msg, origIndex, lastMessagesSnapshot, chatType);
-    });
+    }
 
     chatContainer.innerHTML = html;
 }
@@ -2022,14 +2137,17 @@ export function setupChat() {
 
     // ── Sidebar search filter ──────────────────
     const sidebarSearchInput = document.getElementById('sidebar-search-input');
-    if (sidebarSearchInput) {
-        sidebarSearchInput.addEventListener('input', e => {
-            const q = e.target.value.toLowerCase().trim();
-            document.querySelectorAll('.wa-sidebar-item').forEach(item => {
-                const name = (item.dataset.name || '').toLowerCase();
-                item.style.display = (!q || name.includes(q)) ? '' : 'none';
-            });
+    // FIX: extract filter logic so it can be re-applied after recentList re-renders
+    function _applyContactFilter() {
+        const q = (sidebarSearchInput?.value || '').toLowerCase().trim();
+        // FIX: when query is cleared, un-hide all items that were hidden by a
+        // previous filter — previously the early return left them hidden forever.
+        document.querySelectorAll('.wa-sidebar-item').forEach(item => {
+            item.style.display = (!q || (item.dataset.name || '').toLowerCase().includes(q)) ? '' : 'none';
         });
+    }
+    if (sidebarSearchInput) {
+        sidebarSearchInput.addEventListener('input', () => _applyContactFilter());
     }
 
     // ── Tab toggle ──────────────────────────────
@@ -2063,7 +2181,9 @@ export function setupChat() {
                     users.push(u);
                     html += createSidebarItemHTML({
                         id: u.email, email: u.email, name: u.name,
-                        type: 'private', lastMessage: u.email, time: '',
+                        // FIX: was u.email — showed the raw email as a chat preview subtitle,
+                        // confusing for new users. Use a neutral placeholder instead.
+                        type: 'private', lastMessage: 'Tap to start a conversation', time: '',
                         online: isUserOnline(u.lastActive)
                     });
                 }
@@ -2085,11 +2205,24 @@ export function setupChat() {
     };
     writeHeartbeat();
     _hbInterval = setInterval(writeHeartbeat, 45000);
-    window.addEventListener('beforeunload', () => { clearInterval(_hbInterval); }, { once: true });
+    window.addEventListener('beforeunload', () => {
+        clearInterval(_hbInterval);
+        _hbInterval = null; // FIX #20: keep state consistent
+        // FIX: clear typing state on tab close so the indicator doesn't stay visible for TYPING_TTL_MS
+        if (isCurrentlyTyping && activeRoomId) {
+            writeTypingState(activeRoomId, false);
+            isCurrentlyTyping = false;
+        }
+    }, { once: true });
 
     // ── Recent chats ────────────────────────────
     const loadRecentChats = () => {
-        if (!currentUser) return;
+        // Guard: currentUser is populated asynchronously from store/db.js.
+        // If it isn't ready yet we return false so the caller can retry.
+        if (!currentUser) return false;
+        // Guard: recentList may be null if setupChat() ran before the DOM was
+        // fully rendered (e.g. the chat page is lazily injected).
+        if (!recentList) return false;
         unsubscribeRecent();
         const q = query(
             collection(db, 'chats'),
@@ -2126,25 +2259,44 @@ export function setupChat() {
                 const lastReadMs  = chat.lastRead?.[currentUser.email]?.toMillis?.() || 0;
                 const updatedMs   = chat.lastUpdated?.toMillis?.() || 0;
                 const isActiveRoom = chat.id === activeRoomId;
-                // EXT: use per-user unreadCount when available, fall back to timestamp comparison
+                // FIX: also suppress badge for rooms where markRoomRead fired but the
+                // serverTimestamp() hasn't resolved yet (arrives as null → lastReadMs=0 → stale unread shown)
+                const isPendingRead = _pendingReadRooms.has(chat.id);
                 const unreadFromCounter = chat.unreadCount?.[currentUser.email];
-// If the room is currently open, clear any server counter that arrived in the snapshot
-                // FIX: only write the clear if the counter is actually positive (avoids redundant writes on every snapshot)
-                if (isActiveRoom && typeof unreadFromCounter === 'number' && unreadFromCounter > 0) {
+                // If the room is currently open (or pending read), clear any stale server counter
+                if ((isActiveRoom || isPendingRead) && typeof unreadFromCounter === 'number' && unreadFromCounter > 0) {
                     setDoc(doc(db, 'chats', chat.id), {
                         [`unreadCount.${currentUser.email}`]: 0
                     }, { merge: true }).catch(() => {});
                 }
-                const unread = isActiveRoom ? 0
+                // FIX: also treat missing lastSenderEmail (new chat doc with no messages yet)
+                // as "no unread" — previously `undefined !== currentUser.email` was true,
+                // giving the opener a phantom unread badge on their own new chat.
+                const unread = (isActiveRoom || isPendingRead) ? 0
                     : (typeof unreadFromCounter === 'number'
                         ? unreadFromCounter
-                        : (updatedMs > lastReadMs && chat.lastSenderEmail !== currentUser.email ? 1 : 0));
+                        : (updatedMs > lastReadMs && chat.lastSenderEmail && chat.lastSenderEmail !== currentUser.email ? 1 : 0));
                 const online      = !isGroup && cachedUsersData?.find(u => u.email === email)
                     ? isUserOnline(cachedUsersData.find(u => u.email === email).lastActive) : false;
-                html += createSidebarItemHTML({ id: chat.id, email, name, type: chat.type, lastMessage, time, unread, online, isActive: isActiveRoom });
+
+                // FIX: surface pending join requests to admins directly in the sidebar
+                // so they don't have to open the members panel to discover them.
+                // Show a "🔔 N requests" preview on the group's sidebar item when the
+                // current user is an admin and there are pending requests waiting.
+                const admins = isGroup ? (chat.admins || [chat.admin].filter(Boolean)) : [];
+                const isMeGroupAdmin = isGroup && admins.includes(currentUser.email);
+                const pendingCount = isMeGroupAdmin ? (chat.pendingRequests?.length || 0) : 0;
+                const effectiveLastMessage = (pendingCount > 0 && !isActiveRoom)
+                    ? `🔔 ${pendingCount} join request${pendingCount > 1 ? 's' : ''} pending`
+                    : lastMessage;
+                const effectiveUnread = pendingCount > 0 ? Math.max(unread, pendingCount) : unread;
+
+                html += createSidebarItemHTML({ id: chat.id, email, name, type: chat.type, lastMessage: effectiveLastMessage, time, unread: effectiveUnread, online, isActive: isActiveRoom });
                 totalUnread += unread;
             });
             recentList.innerHTML = html;
+            // FIX: re-apply active search filter after sidebar re-render
+            _applyContactFilter();
 
             // ── Nav indicator: show unread count badge ──
             _totalUnread = totalUnread; // FIX: keep module-level total in sync with snapshot
@@ -2160,7 +2312,61 @@ export function setupChat() {
         });
     };
 
-    document.querySelector('[data-target="page-chat"]')?.addEventListener('click', loadRecentChats);
+    // Gate ALL Firestore subscriptions behind Firebase Auth being confirmed.
+    // The old retry-loop checked `currentUser` (a local store value) which can be
+    // truthy from a cached profile before Firebase has validated the JWT server-side.
+    // Firing listeners before auth resolves causes every rule's isSignedIn() check
+    // to see request.auth == null → permission-denied on every collection.
+    // onAuthStateChanged fires exactly once with the resolved user (or null) and
+    // is the canonical way to know the token is ready.
+    const _unsubAuth = onAuthStateChanged(auth, firebaseUser => {
+        _unsubAuth(); // one-shot — stop listening after first resolution
+        if (!firebaseUser) return; // not signed in; nothing to load
+        // Now auth is confirmed — safe to open Firestore listeners.
+        if (loadRecentChats() === false) {
+            // DOM may not be ready yet (chat page lazily injected); retry briefly.
+            let _rcRetries = 0;
+            const _rcRetryId = setInterval(() => {
+                _rcRetries++;
+                if (loadRecentChats() !== false || _rcRetries > 50) {
+                    clearInterval(_rcRetryId);
+                }
+            }, 200);
+        }
+    });
+    // Also refresh/re-subscribe when user navigates back to the chat page.
+    document.querySelector('[data-target="page-chat"]')?.addEventListener('click', () => {
+        if (!recentChatsSub) loadRecentChats();
+    });
+
+    // ── Handle ?joinGroup= deep-link ────────────
+    // FIX: the invite link generator builds ?joinGroup=<code> URLs but there
+    // was no corresponding handler to read this on page load — clicking a
+    // shared invite link did nothing. Now we read the param, strip it from the
+    // URL, and auto-open the join modal pre-filled with the code.
+    (function handleJoinGroupParam() {
+        const params = new URLSearchParams(window.location.search);
+        const code   = params.get('joinGroup');
+        if (!code) return;
+        // Clean the param from the URL bar without reloading the page
+        params.delete('joinGroup');
+        const cleanUrl = [
+            window.location.pathname,
+            params.toString() ? '?' + params.toString() : '',
+            window.location.hash
+        ].join('');
+        history.replaceState(null, '', cleanUrl);
+        // Open the join modal with the code pre-filled
+        document.getElementById('btn-join-group')?.click();
+        // Wait one tick for the modal DOM to be created, then fill the input
+        requestAnimationFrame(() => {
+            const input = document.getElementById('join-group-code-input');
+            if (input) {
+                input.value = code.trim().toUpperCase().slice(0, 10);
+                input.dispatchEvent(new Event('input')); // trigger uppercase normalisation
+            }
+        });
+    })();
 
     // ── Group creation modal (light theme) ─────
     document.getElementById('btn-create-group')?.addEventListener('click', async () => {
@@ -2242,6 +2448,10 @@ export function setupChat() {
                 await setDoc(doc(db, 'chats', groupId), {
                     type: 'group', name: groupName, members, memberNames,
                     admin: currentUser.email, admins: [currentUser.email],
+                    // FIX: createdBy is required by the Firestore delete rule
+                    // (only creator or admin can delete a group room).
+                    // Was missing — group creator could never delete their own group.
+                    createdBy: currentUser.email,
                     inviteCode, pendingRequests: [],
                     lastMessage: 'Group created',
                     lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp()
@@ -2252,8 +2462,9 @@ export function setupChat() {
                 });
                 closeModal();
                 showToast(`"${groupName}" created. Invite code: ${inviteCode}`, 'success');
+                // FIX: removed redundant loadRecentChats() — the onSnapshot listener already picks
+                // up the new group doc automatically. Extra call creates a second listener.
                 document.getElementById('btn-show-recent')?.click();
-                loadRecentChats();
             } catch {
                 showToast('Failed to create group.', 'error');
                 btn.textContent = 'Create Group';
@@ -2276,11 +2487,8 @@ export function setupChat() {
                 </div>
                 <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
                     <p style="font-size:13px;color:var(--wa-sub)">Enter the group invite code shared by the group admin.</p>
-                    <input type="text" id="join-group-code-input" placeholder="e.g. ABC123XY" maxlength="12"
-                        style="width:100%;background:var(--wa-input-bg);border:1.5px solid transparent;border-radius:12px;padding:12px 16px;font-size:15px;color:var(--wa-text);outline:none;letter-spacing:.1em;text-transform:uppercase;transition:border-color .15s"
-                        oninput="this.value=this.value.toUpperCase()"
-                        onfocus="this.style.borderColor='var(--wa-accent)'"
-                        onblur="this.style.borderColor='transparent'">
+                    <input type="text" id="join-group-code-input" placeholder="e.g. ABC123WXYZ" maxlength="10"
+                        style="width:100%;background:var(--wa-input-bg);border:1.5px solid transparent;border-radius:12px;padding:12px 16px;font-size:15px;color:var(--wa-text);outline:none;letter-spacing:.1em;text-transform:uppercase;transition:border-color .15s">
                     <p id="join-group-error" style="color:var(--wa-danger);font-size:13px;display:none"></p>
                 </div>
                 <div style="padding:14px 16px;border-top:1px solid var(--wa-border);display:flex;justify-content:flex-end;gap:10px;background:var(--wa-panel)">
@@ -2289,65 +2497,150 @@ export function setupChat() {
                 </div>
             </div>`;
         document.body.appendChild(modal);
-        requestAnimationFrame(() => document.getElementById('join-group-card')?.style.setProperty('opacity','1') || (document.getElementById('join-group-card').style.opacity='1', document.getElementById('join-group-card').style.transform='scale(1)'));
+        requestAnimationFrame(() => {
+            const card = document.getElementById('join-group-card');
+            if (card) { card.style.opacity = '1'; card.style.transform = 'scale(1)'; }
+        });
 
         const closeJoin = () => modal.remove();
         modal.addEventListener('click', e => { if (e.target === modal) closeJoin(); });
         document.getElementById('close-join-modal').addEventListener('click', closeJoin);
         document.getElementById('cancel-join-modal').addEventListener('click', closeJoin);
+        // FIX #18: replace inline oninput/onfocus/onblur with addEventListener
+        const _joinInput = document.getElementById('join-group-code-input');
+        if (_joinInput) {
+            _joinInput.addEventListener('input', () => { _joinInput.value = _joinInput.value.toUpperCase(); });
+            _joinInput.addEventListener('focus', () => { _joinInput.style.borderColor = 'var(--wa-accent)'; });
+            _joinInput.addEventListener('blur',  () => { _joinInput.style.borderColor = 'transparent'; });
+            // FIX: pressing Enter should submit — without this users had to click the button
+            _joinInput.addEventListener('keydown', e => {
+                if (e.key === 'Enter') document.getElementById('confirm-join-group')?.click();
+            });
+            // Auto-focus so the user can start typing immediately
+            _joinInput.focus();
+        }
 
         document.getElementById('confirm-join-group').addEventListener('click', async () => {
-            const code = document.getElementById('join-group-code-input').value.trim().toUpperCase();
+            const code  = document.getElementById('join-group-code-input').value.trim().toUpperCase();
             const errEl = document.getElementById('join-group-error');
-            if (!code) { errEl.textContent = 'Please enter an invite code.'; errEl.style.display='block'; return; }
-            const btn = document.getElementById('confirm-join-group');
+            const btn   = document.getElementById('confirm-join-group');
+
+            // FIX: validate code length matches generated length (10 chars, A-Z0-9)
+            if (!code) {
+                errEl.textContent = 'Please enter an invite code.';
+                errEl.style.display = 'block'; return;
+            }
+            if (!/^[A-Z0-9]{10}$/.test(code)) {
+                errEl.textContent = 'Invite codes are 10 characters (letters and numbers only).';
+                errEl.style.display = 'block'; return;
+            }
+
             btn.textContent = 'Searching…'; btn.disabled = true;
             errEl.style.display = 'none';
             try {
-                const q = query(collection(db, 'chats'), where('inviteCode', '==', code), where('type', '==', 'group'));
+                // Step 1: look up the group by invite code.
+                // FIX: must include where('type','==','group') so Firestore's query
+                // security validator can confirm every returned document satisfies the
+                // read rule (type=='group' → readable by any signed-in user). Without
+                // this second constraint, Firestore rejects the whole query with
+                // permission-denied because private chat docs in the same collection
+                // would fail the rule.
+                // REQUIRED INDEX: chats — inviteCode ASC, type ASC (create in Firebase Console
+                // or add to firestore.indexes.json: collection=chats, fields=[inviteCode ASC, type ASC])
+                const q    = query(collection(db, 'chats'), where('inviteCode', '==', code), where('type', '==', 'group'));
                 const snap = await getDocs(q);
-                if (snap.empty) {
-                    errEl.textContent = 'No group found with this code. Check and try again.';
+                const groupDoc = snap.docs[0] ?? null;
+                if (!groupDoc) {
+                    errEl.textContent = 'No group found with that code. Double-check and try again.';
                     errEl.style.display = 'block';
                     btn.textContent = 'Send Join Request'; btn.disabled = false;
                     return;
                 }
-                const groupDoc  = snap.docs[0];
-                const groupData = groupDoc.data();
-                const groupDocId = groupDoc.id;
-                if (groupData.members?.includes(currentUser.email)) {
+
+                // Step 2: use a transaction so the membership/pending checks and
+                // the write are atomic — prevents race conditions where two users
+                // submit at the same moment, or an admin approves while the user
+                // is mid-submit, leading to duplicate pendingRequests entries.
+                const groupRef = doc(db, 'chats', groupDoc.id);
+                let alreadyMember  = false;
+                let alreadyPending = false;
+                let dismissedHours = 0;
+
+                await runTransaction(db, async tx => {
+                    const fresh   = await tx.get(groupRef);
+                    if (!fresh.exists()) throw new Error('group_deleted');
+                    const d       = fresh.data();
+
+                    // FIX: re-check inviteCode inside the transaction — if an admin
+                    // regenerated the code between the getDocs and now, the old code
+                    // should be rejected rather than silently adding to the wrong group.
+                    if (d.inviteCode !== code) throw new Error('code_rotated');
+
+                    const members   = d.members   || [];
+                    const pending   = d.pendingRequests   || [];
+                    const dismissed = d.dismissedRequests || [];
+
+                    if (members.includes(currentUser.email)) {
+                        alreadyMember = true; return; // abort write, not an error
+                    }
+                    if (pending.some(r => r.email === currentUser.email)) {
+                        alreadyPending = true; return;
+                    }
+
+                    const dismissEntry = dismissed.find(r => r.email === currentUser.email);
+                    if (dismissEntry && dismissEntry.dismissedUntil > Date.now()) {
+                        dismissedHours = Math.ceil((dismissEntry.dismissedUntil - Date.now()) / 3600000);
+                        return; // abort write
+                    }
+
+                    // All checks passed — write the pending request.
+                    const payload = {
+                        pendingRequests: arrayUnion({
+                            email: currentUser.email,
+                            name:  currentUser.name,
+                            requestedAt: Date.now()
+                        })
+                    };
+                    // Also clean up any expired dismiss entry for this user.
+                    if (dismissEntry) payload.dismissedRequests = arrayRemove(dismissEntry);
+                    tx.update(groupRef, payload);                });
+
+                if (alreadyMember) {
                     errEl.textContent = 'You are already a member of this group.';
                     errEl.style.display = 'block';
                     btn.textContent = 'Send Join Request'; btn.disabled = false;
                     return;
                 }
-                const pending   = groupData.pendingRequests || [];
-                const dismissed = groupData.dismissedRequests || [];
-                const dismissEntry = dismissed.find(r => r.email === currentUser.email);
-                if (dismissEntry && dismissEntry.dismissedUntil > Date.now()) {
-                    const hoursLeft = Math.ceil((dismissEntry.dismissedUntil - Date.now()) / 3600000);
-                    errEl.textContent = `Your request was dismissed. You can try again in ${hoursLeft} hour(s).`;
-                    errEl.style.display = 'block';
-                    btn.textContent = 'Send Join Request'; btn.disabled = false;
-                    return;
-                }
-                if (pending.some(r => r.email === currentUser.email)) {
+                if (alreadyPending) {
                     errEl.textContent = 'Your join request is already pending approval.';
                     errEl.style.display = 'block';
                     btn.textContent = 'Send Join Request'; btn.disabled = false;
                     return;
                 }
-                // Remove from dismissed if re-applying after expiry
-                const newDismissed = dismissed.filter(r => r.email !== currentUser.email);
-                await updateDoc(doc(db, 'chats', groupDocId), {
-                    pendingRequests: arrayUnion({ email: currentUser.email, name: currentUser.name, requestedAt: Date.now() }),
-                    dismissedRequests: newDismissed
-                });
+                if (dismissedHours > 0) {
+                    errEl.textContent = `Your request was dismissed. Try again in ${dismissedHours} hour(s).`;
+                    errEl.style.display = 'block';
+                    btn.textContent = 'Send Join Request'; btn.disabled = false;
+                    return;
+                }
+
+                // FIX: post a system message into the group so admins who are actively
+                // in the chat see a real-time notification. The sidebar badge (added above)
+                // covers admins who aren't currently in the chat.
+                // Non-members can write system messages per the create rule (senderEmail=='system').
+                await addDoc(collection(db, `chats/${groupDoc.id}/messages`), {
+                    text: `📩 ${currentUser.name} requested to join the group. Open Members → Requests to review.`,
+                    senderEmail: 'system', senderName: 'System', createdAt: serverTimestamp()
+                }).catch(() => {}); // non-fatal — don't block the join flow if this fails
+
                 closeJoin();
                 showToast('Join request sent! Waiting for admin approval.', 'success');
-            } catch(err) {
+            } catch (err) {
                 console.error('[Chat] join group error:', err);
-                errEl.textContent = 'Something went wrong. Please try again.';
+                const msg = err.message === 'group_deleted' ? 'This group no longer exists.'
+                          : err.message === 'code_rotated'  ? 'This invite code has been rotated. Ask the admin for the new code.'
+                          : 'Something went wrong. Please try again.';
+                errEl.textContent = msg;
                 errEl.style.display = 'block';
                 btn.textContent = 'Send Join Request'; btn.disabled = false;
             }
@@ -2355,13 +2648,11 @@ export function setupChat() {
     });
 
     // ── Open chat room ───────────────────────────
-    const openChatRoom = (targetEmail, targetName, chatType) => {
-        // Fix #5 (High): always remove the previous dropdown listener before registering
-        // a new one — prevents accumulation when openChatRoom is called via
-        // window.startDirectChat or the ?joinGroup= URL flow (which skip sidebar cleanup).
-        if (chatHeader._cleanupDropdown) {
-            document.removeEventListener('click', chatHeader._cleanupDropdown);
-            chatHeader._cleanupDropdown = null;
+    const openChatRoom = async (targetEmail, targetName, chatType) => {
+        // FIX #5: use module-scope _cleanupDropdown instead of DOM property
+        if (_cleanupDropdown) {
+            document.removeEventListener('click', _cleanupDropdown);
+            _cleanupDropdown = null;
         }
         unsubscribeRoomListeners();
         closeSearchBar();
@@ -2379,10 +2670,21 @@ export function setupChat() {
         activeRoomDetails = { id: activeRoomId, type: chatType, targetEmail, targetName };
 
         if (chatType === 'private') {
-            setDoc(doc(db, 'chats', activeRoomId), {
-                type: 'private', members: [currentUser.email, targetEmail],
-                memberNames: [currentUser.name, targetName], lastUpdated: serverTimestamp()
-            }, { merge: true }).catch(() => showToast('Could not open chat.', 'error'));
+            // FIX: await the setDoc before any Firestore listeners open.
+            // The messages sub-collection rule calls isChatMember() which does
+            // get(chats/{chatId}) — if that doc doesn't exist yet (first time
+            // these two users chat), isChatMember() returns false → permission-denied.
+            // Awaiting here ensures the parent chat doc is committed before the
+            // snapshot listeners below try to read it.
+            try {
+                await setDoc(doc(db, 'chats', activeRoomId), {
+                    type: 'private', members: [currentUser.email, targetEmail],
+                    memberNames: [currentUser.name, targetName], lastUpdated: serverTimestamp()
+                }, { merge: true });
+            } catch {
+                showToast('Could not open chat.', 'error');
+                return;
+            }
         }
 
         markRoomRead(activeRoomId); // FIX: markRoomRead already calls _recomputeNavBadge — removed duplicate call
@@ -2457,8 +2759,8 @@ export function setupChat() {
         // Close dropdown on outside click
         const closeDropdown = () => { if (headerDropdown) headerDropdown.style.display = 'none'; };
         document.addEventListener('click', closeDropdown);
-        // Clean up listener when room changes (will be re-added on next openChatRoom)
-        chatHeader._cleanupDropdown = closeDropdown;
+        // FIX #5: store at module scope so it survives header innerHTML rewrites
+        _cleanupDropdown = closeDropdown;
 
         // Root listener
         rootChatSub = onSnapshot(doc(db, 'chats', activeRoomId), docSnap => {
@@ -2517,7 +2819,16 @@ export function setupChat() {
             limit(100)
         );
         chatSub = onSnapshot(msgsQuery, snap => {
-            if (snap.empty && !lastMessagesSnapshot.length) {
+            // FIX: always merge in-flight optimistic messages back — they have no Firestore doc yet
+            // so they won't appear in snap.docs. Without this, sending a message wipes the
+            // optimistic bubble the moment the first snapshot fires (which is before addDoc resolves).
+            const pending = lastMessagesSnapshot.filter(m => m._pending || m._failed);
+            const fromFirestore = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+            // FIX: snap.empty guard was `&& !lastMessagesSnapshot.length` — wrong when all messages
+            // are deleted after room was open; show empty state whenever Firestore returns nothing
+            // AND there are no pending optimistic messages in flight.
+            if (snap.empty && !pending.length) {
+                lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length); // already in-place
                 chatContainer.innerHTML = `
                     <div class="w-full h-full flex items-center justify-center">
                         <div style="background:rgba(255,255,255,.9);border:1px solid var(--wa-border);padding:12px 20px;border-radius:12px;color:var(--wa-sub);font-size:13px;text-align:center">
@@ -2527,13 +2838,25 @@ export function setupChat() {
                     </div>`;
                 return;
             }
-            lastMessagesSnapshot = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-            // FIX: mutate starredMessages in place (never reassign); try/catch for private browsing
+            // FIX #1: splice in-place so external references to the array stay valid
+            lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length, ...pending, ...fromFirestore);
+            // FIXED: starred messages now stored in Firestore (no localStorage).
+            // Load starred IDs from the user's starred sub-collection in this room.
             starredMessages.clear();
-            try {
-                const savedStarred = JSON.parse(localStorage.getItem(`starred_${activeRoomId}`) || '[]');
-                savedStarred.forEach(id => starredMessages.add(id));
-            } catch { /* blocked in private browsing — leave set empty */ }
+            getDoc(doc(db, `chats/${activeRoomId}/starred`, currentUser.email))
+                .then(sSnap => {
+                    if (sSnap.exists()) {
+                        const ids = sSnap.data().ids || [];
+                        ids.forEach(id => {
+                            if (typeof id === 'string' && id.length > 0 && id.length < 200 && !/[\s/]/.test(id)) {
+                                starredMessages.add(id);
+                            }
+                        });
+                    }
+                    // Re-render after starred set loads so star badges appear correctly
+                    renderMessages();
+                })
+                .catch(() => { /* non-fatal — leave set empty */ });
             renderMessages();
             markMessagesSeenBy(activeRoomId);
         }, err => { console.error('[Chat] messages:', err); showToast('Error loading messages.', 'error'); });
@@ -2551,10 +2874,10 @@ export function setupChat() {
             document.querySelectorAll('.wa-sidebar-item--active').forEach(el =>
                 el.classList.remove('wa-sidebar-item--active'));
             item.classList.add('wa-sidebar-item--active');
-            // Clean up old dropdown listener
-            if (chatHeader._cleanupDropdown) {
-                document.removeEventListener('click', chatHeader._cleanupDropdown);
-                chatHeader._cleanupDropdown = null;
+            // FIX #5: clean up module-scope dropdown listener
+            if (_cleanupDropdown) {
+                document.removeEventListener('click', _cleanupDropdown);
+                _cleanupDropdown = null;
             }
             openChatRoom(email, name, chatType);
             window.startDirectChat = (e2, n2) => openChatRoom(e2, n2, 'private');
@@ -2601,14 +2924,15 @@ export function setupChat() {
             if (msg) {
                 showReplyPreview(msg, chatHeader, input);
             } else {
+                // FIX #12: re-validate URLs read back from data-* attributes
                 showReplyPreview({
                     id: replyBtn.dataset.msgId,
                     text: replyBtn.dataset.text || '',
                     senderName: replyBtn.dataset.sender || '',
                     senderEmail: '',
-                    imageUrl: replyBtn.dataset.image || '',
-                    voiceUrl: replyBtn.dataset.voice || '',
-                    fileUrl: replyBtn.dataset.file  || '',
+                    imageUrl: safeUrl(replyBtn.dataset.image || '') || '',
+                    voiceUrl: safeUrl(replyBtn.dataset.voice || '') || '',
+                    fileUrl:  safeUrl(replyBtn.dataset.file  || '') || '',
                     fileName: replyBtn.dataset.filename || ''
                 }, chatHeader, input);
             }
@@ -2662,7 +2986,12 @@ export function setupChat() {
             const msgId = starBtn.dataset.msgId;
             if (starredMessages.has(msgId)) { starredMessages.delete(msgId); showToast('Unstarred.'); }
             else { starredMessages.add(msgId); showToast('Message starred. ⭐'); }
-            try { localStorage.setItem(`starred_${activeRoomId}`, JSON.stringify([...starredMessages])); } catch {}
+            // FIXED: persist starred messages in Firestore, not localStorage
+            if (activeRoomId) {
+                setDoc(doc(db, `chats/${activeRoomId}/starred`, currentUser.email), {
+                    ids: [...starredMessages], updatedAt: serverTimestamp()
+                }, { merge: true }).catch(() => {});
+            }
             renderMessages(); return;
         }
 
@@ -2754,21 +3083,64 @@ export function setupChat() {
         if (voicePlayBtn) {
             const url = voicePlayBtn.dataset.voiceUrl;
             if (!url) return;
-            // FIX: use module-level _activeAudio instead of window._waAudio
+
+            const PLAY_ICON  = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
+            const PAUSE_ICON = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
+
+            // FIX: if something is already playing, stop it and reset ITS button (not the clicked one)
             if (_activeAudio && !_activeAudio.paused) {
+                // Find the button that owns the currently playing audio and reset it
+                const playingUrl = _activeAudio._voiceUrl;
+                if (playingUrl) {
+                    document.querySelectorAll(`.wa-voice-play-btn[data-voice-url="${cssEscape(playingUrl)}"]`)
+                        .forEach(b => { b.innerHTML = PLAY_ICON; });
+                    // Remove playing class from the previously-active voice note container
+                    document.querySelectorAll(`.wa-voice-note[data-voice-url="${cssEscape(playingUrl)}"]`)
+                        .forEach(n => { n.classList.remove('playing'); });
+                }
                 _activeAudio.pause();
-                voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
-                return;
+                _activeAudio = null;
+                // If user clicked the SAME button that was playing, just stop — don't restart
+                if (playingUrl === url) return;
             }
-            // Fix #4 (Critical): never fall back to raw url — if safeUrl rejects it, abort
+
             const _safeVoice = safeUrl(url);
             if (!_safeVoice) return;
-            const audio    = new Audio(_safeVoice);
-            _activeAudio   = audio;
-            voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
-            audio.play().catch(() => {});
-            audio.addEventListener('ended', () => {
-                voicePlayBtn.innerHTML = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
+
+            const audio      = new Audio(_safeVoice);
+            audio._voiceUrl  = url; // FIX: tag audio with its source URL so we can reset the right button
+            _activeAudio     = audio;
+            voicePlayBtn.innerHTML = PAUSE_ICON;
+
+            // Mark the voice-note container as playing so CSS waveform animation fires
+            const voiceNote  = voicePlayBtn.closest('.wa-voice-note');
+            const durSpan    = voiceNote?.querySelector('.wa-voice-duration');
+            const totalDur   = durSpan ? durSpan.textContent : '';
+            if (voiceNote) voiceNote.classList.add('playing');
+
+            // FIX: handle load/play errors — reset button, remove playing class, clear ref
+            const resetBtn = () => {
+                voicePlayBtn.innerHTML = PLAY_ICON;
+                if (voiceNote) voiceNote.classList.remove('playing');
+                if (durSpan && totalDur) durSpan.textContent = totalDur; // restore original duration
+                if (_activeAudio === audio) _activeAudio = null; // FIX: null out on end/error
+            };
+
+            // Live elapsed time counter during playback
+            audio.addEventListener('timeupdate', () => {
+                if (!durSpan) return;
+                const elapsed = Math.floor(audio.currentTime);
+                durSpan.textContent = formatDuration(elapsed);
+            });
+
+            audio.addEventListener('ended', resetBtn);
+            audio.addEventListener('error', () => {
+                resetBtn();
+                showToast('Could not play voice note.', 'error');
+            });
+            audio.play().catch(() => {
+                resetBtn();
+                showToast('Could not play voice note.', 'error');
             });
             return;
         }
@@ -2788,10 +3160,21 @@ export function setupChat() {
             });
             if (!ok) return;
             try {
-                await updateDoc(doc(db, 'chats', activeRoomId), { members: arrayRemove(currentUser.email) });
+                // FIX: write the system message BEFORE removing from members.
+                // The messages rule calls isChatMember() — if we remove from members first,
+                // the addDoc fires when the user is no longer a member → permission-denied,
+                // the catch block fires, and the UI shows "Failed to leave" even though the
+                // updateDoc already succeeded and the user actually did leave.
+                // Writing the message first (while still a member) avoids this race.
                 await addDoc(collection(db, `chats/${activeRoomId}/messages`), {
                     text: `${currentUser.name} left the group.`,
                     senderEmail: 'system', senderName: 'System', createdAt: serverTimestamp()
+                });
+                // Also remove from memberNames and admins so no orphaned data remains.
+                await updateDoc(doc(db, 'chats', activeRoomId), {
+                    members:     arrayRemove(currentUser.email),
+                    memberNames: arrayRemove(currentUser.name),
+                    admins:      arrayRemove(currentUser.email),
                 });
                 resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn);
                 showToast('You left the group.', 'success');
@@ -2820,10 +3203,17 @@ export function setupChat() {
             try {
                 const roomIdToClear = activeRoomId;
                 const msgsSnap = await getDocs(collection(db, `chats/${roomIdToClear}/messages`));
-                await Promise.all(msgsSnap.docs.map(d =>
-                    updateDoc(d.ref, { deletedFor: arrayUnion(currentUser.email) })
-                ));
-                lastMessagesSnapshot = [];
+                // FIX #8: use writeBatch instead of parallel updateDoc calls
+                const _clearDocs = msgsSnap.docs;
+                const BATCH_SIZE = 499;
+                for (let _bi = 0; _bi < _clearDocs.length; _bi += BATCH_SIZE) {
+                    const _wb = writeBatch(db);
+                    _clearDocs.slice(_bi, _bi + BATCH_SIZE).forEach(d =>
+                        _wb.update(d.ref, { deletedFor: arrayUnion(currentUser.email) })
+                    );
+                    await _wb.commit();
+                }
+                lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
                 renderMessages();
                 showToast('Chat cleared.', 'success');
             } catch { showToast('Failed to clear chat.', 'error'); }
@@ -2841,16 +3231,15 @@ export function setupChat() {
             if (!ok) return;
             try {
                 const roomIdToDelete = activeRoomId;
-                const msgsSnap       = await getDocs(collection(db, `chats/${roomIdToDelete}/messages`));
-                // Batch deletions in groups of 400 to avoid memory spikes
-                const chunks = [];
-                let chunk    = [];
-                msgsSnap.forEach(d => {
-                    chunk.push(deleteDoc(d.ref));
-                    if (chunk.length >= 400) { chunks.push(Promise.all(chunk)); chunk = []; }
-                });
-                if (chunk.length) chunks.push(Promise.all(chunk));
-                await Promise.all(chunks);
+                const msgsSnap = await getDocs(collection(db, `chats/${roomIdToDelete}/messages`));
+                // FIX #8: use writeBatch (max 499 ops) so Firestore rate-limits properly
+                const _delDocs = msgsSnap.docs;
+                const BATCH_SIZE = 499;
+                for (let _bi = 0; _bi < _delDocs.length; _bi += BATCH_SIZE) {
+                    const _wb = writeBatch(db);
+                    _delDocs.slice(_bi, _bi + BATCH_SIZE).forEach(d => _wb.delete(d.ref));
+                    await _wb.commit();
+                }
                 await deleteDoc(doc(db, 'chats', roomIdToDelete));
                 resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn);
                 showToast('Chat deleted.', 'success');
@@ -2942,7 +3331,12 @@ export function setupChat() {
 
     async function sendTextMessage(text) {
         if (!text || !activeRoomId || !activeRoomDetails) return;
-        const roomId  = activeRoomId;
+        const roomId      = activeRoomId;
+        // FIX: snapshot all room context before the first await — if the user switches
+        // rooms mid-send, activeRoomId/activeRoomDetails will have changed by the time
+        // the await resolves, causing the unread bump to target the wrong chat.
+        const _roomType   = activeRoomDetails.type;
+        const _recipEmail = activeRoomDetails.targetEmail;
         const tempId  = `pending_${Date.now()}_${optimisticCounter++}`;
         const replyTo = replyingTo ? { ...replyingTo } : null;
 
@@ -2950,16 +3344,18 @@ export function setupChat() {
             id: tempId, text, senderEmail: currentUser.email, senderName: currentUser.name,
             createdAt: { toDate: () => new Date() }, _pending: true, replyTo
         };
+        // FIX #7: clear replyingTo BEFORE any await so a room-switch mid-send
+        // can't clobber the new room's reply state
+        replyingTo = null;
+        document.getElementById('wa-reply-preview')?.remove();
+
         if (roomId === activeRoomId) {
-            lastMessagesSnapshot = [optimisticMsg, ...lastMessagesSnapshot];
+            // FIX #1: unshift in-place rather than reassigning the array
+            lastMessagesSnapshot.unshift(optimisticMsg);
             renderMessages();
         }
         clearTypingState();
         writeTypingState(roomId, false);
-
-        // FIX: clear replyingTo BEFORE async call so it's not attached twice on retry
-        replyingTo = null;
-        document.getElementById('wa-reply-preview')?.remove();
 
         try {
             const payload = {
@@ -2968,25 +3364,39 @@ export function setupChat() {
             };
             if (replyTo) payload.replyTo = replyTo;
             await addDoc(collection(db, `chats/${roomId}/messages`), payload);
-            // FIX: bump recipient unreadCount for private chats (was only resetting own counter)
-            const _sendRoomDetails = activeRoomDetails;
+            // FIX: use pre-captured _recipEmail (not live activeRoomDetails) to avoid room-switch race
             const _sendUpdate = {
                 lastMessage: text, lastSenderEmail: currentUser.email,
                 lastUpdated: serverTimestamp(),
                 [`unreadCount.${currentUser.email}`]: 0
             };
-            if (_sendRoomDetails?.type === 'private' && _sendRoomDetails?.targetEmail) {
-                const _recip = _sendRoomDetails.targetEmail;
+            if (_roomType === 'private' && _recipEmail) {
                 const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                _sendUpdate[`unreadCount.${_recip}`] = (_rSnap?.data()?.unreadCount?.[_recip] || 0) + 1;
+                _sendUpdate[`unreadCount.${_recipEmail}`] = (_rSnap?.data()?.unreadCount?.[_recipEmail] || 0) + 1;
+            } else if (_roomType === 'group') {
+                // FIX: bump unread for every group member except the sender
+                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
+                const _groupMembers = _rSnap?.data()?.members || [];
+                for (const _gm of _groupMembers) {
+                    if (_gm && _gm !== currentUser.email) {
+                        _sendUpdate[`unreadCount.${_gm}`] = (_rSnap?.data()?.unreadCount?.[_gm] || 0) + 1;
+                    }
+                }
             }
             await setDoc(doc(db, 'chats', roomId), _sendUpdate, { merge: true });
-            lastMessagesSnapshot = lastMessagesSnapshot.filter(m => m.id !== tempId);
+            // FIX #1: mutate in-place; also handles the case where
+            // the Firestore snapshot already removed the temp entry
+            const _si = lastMessagesSnapshot.findIndex(m => m.id === tempId);
+            if (_si !== -1) lastMessagesSnapshot.splice(_si, 1);
             if (roomId === activeRoomId) renderMessages();
         } catch (err) {
             console.error('Send failed:', err);
-            lastMessagesSnapshot = lastMessagesSnapshot.map(m =>
-                m.id === tempId ? { ...m, _pending: false, _failed: true } : m);
+            // FIX #1+#6: mutate in-place; if user switched rooms the entry
+            // won't be found — no-op is correct (old room's list was reset)
+            const _fi = lastMessagesSnapshot.findIndex(m => m.id === tempId);
+            if (_fi !== -1) {
+                lastMessagesSnapshot[_fi] = { ...lastMessagesSnapshot[_fi], _pending: false, _failed: true };
+            }
             if (roomId === activeRoomId) renderMessages();
             showToast('Failed to send.', 'error');
         }
@@ -2995,7 +3405,9 @@ export function setupChat() {
     async function retrySend(tempId) {
         const t = lastMessagesSnapshot.find(m => m.id === tempId);
         if (!t) return;
-        lastMessagesSnapshot = lastMessagesSnapshot.filter(m => m.id !== tempId);
+        // FIX #1: mutate in-place
+        const _ri = lastMessagesSnapshot.findIndex(m => m.id === tempId);
+        if (_ri !== -1) lastMessagesSnapshot.splice(_ri, 1);
         // FIX: restore replyTo from the failed message so it's preserved on retry
         if (t.replyTo) replyingTo = t.replyTo;
         await sendTextMessage(t.text);
@@ -3014,6 +3426,8 @@ export function setupChat() {
             input.style.height = 'auto';
             input.focus();
             try {
+                // FIX: guard activeRoomId — could be null if user navigated away during edit
+                if (!activeRoomId) { showToast('Chat closed — edit cancelled.', 'warning'); return; }
                 await updateDoc(doc(db, `chats/${activeRoomId}/messages`, idToEdit), {
                     text, edited: true, editedAt: serverTimestamp()
                 });
@@ -3094,13 +3508,18 @@ export function setupChat() {
     // FIX (Security): 50 MB client-side limit to prevent accidental/malicious huge uploads
     const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
+    // FIXED: sendMediaFile is intentionally single-file; multi-file callers use sendFilesSequentially.
+    // Progress bar is re-created per file so sequential uploads each show their own progress.
     async function sendMediaFile(file) {
         if (!file || !activeRoomId) return;
         if (file.size > MAX_UPLOAD_BYTES) {
-            showToast(`File too large (max 50 MB). Please choose a smaller file.`, 'error');
+            showToast(`"${file.name}" is too large (max 50 MB).`, 'error');
             return;
         }
-        const roomId  = activeRoomId;
+        const roomId      = activeRoomId;
+        // FIX: snapshot room context before upload await — prevents room-switch race
+        const _fileRoomType = activeRoomDetails?.type;
+        const _fileRecip    = activeRoomDetails?.targetEmail;
         const isImage = file.type?.startsWith('image/');
         const isVideo = file.type?.startsWith('video/');
         const savedPH = input.placeholder;
@@ -3141,14 +3560,10 @@ export function setupChat() {
         try {
             // All media goes through Cloudinary (Firebase Spark plan has no Storage).
             // uploadBytesWithRetry wraps uploadToCloudinary with retry + progress.
-            let url;
-            try {
-                url = await uploadBytesWithRetry(fileToSend, 'chats', (pct, attempt) => {
-                    setProgress(pct, attempt > 0 ? `Retrying… (attempt ${attempt + 1})` : `Uploading… ${pct}%`);
-                }, fileToSend instanceof File ? fileToSend.name : `upload_${Date.now()}`);
-            } catch (uploadErr) {
-                throw uploadErr;
-            }
+            // FIX: removed redundant inner try/catch that only re-threw — outer catch handles it
+            const url = await uploadBytesWithRetry(fileToSend, 'chats', (pct, attempt) => {
+                setProgress(pct, attempt > 0 ? `Retrying… (attempt ${attempt + 1})` : `Uploading… ${pct}%`);
+            }, fileToSend instanceof File ? fileToSend.name : `upload_${Date.now()}`);
             setProgress(100, 'Done');
 
             const payload = {
@@ -3165,17 +3580,24 @@ export function setupChat() {
             else               { payload.fileUrl = url; payload.fileName = file.name; payload.fileMime = file.type; payload.fileSize = fileToSend.size; }
 
             await addDoc(collection(db, `chats/${roomId}/messages`), payload);
-            // FIX: bump recipient unreadCount for file/image/video sends too
-            const _fileRoomDetails = activeRoomDetails;
+            // FIX: use pre-captured _fileRoomType/_fileRecip (not live activeRoomDetails — could have changed during upload)
             const _fileUpdate = {
                 lastMessage: isImage ? '📷 Photo' : (isVideo ? '🎥 Video' : `📎 ${file.name}`),
                 lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp(),
                 [`unreadCount.${currentUser.email}`]: 0
             };
-            if (_fileRoomDetails?.type === 'private' && _fileRoomDetails?.targetEmail) {
-                const _recip = _fileRoomDetails.targetEmail;
+            if (_fileRoomType === 'private' && _fileRecip) {
                 const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                _fileUpdate[`unreadCount.${_recip}`] = (_rSnap?.data()?.unreadCount?.[_recip] || 0) + 1;
+                _fileUpdate[`unreadCount.${_fileRecip}`] = (_rSnap?.data()?.unreadCount?.[_fileRecip] || 0) + 1;
+            } else if (_fileRoomType === 'group') {
+                // FIX: bump unread for every group member except the sender
+                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
+                const _groupMembers = _rSnap?.data()?.members || [];
+                for (const _gm of _groupMembers) {
+                    if (_gm && _gm !== currentUser.email) {
+                        _fileUpdate[`unreadCount.${_gm}`] = (_rSnap?.data()?.unreadCount?.[_gm] || 0) + 1;
+                    }
+                }
             }
             await setDoc(doc(db, 'chats', roomId), _fileUpdate, { merge: true });
             showToast(isImage ? 'Photo sent!' : isVideo ? 'Video sent!' : 'File sent!', 'success');
@@ -3192,14 +3614,26 @@ export function setupChat() {
         }
     }
 
+    // FIXED: multi-file support — queue all selected files and send sequentially.
+    // Shows progress per file; if any single file fails sendMediaFile shows its own toast.
+    async function sendFilesSequentially(files) {
+        for (let i = 0; i < files.length; i++) {
+            if (!activeRoomId) break; // user navigated away
+            await sendMediaFile(files[i]);
+        }
+    }
+
     imageAttachInput.addEventListener('change', async e => {
-        if (e.target.files[0]) { await sendMediaFile(e.target.files[0]); imageAttachInput.value = ''; }
+        const files = Array.from(e.target.files || []);
+        if (files.length) { await sendFilesSequentially(files); imageAttachInput.value = ''; }
     });
     fileAttachInput.addEventListener('change', async e => {
-        if (e.target.files[0]) { await sendMediaFile(e.target.files[0]); fileAttachInput.value = ''; }
+        const files = Array.from(e.target.files || []);
+        if (files.length) { await sendFilesSequentially(files); fileAttachInput.value = ''; }
     });
     videoAttachInput.addEventListener('change', async e => {
-        if (e.target.files[0]) { await sendMediaFile(e.target.files[0]); videoAttachInput.value = ''; }
+        const files = Array.from(e.target.files || []);
+        if (files.length) { await sendFilesSequentially(files); videoAttachInput.value = ''; }
     });
 
     // Drag & drop
@@ -3213,18 +3647,25 @@ export function setupChat() {
         e.preventDefault();
         chatContainer.classList.remove('wa-drag-over');
         if (!activeRoomId) return;
-        const file = e.dataTransfer.files?.[0];
-        if (file) await sendMediaFile(file);
+        // FIXED: send all dropped files, not just the first
+        const files = Array.from(e.dataTransfer.files || []);
+        if (files.length) await sendFilesSequentially(files);
     });
 
-    // Paste image from clipboard
+    // Paste image(s) from clipboard
+    // FIXED: send ALL pasted image items, not just the first
     input.addEventListener('paste', async e => {
         if (!activeRoomId) return;
+        const imageFiles = [];
         for (const item of (e.clipboardData?.items || [])) {
             if (item.type?.startsWith('image/')) {
                 const file = item.getAsFile();
-                if (file) { e.preventDefault(); await sendMediaFile(file); break; }
+                if (file) imageFiles.push(file);
             }
+        }
+        if (imageFiles.length) {
+            e.preventDefault();
+            await sendFilesSequentially(imageFiles);
         }
     });
 
@@ -3265,21 +3706,34 @@ export function setupChat() {
                 <span class="wa-rec-timer" id="wa-rec-timer">0:00</span>
                 <span style="color:var(--wa-sub);font-size:13px;margin-left:4px">Recording…</span>
                 <button type="button" class="wa-rec-pause" id="wa-rec-pause-btn" aria-label="Pause recording">⏸</button>
-                <button class="wa-rec-cancel" id="wa-rec-cancel-btn">✕ Cancel</button>`;
+                <button class="wa-rec-cancel" id="wa-rec-cancel-btn">✕ Cancel</button>
+                <button class="wa-rec-send" id="wa-rec-send-btn" aria-label="Send voice note">
+                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                </button>`;
             const inputArea = input.closest('form') || input.parentElement;
             inputArea?.parentElement?.insertBefore(bar, inputArea);
 
             let elapsed = 0;
+            let _pausedMs = 0;      // FIX: accumulate paused time so duration is accurate
+            let _pauseStart = null; // FIX: timestamp when pause began
+            // FIX: guard against stale interval if re-entered (belt-and-suspenders)
+            if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
             recordingTimer = setInterval(() => {
+                // FIX: skip tick while MediaRecorder is paused so display matches audio length
+                if (mediaRecorder && mediaRecorder.state === 'paused') return;
                 elapsed++;
                 const el = document.getElementById('wa-rec-timer');
                 if (el) el.textContent = formatDuration(elapsed);
-                if (elapsed >= 120) stopAndSendRecording();
+                if (elapsed >= 120) stopAndSendRecording(); // 2-min cap
             }, 1000);
 
             document.getElementById('wa-rec-cancel-btn')?.addEventListener('click', () => {
                 stopRecording(true);
                 stream.getTracks().forEach(t => t.stop());
+            });
+
+            document.getElementById('wa-rec-send-btn')?.addEventListener('click', () => {
+                stopAndSendRecording();
             });
 
             // EXT: pause / resume recording
@@ -3289,41 +3743,106 @@ export function setupChat() {
                 if (!mediaRecorder) return;
                 if (mediaRecorder.state === 'recording') {
                     mediaRecorder.pause();
+                    _pauseStart = Date.now(); // FIX: record when pause began
                     if (pauseBtn) pauseBtn.textContent = '▶';
                     if (dot)     dot.classList.add('paused');
                 } else if (mediaRecorder.state === 'paused') {
                     mediaRecorder.resume();
+                    if (_pauseStart) { _pausedMs += Date.now() - _pauseStart; _pauseStart = null; } // FIX: accumulate
                     if (pauseBtn) pauseBtn.textContent = '⏸';
                     if (dot)     dot.classList.remove('paused');
                 }
             });
 
+            // FIX: snapshot room context HERE (before recording starts) so onstop
+            // can't be affected by a room switch that happens while recording.
+            const _voiceRoomId      = activeRoomId;
+            const _voiceRoomType    = activeRoomDetails?.type;
+            const _voiceRecip       = activeRoomDetails?.targetEmail;
+            // FIX: capture mimeType now — by the time onstop fires we null mediaRecorder
+            const _capturedMime     = mediaRecorder.mimeType || mimeType || 'audio/webm';
+
             mediaRecorder.onstop = async () => {
-                stream.getTracks().forEach(t => t.stop());
-                // FIX: check cancelled flag, not chunk length (chunks may have been pushed after clear)
+                // FIX: collect all remaining data BEFORE stopping tracks — some browsers
+                // flush a final chunk only after requestData(), stopping tracks early can drop it.
+                // Tracks are stopped here (not at the top) so the final chunk isn't cut off.
                 if (recordingCancelled || !audioChunks.length) {
                     audioChunks = [];
+                    stream.getTracks().forEach(t => t.stop());
                     return;
                 }
-                // FIX: use the recorder's actual mimeType, not hardcoded ogg
-                const recMime  = mediaRecorder?.mimeType || 'audio/webm';
-                mediaRecorder  = null; // safe to null now — all data collected
-                const blob     = new Blob(audioChunks, { type: recMime });
-                const duration = Math.max(1, Math.round((Date.now() - recordingStartTime) / 1000));
+                // FIX (voice): discard suspiciously tiny blobs (silence or mic error)
+                const _totalSize = audioChunks.reduce((n, c) => n + c.size, 0);
+                if (_totalSize < 100) {
+                    audioChunks = [];
+                    stream.getTracks().forEach(t => t.stop());
+                    showToast('Voice note was too short.', 'warning');
+                    return;
+                }
+                // FIX: use _capturedMime — mediaRecorder is nulled below before we'd read .mimeType
+                const blob     = new Blob(audioChunks, { type: _capturedMime });
+                // FIX: subtract accumulated paused time so voiceDuration matches actual audio
+                if (_pauseStart) { _pausedMs += Date.now() - _pauseStart; _pauseStart = null; }
+                const duration = Math.max(1, Math.round((Date.now() - recordingStartTime - _pausedMs) / 1000));
                 audioChunks    = [];
-                const roomId   = activeRoomId;
-                if (!roomId) return;
+                mediaRecorder  = null; // safe to null now — blob assembled, mimeType already captured
+                stream.getTracks().forEach(t => t.stop()); // FIX: stop tracks after blob is assembled
+                if (!_voiceRoomId) return;
+
+                // Optimistic: show a pending voice bubble immediately while uploading
+                const _voiceTempId = `pending_voice_${Date.now()}_${optimisticCounter++}`;
+                const _optimisticVoice = {
+                    id: _voiceTempId,
+                    voiceUrl: '', voiceDuration: duration,
+                    senderEmail: currentUser.email, senderName: currentUser.name,
+                    createdAt: { toDate: () => new Date() }, _pending: true, text: ''
+                };
+                if (_voiceRoomId === activeRoomId) {
+                    // FIX #1: unshift in-place
+                    lastMessagesSnapshot.unshift(_optimisticVoice);
+                    renderMessages();
+                }
+
                 try {
-                    const url = await uploadAudioBlob(blob, recMime);
-                    await addDoc(collection(db, `chats/${roomId}/messages`), {
+                    const url = await uploadAudioBlob(blob, _capturedMime);
+                    await addDoc(collection(db, `chats/${_voiceRoomId}/messages`), {
                         voiceUrl: url, voiceDuration: duration,
                         senderEmail: currentUser.email, senderName: currentUser.name,
                         createdAt: serverTimestamp(), seenBy: [], text: ''
                     });
-                    await setDoc(doc(db, 'chats', roomId), {
-                        lastMessage: '🎤 Voice note', lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp()
-                    }, { merge: true });
-                } catch (err) { console.error(err); showToast('Failed to send voice note.', 'error'); }
+                    // FIX #1: remove in-place
+                    const _vsi = lastMessagesSnapshot.findIndex(m => m.id === _voiceTempId);
+                    if (_vsi !== -1) lastMessagesSnapshot.splice(_vsi, 1);
+                    if (_voiceRoomId === activeRoomId) renderMessages();
+                    // FIX: bump recipient unread + reset own — uses pre-captured room context
+                    const _voiceUpdate = {
+                        lastMessage: '🎤 Voice note', lastSenderEmail: currentUser.email,
+                        lastUpdated: serverTimestamp(),
+                        [`unreadCount.${currentUser.email}`]: 0
+                    };
+                    if (_voiceRoomType === 'private' && _voiceRecip) {
+                        const _vSnap = await getDoc(doc(db, 'chats', _voiceRoomId)).catch(() => null);
+                        _voiceUpdate[`unreadCount.${_voiceRecip}`] = (_vSnap?.data()?.unreadCount?.[_voiceRecip] || 0) + 1;
+                    } else if (_voiceRoomType === 'group') {
+                        // FIX: bump unread for every group member except the sender
+                        const _vSnap = await getDoc(doc(db, 'chats', _voiceRoomId)).catch(() => null);
+                        const _vGroupMembers = _vSnap?.data()?.members || [];
+                        for (const _gm of _vGroupMembers) {
+                            if (_gm && _gm !== currentUser.email) {
+                                _voiceUpdate[`unreadCount.${_gm}`] = (_vSnap?.data()?.unreadCount?.[_gm] || 0) + 1;
+                            }
+                        }
+                    }
+                    await setDoc(doc(db, 'chats', _voiceRoomId), _voiceUpdate, { merge: true });
+                } catch (err) {
+                    console.error(err);
+                    // Mark optimistic bubble as failed so user sees a retry affordance
+                    // FIX #1: mutate in-place
+                    const _vfi = lastMessagesSnapshot.findIndex(m => m.id === _voiceTempId);
+                    if (_vfi !== -1) lastMessagesSnapshot[_vfi] = { ...lastMessagesSnapshot[_vfi], _pending: false, _failed: true };
+                    if (_voiceRoomId === activeRoomId) renderMessages();
+                    showToast('Failed to send voice note.', 'error');
+                }
             };
         } catch (err) {
             console.error(err);
@@ -3381,9 +3900,13 @@ export function setupChat() {
                 <div id="mem-tab-invite" style="overflow-y:auto;flex:1;padding:16px;display:none;flex-direction:column;gap:14px"></div>
             </div>`;
         document.body.appendChild(modal);
-        const close = () => modal.remove();
-        modal.addEventListener('click', e => { if (e.target === modal) close(); });
-        document.getElementById('close-members-modal').addEventListener('click', close);
+        // FIX: define close2 first so it is the only listener ever attached —
+        // the old pattern attached 'close' then tried to remove it via a fresh
+        // arrow function (which never matched), leaving the original leaking.
+        let _membersPanelSub = null;
+        const close2 = () => { _membersPanelSub?.(); modal.remove(); };
+        modal.addEventListener('click', e => { if (e.target === modal) close2(); });
+        document.getElementById('close-members-modal').addEventListener('click', close2);
 
         // Tab switching
         modal.querySelectorAll('.mem-tab-btn').forEach(btn => {
@@ -3403,9 +3926,10 @@ export function setupChat() {
             });
         });
 
+        // FIX #9: use onSnapshot so the panel reflects concurrent admin changes
         try {
-            const snap = await getDoc(doc(db, 'chats', activeRoomId));
-            if (!snap.exists()) { close(); return; }
+            _membersPanelSub = onSnapshot(doc(db, 'chats', activeRoomId), (snap) => {
+            if (!snap.exists()) { close2(); return; }
             const data        = snap.data();
             const members     = data.members || [];
             const memberNames = data.memberNames || [];
@@ -3506,7 +4030,7 @@ export function setupChat() {
                                 });
                                 showToast(`${newName} added to group!`, 'success');
                                 closeAdd();
-                                close();
+                                close2();
                             } catch { showToast('Failed to add member.', 'error'); }
                         });
                     });
@@ -3531,7 +4055,7 @@ export function setupChat() {
                             admins: wasAdmin ? arrayRemove(targetEmail) : arrayUnion(targetEmail)
                         });
                         showToast(wasAdmin ? 'Admin removed.' : 'Admin added!', 'success');
-                        close();
+                        close2();
                         setTimeout(() => openMembersPanel(), 150);
                     } catch { showToast('Failed to update admin.', 'error'); }
                 });
@@ -3560,7 +4084,7 @@ export function setupChat() {
                             senderEmail: 'system', senderName: 'System', createdAt: serverTimestamp()
                         });
                         showToast('Member removed.', 'success');
-                        close();
+                        close2();
                     } catch { showToast('Failed to remove member.', 'error'); }
                 });
             });
@@ -3605,38 +4129,64 @@ export function setupChat() {
                 document.querySelectorAll('.req-approve-btn').forEach(btn => {
                     btn.addEventListener('click', async () => {
                         const email = btn.dataset.email;
-                        const name  = btn.dataset.name;
                         try {
-                            await updateDoc(doc(db, 'chats', activeRoomId), {
-                                members: arrayUnion(email),
-                                memberNames: arrayUnion(name),
-                                pendingRequests: (data.pendingRequests || []).filter(r => r.email !== email)
+                            // FIX: read reqObj fresh inside a transaction so we use the
+                            // exact object Firestore has (including requestedAt), not a
+                            // stale snapshot from when the panel was rendered.
+                            // Also fixes: btn.dataset.name was HTML-sanitised so it could
+                            // differ from the raw stored name, causing arrayRemove to fail
+                            // (object equality requires every field to match exactly).
+                            const roomRef = doc(db, 'chats', activeRoomId);
+                            let rawName   = email; // fallback
+                            await runTransaction(db, async tx => {
+                                const snap = await tx.get(roomRef);
+                                if (!snap.exists()) throw new Error('room_gone');
+                                const d      = snap.data();
+                                const reqObj = (d.pendingRequests || []).find(r => r.email === email);
+                                if (!reqObj) return; // already approved/denied by another admin — no-op
+                                rawName = reqObj.name || email;
+                                const payload = {
+                                    members:     arrayUnion(email),
+                                    memberNames: arrayUnion(rawName),
+                                    pendingRequests: arrayRemove(reqObj),
+                                };
+                                tx.update(roomRef, payload);
                             });
                             await addDoc(collection(db, `chats/${activeRoomId}/messages`), {
-                                text: `${name || email} joined the group.`,
+                                text: `${rawName} joined the group.`,
                                 senderEmail: 'system', senderName: 'System', createdAt: serverTimestamp()
                             });
-                            showToast(`${name || email} approved!`, 'success');
-                            close();
+                            showToast(`${rawName} approved!`, 'success');
+                            close2();
                         } catch { showToast('Failed to approve.', 'error'); }
                     });
                 });
 
-                // Dismiss for 24h: add dismissedUntil timestamp, remove from pending
+                // Dismiss for 24h: move from pendingRequests to dismissedRequests
                 document.querySelectorAll('.req-dismiss-btn').forEach(btn => {
                     btn.addEventListener('click', async () => {
-                        const email = btn.dataset.email;
+                        const email        = btn.dataset.email;
                         const dismissUntil = Date.now() + 24 * 60 * 60 * 1000;
                         try {
-                            const newPending = (data.pendingRequests || []).filter(r => r.email !== email);
-                            const dismissed  = [...(data.dismissedRequests || []).filter(r => r.email !== email),
-                                               { email, dismissedUntil: dismissUntil }];
-                            await updateDoc(doc(db, 'chats', activeRoomId), {
-                                pendingRequests: newPending,
-                                dismissedRequests: dismissed
+                            // FIX: was two separate updateDoc calls (remove then add) which
+                            // opened a window for a concurrent write to corrupt the array.
+                            // Use a transaction to read fresh objects and write atomically.
+                            const roomRef = doc(db, 'chats', activeRoomId);
+                            await runTransaction(db, async tx => {
+                                const snap = await tx.get(roomRef);
+                                if (!snap.exists()) throw new Error('room_gone');
+                                const d            = snap.data();
+                                const pendingObj   = (d.pendingRequests   || []).find(r => r.email === email);
+                                const dismissedObj = (d.dismissedRequests || []).find(r => r.email === email);
+                                const dismissEntry = { email, dismissedUntil };
+                                const payload = { dismissedRequests: arrayUnion(dismissEntry) };
+                                // Remove stale entries atomically in the same write
+                                if (pendingObj)   payload.pendingRequests   = arrayRemove(pendingObj);
+                                if (dismissedObj) payload.dismissedRequests = arrayRemove(dismissedObj);
+                                tx.update(roomRef, payload);
                             });
                             showToast('Request dismissed for 24 hours.', 'info');
-                            close();
+                            close2();
                         } catch { showToast('Failed to dismiss.', 'error'); }
                     });
                 });
@@ -3646,11 +4196,17 @@ export function setupChat() {
                     btn.addEventListener('click', async () => {
                         const email = btn.dataset.email;
                         try {
-                            await updateDoc(doc(db, 'chats', activeRoomId), {
-                                pendingRequests: (data.pendingRequests || []).filter(r => r.email !== email)
+                            // FIX: read the request object fresh inside a transaction
+                            // so arrayRemove receives the exact stored object.
+                            const roomRef = doc(db, 'chats', activeRoomId);
+                            await runTransaction(db, async tx => {
+                                const snap    = await tx.get(roomRef);
+                                if (!snap.exists()) return; // room gone — no-op
+                                const denyObj = (snap.data().pendingRequests || []).find(r => r.email === email);
+                                if (denyObj) tx.update(roomRef, { pendingRequests: arrayRemove(denyObj) });
                             });
                             showToast('Request denied.', 'info');
-                            close();
+                            close2();
                         } catch { showToast('Failed to deny.', 'error'); }
                     });
                 });
@@ -3706,17 +4262,20 @@ export function setupChat() {
                 try {
                     await updateDoc(doc(db, 'chats', activeRoomId), { inviteCode: newCode });
                     showToast('New invite code generated!', 'success');
-                    close();
+                    close2();
                     setTimeout(() => openMembersPanel(), 150);
                 } catch { showToast('Failed to regenerate code.', 'error'); }
             });
+            }, err => {
+                console.error('[Chat] members panel:', err);
+                const el = document.getElementById('mem-tab-members');
+                if (el) el.innerHTML = '<p style="color:var(--wa-danger);font-size:14px;text-align:center;padding:24px">Failed to load members.</p>';
+            });
         } catch (err) {
-            console.error('[Chat] members panel:', err);
+            console.error('[Chat] members panel setup:', err);
             document.getElementById('mem-tab-members').innerHTML =
                 '<p style="color:var(--wa-danger);font-size:14px;text-align:center;padding:24px">Failed to load members.</p>';
         }
     }
 
-    // ── Init sidebar ─────────────────────────────
-    loadRecentChats();
 }

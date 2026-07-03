@@ -20,7 +20,8 @@
  *     skeletons, all async guards, audit on every action.
  */
 
-import { db } from '../config/firebase.js';
+import { db, auth } from '../config/firebase.js';
+import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
 import { currentUser, addDocument } from '../store/db.js';
 import { sanitize } from '../ui/templates.js';
 import {
@@ -430,27 +431,34 @@ export function setupAdmin() {
     // Subscribes once for the lifetime of the admin panel and keeps the
     // sidebar badge in sync without needing the user to navigate to the
     // moderation tab first.
-    _detach('queueBadge');
-    _unsubs['queueBadge'] = onSnapshot(
-        collection(db, 'reports'),
-        (snap) => {
-            const RESOLVED = new Set([
-                'resolved (dismissed)', 'resolved (purged)',
-                'resolved', 'dismissed', 'purged', 'closed',
-            ]);
-            let pending = 0;
-            snap.forEach(d => {
-                const st = (d.data().status || '').toLowerCase().trim();
-                if (!RESOLVED.has(st)) pending++;
-            });
-            const badge = document.getElementById('admin-queue-badge');
-            if (badge) {
-                badge.textContent = pending;
-                badge.classList.toggle('hidden', pending === 0);
-            }
-        },
-        (err) => console.warn('[Admin] Queue badge listener error:', err)
-    );
+    // FIX: gate behind confirmed Firebase Auth state — opening this snapshot
+    // immediately caused permission-denied because request.auth was null
+    // server-side until the JWT was fully validated.
+    const _unsubAdminAuth = onAuthStateChanged(auth, firebaseUser => {
+        _unsubAdminAuth(); // one-shot
+        if (!firebaseUser) return;
+        _detach('queueBadge');
+        _unsubs['queueBadge'] = onSnapshot(
+            collection(db, 'reports'),
+            (snap) => {
+                const RESOLVED = new Set([
+                    'resolved (dismissed)', 'resolved (purged)',
+                    'resolved', 'dismissed', 'purged', 'closed',
+                ]);
+                let pending = 0;
+                snap.forEach(d => {
+                    const st = (d.data().status || '').toLowerCase().trim();
+                    if (!RESOLVED.has(st)) pending++;
+                });
+                const badge = document.getElementById('admin-queue-badge');
+                if (badge) {
+                    badge.textContent = pending;
+                    badge.classList.toggle('hidden', pending === 0);
+                }
+            },
+            (err) => console.warn('[Admin] Queue badge listener error:', err)
+        );
+    });
 
     // ════════════════════════════════════════════════════════════════════════
     // 2. OVERVIEW / ANALYTICS

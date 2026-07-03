@@ -2,7 +2,8 @@
  * posts.js — Advanced Community Feed Module
  */
 
-import { db } from '../config/firebase.js';
+import { db, auth } from '../config/firebase.js';
+import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
 import { addDocument, currentUser } from '../store/db.js';
 import { uploadImage, uploadMediaFiles, getVideoThumbnail } from '../utils/storage.js';
 import {
@@ -10,10 +11,11 @@ import {
     handleAiSummarize,
 } from '../ui/templates.js';
 import {
-    collection, onSnapshot, query, orderBy, limit,
+    collection, onSnapshot, query, orderBy, limit, where,
     doc, updateDoc, arrayUnion, arrayRemove, deleteDoc,
-    getDoc, setDoc, serverTimestamp,
+    getDoc, getDocs, setDoc, serverTimestamp,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
+import { onPageVisit } from '../ui/navigation.js';
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -1523,7 +1525,80 @@ export function setupPosts() {
             (snap) => snap.forEach(d => _postCache.set(d.id, { id: d.id, ...d.data() }))
         );
     }
-    startCacheListener();
+
+    // FIX: gate both listeners behind confirmed Firebase Auth state.
+    // Previously loadFeed() and startCacheListener() fired immediately, before
+    // the Firebase JWT was validated server-side → permission-denied on every
+    // snapshot. onAuthStateChanged is the canonical signal the token is ready.
+    const _unsubPostsAuth = onAuthStateChanged(auth, firebaseUser => {
+        _unsubPostsAuth(); // one-shot
+        if (firebaseUser) {
+            loadFeed();
+            startCacheListener();
+        }
+    });
+
+    // ── My Posts — lazy load when the page is visited ─────────────────────
+    onPageVisit('page-my-posts', async () => {
+        if (!currentUser) return;
+        const feed = document.getElementById('my-posts-feed');
+        if (!feed) return;
+        feed.innerHTML = skeletonHTML(3);
+        try {
+            const q = query(
+                collection(db, 'posts'),
+                where('authorEmail', '==', currentUser.email),
+                orderBy('timestamp', 'desc')
+            );
+            const snap = await getDocs(q);
+            if (snap.empty) {
+                feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">You haven't posted anything yet.</p></div>`;
+            } else {
+                feed.innerHTML = '';
+                snap.forEach(d => { feed.innerHTML += createPostCardHTML({ id: d.id, ...d.data() }, currentUser); });
+            }
+        } catch (err) {
+            console.error('[My Posts] load error:', err);
+            feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title" style="color:#ef4444">Failed to load your posts. Please try again.</p></div>`;
+        }
+    });
+
+    // ── Bookmarked Posts — lazy load when the page is visited ─────────────
+    onPageVisit('page-bookmarked-posts', async () => {
+        if (!currentUser) return;
+        const feed = document.getElementById('bookmarked-posts-feed');
+        if (!feed) return;
+        feed.innerHTML = skeletonHTML(3);
+
+        const savedIds = currentUser.savedPosts || [];
+        if (savedIds.length === 0) {
+            feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts yet.</p><p class="empty-feed-sub">Tap the bookmark icon on any post to save it here.</p></div>`;
+            return;
+        }
+
+        try {
+            // Firestore 'in' query supports up to 30 items; batch if needed
+            const BATCH = 30;
+            const posts = [];
+            for (let i = 0; i < savedIds.length; i += BATCH) {
+                const chunk = savedIds.slice(i, i + BATCH);
+                const q = query(collection(db, 'posts'), where('__name__', 'in', chunk));
+                const snap = await getDocs(q);
+                snap.forEach(d => posts.push({ id: d.id, ...d.data() }));
+            }
+            // Sort by bookmark order (most recently bookmarked first)
+            posts.sort((a, b) => savedIds.indexOf(a.id) - savedIds.indexOf(b.id));
+            if (posts.length === 0) {
+                feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts found.</p></div>`;
+            } else {
+                feed.innerHTML = '';
+                posts.forEach(p => { feed.innerHTML += createPostCardHTML(p, currentUser); });
+            }
+        } catch (err) {
+            console.error('[Bookmarked Posts] load error:', err);
+            feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title" style="color:#ef4444">Failed to load bookmarked posts. Please try again.</p></div>`;
+        }
+    });
 }
 
 // ─── Global CSS ───────────────────────────────────────────────────────────────

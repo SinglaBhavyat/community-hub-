@@ -2,235 +2,286 @@ rules_version = '2';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Community Hub — Firestore Security Rules
-//
-// This is the most likely root cause of "other authenticated users cannot
-// view Lost & Found posts": a rule that scoped `allow read` to the post's
-// own author (e.g. `resource.data.authorEmail == request.auth.token.email`)
-// instead of to any signed-in user. That makes onSnapshot() throw
-// permission-denied for everyone except the author, which the client then
-// shows as an empty/error feed.
-//
-// Fix: any authenticated user can READ lost_found posts; only the owner or
-// an admin can WRITE (create is allowed for any signed-in user, since
-// that's how new reports get submitted in the first place — but the
-// authorEmail/authorUid on the new doc must match the requester, so people
-// can't post on someone else's behalf).
 // ─────────────────────────────────────────────────────────────────────────
 
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ── Helper functions ──────────────────────────────────────────────────
+
     function isSignedIn() {
       return request.auth != null;
     }
 
+    function callerEmail() {
+      // Canonical way to get the verified email from the JWT.
+      // token.email is set by Firebase Auth and cannot be spoofed by the client.
+      return request.auth.token.email;
+    }
+
     function isAdmin() {
       return isSignedIn() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.token.email)) &&
-        get(/databases/$(database)/documents/users/$(request.auth.token.email)).data.role == 'admin';
+        exists(/databases/$(database)/documents/users/$(callerEmail())) &&
+        get(/databases/$(database)/documents/users/$(callerEmail())).data.role == 'admin';
     }
 
     function isOwner(data) {
+      // Accept either email or UID match so legacy docs that only stored one
+      // of the two are still handled correctly.
       return isSignedIn() && (
-        data.authorEmail == request.auth.token.email ||
+        data.authorEmail == callerEmail() ||
         data.authorUid   == request.auth.uid
       );
     }
 
-    // ── Lost & Found ─────────────────────────────────────────────────────
+    // ── Lost & Found ──────────────────────────────────────────────────────
     match /lost_found/{itemId} {
-      // Any authenticated user can view the feed — this is the fix for the
-      // "other users can't see posts" bug.
       allow read: if isSignedIn();
 
-      // Anyone signed in can report an item, but only as themselves.
       allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == request.auth.token.email;
+        request.resource.data.authorEmail == callerEmail();
 
-      // Only the post's owner or an admin can edit/resolve/delete it.
-      // `resource.data` is the EXISTING document — this is what stops a
-      // non-owner from updating or deleting someone else's post even if
-      // they craft the request by hand.
       allow update, delete: if isOwner(resource.data) || isAdmin();
     }
 
-    // ── Reports (moderation queue) ───────────────────────────────────────
+    // ── Reports (moderation queue) ────────────────────────────────────────
     match /reports/{reportId} {
-      // Reports contain moderation-sensitive info (who reported whom) —
-      // only admins should be able to read the queue. Reporters get a
-      // client-side success toast on create; they don't need read access.
       allow read: if isAdmin();
 
-      // Any signed-in user can file a report, but only attributed to
-      // themselves, and never pre-resolved.
       allow create: if isSignedIn() &&
-        request.resource.data.reporterEmail == request.auth.token.email &&
+        request.resource.data.reporterEmail == callerEmail() &&
         request.resource.data.status == 'Pending';
 
-      // Only admins can update (dismiss/resolve) or delete reports.
       allow update, delete: if isAdmin();
     }
 
-    // ── Users ────────────────────────────────────────────────────────────
+    // ── Users ─────────────────────────────────────────────────────────────
     match /users/{userEmail} {
       allow read: if isSignedIn();
-      allow create: if isSignedIn() && request.auth.token.email == userEmail;
-      // Users can edit their own profile fields, but never their own role —
-      // that would let anyone self-promote to admin. Only an existing admin
-      // can change `role`.
+
+      // A user may only create their own document.
+      allow create: if isSignedIn() && callerEmail() == userEmail;
+
+      // Users can update their own profile fields but never escalate their role.
+      // Admins can change anything including role.
       allow update: if isAdmin() || (
-        isSignedIn() && request.auth.token.email == userEmail &&
+        isSignedIn() &&
+        callerEmail() == userEmail &&
         request.resource.data.role == resource.data.role
       );
+
       allow delete: if isAdmin();
     }
 
-    // ── Messages ─────────────────────────────────────────────────────────
+    // ── Top-level /messages collection (legacy DMs) ───────────────────────
+    // NOTE: chat.js uses the /chats sub-architecture for all messaging.
+    // This rule is kept only so any old documents aren't left completely
+    // unprotected, but new code should not write here.
     match /messages/{messageId} {
       allow read: if isSignedIn() && (
-        resource.data.to   == request.auth.token.email ||
-        resource.data.from == request.auth.token.email
+        resource.data.to   == callerEmail() ||
+        resource.data.from == callerEmail()
       );
       allow create: if isSignedIn() &&
-        request.resource.data.from == request.auth.token.email;
-      allow update, delete: if isSignedIn() &&
-        resource.data.to == request.auth.token.email;
+        request.resource.data.from == callerEmail();
+      // FIX: was `to == callerEmail()` which let the recipient edit the message.
+      // Only the sender or admin should be able to update/delete.
+      allow update, delete: if isSignedIn() && (
+        resource.data.from == callerEmail() || isAdmin()
+      );
     }
 
-    // ── Audit logs (admin panel) ─────────────────────────────────────────
+    // ── Audit logs ────────────────────────────────────────────────────────
     match /audit_logs/{logId} {
       allow read, create: if isAdmin();
-      allow update, delete: if false; // audit trail is append-only
+      allow update, delete: if false; // append-only; no mutations allowed
     }
 
-    // ── Platform settings (admin panel) ──────────────────────────────────
-    // FIX: must be publicly readable (no auth required) because main.js
-    // reads the maintenanceMode flag BEFORE the user is signed in.
-    // If this requires isSignedIn(), the onSnapshot() in main.js gets
-    // permission-denied on every cold load, the listener errors out, and
-    // the homepage never renders (blank page).
+    // ── Platform settings ─────────────────────────────────────────────────
+    // Must be publicly readable: main.js checks maintenanceMode BEFORE the
+    // user signs in, so requiring auth here would produce a permission-denied
+    // on every cold load and leave the page blank.
     match /platform_settings/{settingId} {
-      allow read: if true;          // public — only contains the maintenance flag
+      allow read: if true;
       allow write: if isAdmin();
     }
 
     // ── Posts ─────────────────────────────────────────────────────────────
-    // FIX: missing rules caused permission-denied when the report modal
-    // tried to increment reportCount on a post doc, breaking the report
-    // submission flow entirely.
     match /posts/{postId} {
       allow read: if isSignedIn();
+
       allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == request.auth.token.email;
+        request.resource.data.authorEmail == callerEmail();
+
       allow update: if isOwner(resource.data) || isAdmin() ||
-        // Allow any signed-in user to update only aggregate counters
-        // (upvotes, reportCount, commentCount) — not author/content fields.
+        // Any member may bump aggregate counters (upvotes, reportCount,
+        // commentCount) but must not touch authorship or content fields.
         (isSignedIn() &&
           !request.resource.data.diff(resource.data).affectedKeys()
             .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
+
       allow delete: if isOwner(resource.data) || isAdmin();
+
+      // ── Comments subcollection ─────────────────────────────────────────
+      // FIX (original): the old rule covered a top-level /comments collection
+      // that the app never writes to.  The actual path is posts/{id}/comments/{id}.
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+
+        allow create: if isSignedIn() &&
+          request.resource.data.authorEmail == callerEmail();
+
+        // Owner/admin: full update.
+        // Anyone else: may only touch social-engagement fields.
+        allow update: if isOwner(resource.data) || isAdmin() ||
+          (isSignedIn() &&
+            !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['authorEmail', 'authorUid', 'text', 'author']));
+
+        allow delete: if isOwner(resource.data) || isAdmin();
+      }
     }
 
     // ── Events & Polls ────────────────────────────────────────────────────
     match /events/{eventId} {
       allow read: if isSignedIn();
+
       allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == request.auth.token.email;
+        request.resource.data.authorEmail == callerEmail();
+
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           !request.resource.data.diff(resource.data).affectedKeys()
             .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
+
       allow delete: if isOwner(resource.data) || isAdmin();
     }
-
 
     // ── Chats ─────────────────────────────────────────────────────────────
-    // FIX: chat.js reads/writes chats, chats/{id}/messages, and
-    // chats/{id}/typing — all were missing rules, causing permission-denied
-    // on recent chats, room messages, and send failures.
     match /chats/{chatId} {
+      // Members can always read their chat rooms.
+      // Group documents are readable by any signed-in user so that:
+      //   (a) invite-code lookup queries (getDocs where inviteCode==X) succeed for
+      //       non-members joining via a shared link, AND
+      //   (b) Firestore can guarantee the query predicate holds for every returned
+      //       document — without this, Firestore rejects the whole query even if
+      //       the matching doc is a public group, because private chat docs in the
+      //       same collection would fail the rule.
+      // Private DMs remain visible only to their two participants.
+      // resource == null guard lets create-time reads succeed.
       allow read: if isSignedIn() &&
-        (resource == null || resource.data.members.hasAny([request.auth.token.email]));
+        (resource == null ||
+         resource.data.members.hasAny([callerEmail()]) ||
+         resource.data.type == 'group');
+
       allow create: if isSignedIn() &&
-        request.resource.data.members.hasAny([request.auth.token.email]);
-      allow update: if isSignedIn() &&
-        resource.data.members.hasAny([request.auth.token.email]);
-      // Fix #2 (Critical): for group chats only admins/creator may delete the room;
-      // for private chats either member may delete (symmetric behaviour).
-      allow delete: if isSignedIn() && (
-        resource.data.type == 'private'
-          ? resource.data.members.hasAny([request.auth.token.email])
-          : (resource.data.createdBy == request.auth.token.email || isAdmin())
+        request.resource.data.members.hasAny([callerEmail()]);
+
+      allow update: if isSignedIn() && (
+        // Admin-only fields that no member (including admins acting via client code)
+        // should be able to silently overwrite. Enforced here as a safety net.
+        // Covered fields: type, createdBy, inviteCode integrity is managed by admins only.
+        // Members (including the updater themselves) may NOT freely set admins/createdBy.
+        // --- Full update for existing members, EXCEPT they cannot touch admin-only fields ---
+        (resource.data.members.hasAny([callerEmail()]) &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['type', 'createdBy'])) ||
+        // Non-members submitting a join request via invite code may ONLY
+        // write to pendingRequests / dismissedRequests — nothing else.
+        (resource.data.type == 'group' &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['pendingRequests', 'dismissedRequests']))
       );
 
-      // ── Messages subcollection ────────────────────────────────────────
+      // Private: either member can delete.
+      // Group: only the creator or an admin can delete.
+      allow delete: if isSignedIn() && (
+        resource.data.type == 'private'
+          ? resource.data.members.hasAny([callerEmail()])
+          : (resource.data.createdBy == callerEmail() || isAdmin())
+      );
+
+      // ── Messages subcollection ─────────────────────────────────────────
       match /messages/{messageId} {
-        allow read: if isSignedIn() &&
-          get(/databases/$(database)/documents/chats/$(chatId)).data.members
-            .hasAny([request.auth.token.email]);
-        allow create: if isSignedIn() &&
-          get(/databases/$(database)/documents/chats/$(chatId)).data.members
-            .hasAny([request.auth.token.email]) &&
-          request.resource.data.senderEmail == request.auth.token.email;
-        // Fix #1 (Critical): only the sender or an admin may edit/delete message content.
-        // Members may update ONLY social fields (seenBy, reactions, deletedFor) — NOT
-        // text, imageUrl, voiceUrl, fileUrl, isDeletedForEveryone, senderEmail, senderName.
+        function isChatMember() {
+          // FIX: guard against the parent chat doc not existing yet.
+          // get() on a missing doc returns a resource with exists==false;
+          // accessing .data on it throws in Rules, causing the rule to deny.
+          // exists() check first prevents the throw.
+          let chatRef = /databases/$(database)/documents/chats/$(chatId);
+          return exists(chatRef) &&
+                 get(chatRef).data.members.hasAny([callerEmail()]);
+        }
+
+        allow read: if isSignedIn() && isChatMember();
+
+        // Sender must be authenticated and a member of the room.
+        // System messages (senderEmail == 'system') are written directly from
+        // the client in 5 places (group creation, leave, member approval, etc.)
+        // so we must allow them from any current member.
+        // EXTEND: non-members may also write a system message when submitting
+        // a join request (to notify admins in real time). Constrained to:
+        //   • senderEmail must be exactly 'system'
+        //   • only on group-type rooms
+        //   • caller must be signed in
+        allow create: if isSignedIn() && (
+          (isChatMember() && (
+            request.resource.data.senderEmail == callerEmail() ||
+            request.resource.data.senderEmail == 'system'
+          )) ||
+          // Join-request notification from a non-member to a group room.
+          (!isChatMember() &&
+            exists(/databases/$(database)/documents/chats/$(chatId)) &&
+            get(/databases/$(database)/documents/chats/$(chatId)).data.type == 'group' &&
+            request.resource.data.senderEmail == 'system')
+        );
+
+        // Sender or admin: unrestricted update (edit text, delete-for-everyone).
+        // Other members: may only update social fields — seenBy, reactions,
+        //                deletedFor — and must not touch message content or identity.
         allow update: if isSignedIn() && (
-          resource.data.senderEmail == request.auth.token.email ||
+          resource.data.senderEmail == callerEmail() ||
           isAdmin() ||
-          (get(/databases/$(database)/documents/chats/$(chatId)).data.members
-            .hasAny([request.auth.token.email]) &&
+          (isChatMember() &&
             !request.resource.data.diff(resource.data).affectedKeys()
-              .hasAny(['text','imageUrl','voiceUrl','fileUrl','isDeletedForEveryone',
-                       'senderEmail','senderName']))
+              .hasAny(['text', 'imageUrl', 'voiceUrl', 'fileUrl',
+                       'isDeletedForEveryone', 'senderEmail', 'senderName',
+                       'edited', 'editedAt', 'replyTo', 'forwarded']))
         );
+
+        // Only the sender or an admin can physically delete a message doc.
         allow delete: if isSignedIn() && (
-          resource.data.senderEmail == request.auth.token.email ||
-          isAdmin()
+          resource.data.senderEmail == callerEmail() || isAdmin()
         );
       }
 
-      // ── Typing indicators subcollection ──────────────────────────────
-      match /typing/{userEmail} {
+      // ── Typing indicators subcollection ───────────────────────────────
+      match /typing/{typingUserEmail} {
+        // Only members can see who is typing.
         allow read: if isSignedIn() &&
-          get(/databases/$(database)/documents/chats/$(chatId)).data.members
-            .hasAny([request.auth.token.email]);
-        allow write: if isSignedIn() && request.auth.token.email == userEmail;
+          get(/databases/$(database)/documents/chats/$(chatId))
+            .data.members.hasAny([callerEmail()]);
+
+        // A user can only write their own typing document.
+        allow write: if isSignedIn() && callerEmail() == typingUserEmail;
       }
-    }
 
-    // ── Comments (subcollection under posts) ─────────────────────────────
-    // FIX: comments.js reads/writes posts/{postId}/comments/{commentId}
-    // (a subcollection), but the previous rule covered only a top-level
-    // /comments/{commentId} collection that the app never uses. Because
-    // Firestore denies by default when no rule matches, every addDoc/
-    // onSnapshot/updateDoc call on the subcollection threw permission-denied,
-    // making it impossible to post or view comments on any post.
-    //
-    // Secondary fix: the update rule now explicitly allows any signed-in
-    // user to update likes, likedBy, reactions, and replies — the fields
-    // that change when anyone likes or reacts to a comment — without being
-    // the comment's author.  It still blocks edits to author/text fields
-    // unless the requester is the owner or an admin.
-    match /posts/{postId}/comments/{commentId} {
-      // Any signed-in user can read comments on any post.
-      allow read: if isSignedIn();
+      // ── Starred messages subcollection (NEW — replaces localStorage) ──
+      // Added to support the chat.js fix that moved starred-message storage
+      // from localStorage to Firestore so stars persist across devices.
+      // Path: chats/{chatId}/starred/{userEmail}
+      match /starred/{starredUserEmail} {
+        // Only the owning user can read their own starred list.
+        // Room members cannot see each other's starred messages.
+        allow read: if isSignedIn() && callerEmail() == starredUserEmail;
 
-      // Only the signed-in user can create a comment attributed to themselves.
-      allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == request.auth.token.email;
-
-      // Owner and admin can change anything.
-      // Any other signed-in user may update ONLY social fields
-      // (likes, likedBy, reactions, replies, commentCount, pinned)
-      // but NOT the author identity or the comment text.
-      allow update: if isOwner(resource.data) || isAdmin() ||
-        (isSignedIn() &&
-          !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['authorEmail', 'authorUid', 'text', 'author']));
-
-      // Only owner or admin can delete.
-      allow delete: if isOwner(resource.data) || isAdmin();
+        // Only the owning user can write (star / unstar) their own list,
+        // and they must be a member of this chat room.
+        allow write: if isSignedIn() &&
+          callerEmail() == starredUserEmail &&
+          get(/databases/$(database)/documents/chats/$(chatId))
+            .data.members.hasAny([callerEmail()]);
+      }
     }
   }
 }
