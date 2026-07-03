@@ -321,13 +321,67 @@ export function createPostCardHTML(post, currentUser, isDetailed = false) {
         </div>`;
     }
 
-    // ---- Image ----
-    const imageHTML = post.imageSrc ? `
-        <div class="mt-4 rounded-2xl overflow-hidden border border-gray-200 dark:border-zinc-700 cursor-zoom-in group"
-             onclick="this.classList.toggle('expanded')" role="img" aria-label="Post image">
-            <img src="${sanitize(post.imageSrc)}" alt="Post image" loading="lazy"
-                 class="w-full object-cover max-h-96 group-[.expanded]:max-h-none transition-all duration-500 ease-in-out hover:brightness-95">
-        </div>` : '';
+    // ---- Media (carousel + video player, matching posts.js logic) ----
+    const mediaItems = post.mediaItems?.length
+        ? post.mediaItems
+        : (post.imageSrc ? [{ url: post.imageSrc, type: 'image' }] : []);
+
+    let imageHTML = '';
+    if (mediaItems.length === 1 && mediaItems[0].type === 'image') {
+        // Single image — open native full-screen via lightbox stored on element
+        const escapedUrl = sanitize(mediaItems[0].url);
+        imageHTML = `
+        <div class="mt-4 rounded-2xl overflow-hidden border border-gray-200 dark:border-zinc-700 cursor-zoom-in group
+                    post-single-image-wrap"
+             role="img" aria-label="Post image"
+             data-img-src="${escapedUrl}">
+            <img src="${escapedUrl}" alt="Post image" loading="lazy"
+                 class="w-full object-cover max-h-96 transition-all duration-500 ease-in-out hover:brightness-95">
+        </div>`;
+    } else if (mediaItems.length === 1 && mediaItems[0].type === 'video') {
+        // Single video — full player
+        imageHTML = `
+        <div class="mt-4 rounded-2xl overflow-hidden border border-gray-200 dark:border-zinc-700">
+            <div class="vid-wrapper" style="height:300px;">
+                <video src="${sanitize(mediaItems[0].url)}" preload="metadata" playsinline muted
+                       style="width:100%;height:100%;object-fit:cover;display:block;"></video>
+            </div>
+        </div>`;
+    } else if (mediaItems.length > 1) {
+        // Multi-media carousel
+        const carId = 'car-' + post.id;
+        const count  = mediaItems.length;
+        const slides = mediaItems.map((m, i) => {
+            if (m.type === 'video') {
+                return `<div class="carousel-slide" data-index="${i}">
+                    <div class="vid-wrapper">
+                        <video src="${sanitize(m.url)}" preload="metadata" playsinline muted
+                               style="width:100%;height:100%;object-fit:cover;display:block;"></video>
+                    </div>
+                </div>`;
+            }
+            return `<div class="carousel-slide media-cell--image" data-index="${i}"
+                         data-media-items='${JSON.stringify(mediaItems)}' data-media-index="${i}"
+                         style="cursor:zoom-in;">
+                <img src="${sanitize(m.url)}" alt="Media ${i + 1}" loading="lazy"
+                     style="width:100%;height:100%;object-fit:cover;display:block;" />
+            </div>`;
+        }).join('');
+        const dots = count > 1
+            ? `<div class="carousel-dots">${mediaItems.map((_, i) =>
+                `<span class="carousel-dot ${i === 0 ? 'carousel-dot--active' : ''}" data-dot="${i}"></span>`
+              ).join('')}</div>` : '';
+        imageHTML = `
+        <div class="post-carousel mt-4" id="${carId}" data-current="0" data-count="${count}"
+             data-post-id="${post.id}">
+            <div class="carousel-track">${slides}</div>
+            ${count > 1 ? `
+                <button class="carousel-arrow carousel-prev" aria-label="Previous">‹</button>
+                <button class="carousel-arrow carousel-next" aria-label="Next">›</button>
+                <span class="carousel-counter">1 / ${count}</span>` : ''}
+            ${dots}
+        </div>`;
+    }
 
     // ---- Tags ----
     const tagsHTML = post.tags?.length

@@ -5,7 +5,7 @@ import {
   orderBy, addDoc, serverTimestamp,
   doc, updateDoc, deleteDoc,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
-import { uploadImage } from '../utils/storage.js';
+import { uploadImage, uploadMediaFiles, getVideoThumbnail } from '../utils/storage.js';
 import { currentUser, onCurrentUserChange } from '../store/db.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -396,6 +396,133 @@ function injectStyles() {
     @keyframes lf-toast-in  { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes lf-toast-out { from { opacity: 1; } to { opacity: 0; transform: translateY(6px); } }
 
+    /* ── Carousel ── */
+    .lf-carousel {
+      position: relative;
+      border-radius: 0;
+      overflow: hidden;
+      background: #0a0a14;
+      height: 220px;
+    }
+    .lf-car-track {
+      display: flex; height: 100%;
+      transition: transform 0.42s cubic-bezier(0.4,0,0.2,1);
+      will-change: transform;
+    }
+    .lf-carousel-slide {
+      flex: 0 0 100%; height: 100%;
+      position: relative; overflow: hidden;
+    }
+    .lf-carousel-slide img {
+      width: 100%; height: 100%; object-fit: cover; display: block;
+      transition: transform 0.5s ease;
+    }
+    .lf-carousel-slide:hover img { transform: scale(1.02); }
+    .lf-car-arrow {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      width: 36px; height: 36px; border-radius: 50%;
+      border: none; background: rgba(0,0,0,0.5);
+      color: #fff; font-size: 20px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      z-index: 10; opacity: 0;
+      transition: background 0.2s, opacity 0.2s, transform 0.2s;
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    }
+    .lf-carousel:hover .lf-car-arrow { opacity: 1; }
+    .lf-car-prev { left: 10px; }
+    .lf-car-next { right: 10px; }
+    .lf-car-prev:hover { background: rgba(0,0,0,0.75); transform: translateY(-50%) scale(1.1); }
+    .lf-car-next:hover { background: rgba(0,0,0,0.75); transform: translateY(-50%) scale(1.1); }
+    @media (hover: none) {
+      .lf-car-arrow    { opacity: 0.65 !important; }
+      .lf-vid-controls { opacity: 1 !important; }
+    }
+    .lf-car-dots {
+      position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 5px; z-index: 10;
+    }
+    .lf-car-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: rgba(255,255,255,0.4); cursor: pointer;
+      transition: background 0.25s, transform 0.25s, width 0.25s;
+    }
+    .lf-car-dot.active { background: #fff; transform: scale(1.2); width: 18px; border-radius: 3px; }
+    .lf-car-counter {
+      position: absolute; top: 10px; right: 10px;
+      font-size: 12px; color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.45); padding: 3px 10px;
+      border-radius: 20px; z-index: 10; font-weight: 500;
+      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Video Player (inside carousel & standalone) ── */
+    .lf-vid-wrap {
+      position: relative; width: 100%; height: 100%;
+      background: #090912; min-height: 200px;
+    }
+    .lf-vid-wrap video {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: contain;
+    }
+    .lf-vid-overlay {
+      position: absolute; inset: 0; z-index: 2;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.12);
+      transition: background 0.25s;
+    }
+    .lf-vid-overlay--paused { background: rgba(0,0,0,0.38); }
+    .lf-vid-overlay:not(.lf-vid-overlay--paused) .lf-vid-play-btn { opacity: 0; pointer-events: none; }
+    .lf-vid-overlay:hover .lf-vid-play-btn { opacity: 1 !important; pointer-events: auto; }
+    .lf-vid-play-btn {
+      width: 60px; height: 60px; border-radius: 50%;
+      background: rgba(255,255,255,0.15);
+      backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; cursor: pointer;
+      transition: transform 0.2s cubic-bezier(0.34,1.56,0.64,1), opacity 0.2s;
+      border: 1.5px solid rgba(255,255,255,0.3);
+      box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+    }
+    .lf-vid-play-btn:hover  { transform: scale(1.12); }
+    .lf-vid-play-btn:active { transform: scale(0.95); }
+    .lf-vid-icon-play, .lf-vid-icon-pause,
+    .lf-vid-icon-unmuted, .lf-vid-icon-muted { display: block; }
+    .hidden { display: none !important; }
+    .lf-vid-controls {
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 3;
+      display: flex; align-items: center; gap: 6px; padding: 10px 12px;
+      background: linear-gradient(transparent, rgba(0,0,0,0.75));
+      opacity: 0; transition: opacity 0.25s;
+    }
+    .lf-vid-wrap:hover .lf-vid-controls { opacity: 1; }
+    .lf-vid-ctrl-btn {
+      background: none; border: none; color: #fff; cursor: pointer;
+      padding: 4px; border-radius: 5px; display: flex; align-items: center;
+      transition: background 0.15s, transform 0.15s;
+    }
+    .lf-vid-ctrl-btn:hover { background: rgba(255,255,255,0.15); transform: scale(1.1); }
+    .lf-vid-progress-wrap { flex: 1; padding: 6px 0; cursor: pointer; }
+    .lf-vid-progress-bar {
+      position: relative; height: 3px;
+      background: rgba(255,255,255,0.25);
+      border-radius: 99px; overflow: visible;
+      transition: height 0.15s;
+    }
+    .lf-vid-progress-wrap:hover .lf-vid-progress-bar { height: 5px; }
+    .lf-vid-progress-fill { height: 100%; background: #fff; border-radius: 99px; width: 0; transition: width 0.1s linear; }
+    .lf-vid-progress-thumb {
+      position: absolute; top: 50%; transform: translate(-50%,-50%);
+      width: 13px; height: 13px; border-radius: 50%; background: #fff;
+      left: 0; opacity: 0; transition: opacity 0.15s;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+    }
+    .lf-vid-progress-wrap:hover .lf-vid-progress-thumb { opacity: 1; }
+    .lf-vid-time {
+      font-size: 11px; color: rgba(255,255,255,0.85);
+      white-space: nowrap; font-variant-numeric: tabular-nums;
+    }
+
     /* ── Lightbox ── */
     #lf-lightbox {
       position: fixed; inset: 0; z-index: 99999;
@@ -428,6 +555,36 @@ function injectStyles() {
       z-index: 100000;
     }
     #lf-lightbox-close:hover { background: rgba(255,255,255,0.22); }
+    .lf-lb-close {
+      position: absolute; top: -52px; right: 0;
+      background: rgba(255,255,255,0.1); backdrop-filter: blur(8px);
+      border: 0.5px solid rgba(255,255,255,0.2);
+      color: #fff; width: 42px; height: 42px; border-radius: 50%;
+      font-size: 18px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s, transform 0.15s;
+    }
+    .lf-lb-close:hover { background: rgba(255,255,255,0.2); transform: rotate(90deg) scale(1.1); }
+    .lf-lb-media { display: flex; align-items: center; justify-content: center; }
+    .lf-lb-nav {
+      position: fixed; top: 50%; transform: translateY(-50%);
+      background: rgba(255,255,255,0.1); backdrop-filter: blur(8px);
+      border: 0.5px solid rgba(255,255,255,0.15);
+      color: #fff; width: 50px; height: 50px; border-radius: 50%;
+      font-size: 26px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s, transform 0.2s; z-index: 100001;
+    }
+    .lf-lb-nav:hover { background: rgba(255,255,255,0.2); transform: translateY(-50%) scale(1.08); }
+    .lf-lb-prev { left: 16px; }
+    .lf-lb-next { right: 16px; }
+    .lf-lb-counter {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,0.8); font-size: 13px; font-weight: 500;
+      background: rgba(255,255,255,0.1); backdrop-filter: blur(8px);
+      padding: 5px 14px; border-radius: 20px; z-index: 100001;
+      border: 0.5px solid rgba(255,255,255,0.15);
+    }
 
     /* ── Shared modal base ── */
     .lf-modal-overlay {
@@ -639,28 +796,82 @@ function initLightbox() {
   const lb = document.createElement('div');
   lb.id = 'lf-lightbox';
   lb.setAttribute('role', 'dialog');
-  lb.setAttribute('aria-label', 'Image viewer');
-  lb.innerHTML = `
-    <button id="lf-lightbox-close" aria-label="Close image viewer">✕</button>
-    <img id="lf-lightbox-img" alt="Full-size item photo">
-  `;
+  lb.setAttribute('aria-label', 'Media viewer');
   document.body.appendChild(lb);
-  const close = () => lb.classList.remove('open');
-  document.getElementById('lf-lightbox-close').addEventListener('click', close);
-  lb.addEventListener('click', (e) => { if (e.target === lb) close(); });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && lb.classList.contains('open')) close();
+    if (e.key === 'Escape' && lb.classList.contains('open')) lb.classList.remove('open');
+    if (e.key === 'ArrowLeft')  lb.querySelector('.lf-lb-prev')?.click();
+    if (e.key === 'ArrowRight') lb.querySelector('.lf-lb-next')?.click();
   });
 }
 
-function openLightbox(src, alt) {
-  const lb  = document.getElementById('lf-lightbox');
-  const img = document.getElementById('lf-lightbox-img');
-  if (!lb || !img) return;
-  img.src = src;
-  img.alt = alt || 'Item photo';
-  lb.classList.add('open');
+function openLightbox(mediaItems, startIndex = 0) {
+  const items = Array.isArray(mediaItems)
+    ? mediaItems.filter(m => m?.url)
+    : [{ url: mediaItems, type: 'image' }];
+  if (!items.length) return;
+
+  let current = startIndex;
+
+  // Use a dynamically created overlay (same pattern as posts.js) so we can
+  // safely remove it on close rather than fighting with classList.
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position:fixed;inset:0;z-index:99999;
+    display:flex;align-items:center;justify-content:center;
+    animation:lf-lb-in 0.2s ease;
+  `;
+
+  function render() {
+    const m = items[current];
+    const isVideo = m.type === 'video';
+    const navPrev = current > 0
+      ? `<button class="lf-lb-nav lf-lb-prev" aria-label="Previous">‹</button>` : '';
+    const navNext = current < items.length - 1
+      ? `<button class="lf-lb-nav lf-lb-next" aria-label="Next">›</button>` : '';
+
+    overlay.innerHTML = `
+      <div style="position:absolute;inset:0;background:rgba(0,0,0,0.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);"></div>
+      <div style="position:relative;z-index:1;display:flex;align-items:center;justify-content:center;animation:lf-lb-scale 0.2s ease;">
+        <button class="lf-lb-close" aria-label="Close">✕</button>
+        <div class="lf-lb-media">
+          ${isVideo ? `
+            <div class="lf-vid-wrap" style="border-radius:12px;overflow:hidden;background:#000;max-width:90vw;max-height:80vh;width:min(900px,90vw);height:min(500px,80vh);">
+              <video src="${sanitize(m.url)}" controls autoplay
+                     style="position:relative;width:100%;height:100%;object-fit:contain;"></video>
+            </div>
+          ` : `
+            <img src="${sanitize(m.url)}" alt="Media ${current + 1}"
+                 style="max-width:90vw;max-height:80vh;border-radius:12px;object-fit:contain;box-shadow:0 24px 64px rgba(0,0,0,0.5);" />
+          `}
+        </div>
+        ${navPrev}${navNext}
+        ${items.length > 1 ? `<div class="lf-lb-counter">${current + 1} / ${items.length}</div>` : ''}
+      </div>
+    `;
+    overlay.querySelector('.lf-lb-close')?.addEventListener('click', close);
+    overlay.querySelector('div')?.addEventListener('click', (e) => { if (e.target === overlay.querySelector('div')) close(); });
+    overlay.querySelector('.lf-lb-prev')?.addEventListener('click', (e) => { e.stopPropagation(); current--; render(); });
+    overlay.querySelector('.lf-lb-next')?.addEventListener('click', (e) => { e.stopPropagation(); current++; render(); });
+  }
+
+  function close() {
+    overlay.remove();
+    document.removeEventListener('keydown', keyHandler);
+  }
+  function keyHandler(e) {
+    if (!document.body.contains(overlay)) { document.removeEventListener('keydown', keyHandler); return; }
+    if (e.key === 'Escape') close();
+    if (e.key === 'ArrowLeft'  && current > 0)               { current--; render(); }
+    if (e.key === 'ArrowRight' && current < items.length - 1) { current++; render(); }
+  }
+
+  render();
+  document.addEventListener('keydown', keyHandler);
+  document.body.appendChild(overlay);
 }
+
+
 
 // ─── Message modal ────────────────────────────────────────────────────────────
 
@@ -1180,7 +1391,140 @@ async function copyToClipboard(text, btn) {
     showToast('Could not copy to clipboard.', 'error');
   }
 }
+function _lfGoToSlide(car, index) {
+  const track   = car.querySelector('.lf-car-track');
+  const counter = car.querySelector('.lf-car-counter');
+  const count   = parseInt(car.dataset.count, 10);
+  if (!track || index < 0 || index >= count) return;
+  car.dataset.current = index;
+  track.style.transform = `translateX(-${index * 100}%)`;
+  if (counter) counter.textContent = `${index + 1} / ${count}`;
+  car.querySelectorAll('.lf-car-dot').forEach((d, i) => d.classList.toggle('active', i === index));
+  // pause non-active videos
+  car.querySelectorAll('.lf-carousel-slide').forEach((slide, i) => {
+    const v = slide.querySelector('video');
+    if (v && i !== index) v.pause();
+  });
+  // init full video player on active slide if not yet done
+  const activeSlide = car.querySelectorAll('.lf-carousel-slide')[index];
+  const activeVidWrap = activeSlide?.querySelector('.lf-vid-wrap');
+  if (activeVidWrap) _lfInitVideo(activeVidWrap);
+}
 
+function _lfInitVideo(wrapper) {
+  if (wrapper.dataset.playerInit) return;
+  wrapper.dataset.playerInit = '1';
+  const video = wrapper.querySelector('video');
+  if (!video) return;
+
+  // Remove old simple play button if present
+  wrapper.querySelector('.lf-vid-play-btn')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'lf-vid-overlay';
+  overlay.innerHTML = `
+    <div class="lf-vid-play-btn" aria-label="Play/Pause">
+      <svg class="lf-vid-icon-play" viewBox="0 0 24 24" fill="currentColor" width="32" height="32"><path d="M8 5v14l11-7z"/></svg>
+      <svg class="lf-vid-icon-pause hidden" viewBox="0 0 24 24" fill="currentColor" width="32" height="32"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+    </div>`;
+
+  const controls = document.createElement('div');
+  controls.className = 'lf-vid-controls';
+  controls.innerHTML = `
+    <button class="lf-vid-ctrl-btn lf-vid-toggle-btn" aria-label="Play/Pause">
+      <svg class="lf-vid-icon-play" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M8 5v14l11-7z"/></svg>
+      <svg class="lf-vid-icon-pause hidden" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+    </button>
+    <div class="lf-vid-progress-wrap">
+      <div class="lf-vid-progress-bar">
+        <div class="lf-vid-progress-fill"></div>
+        <div class="lf-vid-progress-thumb"></div>
+      </div>
+    </div>
+    <span class="lf-vid-time">0:00</span>
+    <button class="lf-vid-ctrl-btn lf-vid-mute-btn" aria-label="Mute/Unmute">
+      <svg class="lf-vid-icon-unmuted" viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+        <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/>
+        <path d="M14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+      </svg>
+      <svg class="lf-vid-icon-muted hidden" viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+        <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+      </svg>
+    </button>
+    <button class="lf-vid-ctrl-btn lf-vid-fullscreen-btn" aria-label="Fullscreen">
+      <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+    </button>`;
+
+  wrapper.appendChild(overlay);
+  wrapper.appendChild(controls);
+
+  const playBtnOverlay = overlay.querySelector('.lf-vid-play-btn');
+  const toggleBtn      = controls.querySelector('.lf-vid-toggle-btn');
+  const muteBtn        = controls.querySelector('.lf-vid-mute-btn');
+  const fsBtn          = controls.querySelector('.lf-vid-fullscreen-btn');
+  const fill           = controls.querySelector('.lf-vid-progress-fill');
+  const thumb          = controls.querySelector('.lf-vid-progress-thumb');
+  const timeEl         = controls.querySelector('.lf-vid-time');
+  const progressWrap   = controls.querySelector('.lf-vid-progress-bar');
+
+  function fmtTime(s) {
+    const m = Math.floor(s / 60);
+    return `${m}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+  }
+  function syncPlayIcons(playing) {
+    [overlay, controls].forEach(el => {
+      el.querySelectorAll('.lf-vid-icon-play').forEach(i => i.classList.toggle('hidden', playing));
+      el.querySelectorAll('.lf-vid-icon-pause').forEach(i => i.classList.toggle('hidden', !playing));
+    });
+    overlay.classList.toggle('lf-vid-overlay--paused', !playing);
+  }
+  function syncMuteIcons(muted) {
+    muteBtn.querySelector('.lf-vid-icon-unmuted').classList.toggle('hidden', muted);
+    muteBtn.querySelector('.lf-vid-icon-muted').classList.toggle('hidden', !muted);
+  }
+  function togglePlay() { video.paused ? video.play() : video.pause(); }
+
+  video.addEventListener('play',  () => syncPlayIcons(true));
+  video.addEventListener('pause', () => syncPlayIcons(false));
+  video.addEventListener('ended', () => syncPlayIcons(false));
+  video.addEventListener('timeupdate', () => {
+    if (!video.duration) return;
+    const pct = (video.currentTime / video.duration) * 100;
+    fill.style.width  = pct + '%';
+    thumb.style.left  = pct + '%';
+    timeEl.textContent = fmtTime(video.currentTime);
+  });
+  progressWrap.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const rect = progressWrap.getBoundingClientRect();
+    video.currentTime = ((e.clientX - rect.left) / rect.width) * video.duration;
+  });
+  playBtnOverlay.addEventListener('click', (e) => { e.stopPropagation(); togglePlay(); });
+  toggleBtn.addEventListener('click',      (e) => { e.stopPropagation(); togglePlay(); });
+  overlay.addEventListener('click',        (e) => { if (e.target === overlay) togglePlay(); });
+  video.muted = true;
+  syncMuteIcons(true);
+  muteBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    video.muted = !video.muted;
+    syncMuteIcons(video.muted);
+  });
+  fsBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else wrapper.requestFullscreen?.() || video.webkitRequestFullscreen?.();
+  });
+  // Pause when scrolled out of view
+  const obs = new IntersectionObserver(entries => {
+    if (!entries[0].isIntersecting && !video.paused) video.pause();
+  }, { threshold: 0.2 });
+  obs.observe(wrapper);
+  const removalObs = new MutationObserver(() => {
+    if (!document.contains(video)) { obs.disconnect(); removalObs.disconnect(); }
+  });
+  removalObs.observe(document.body, { childList: true, subtree: true });
+  syncPlayIcons(false);
+}
 // ─── Card builder ─────────────────────────────────────────────────────────────
 
 function buildCard(id, item, user) {
@@ -1206,17 +1550,59 @@ function buildCard(id, item, user) {
   // Sharing is always available — no sign-in required
   const canShare   = true;
 
-  // ── Image block ──
-  const imgBlock = item.imageSrc
-    ? `<div class="lf-card-img-wrap" role="button" tabindex="0"
-            aria-label="View full image of ${sanitize(item.name)}"
-            data-lightbox-src="${sanitize(item.imageSrc)}"
-            data-lightbox-alt="${sanitize(item.name)}">
-         <img src="${sanitize(item.imageSrc)}" class="lf-card-img"
-              alt="${sanitize(item.name)}" loading="lazy">
-         <span class="lf-zoom-hint" aria-hidden="true">Tap to expand</span>
-       </div>`
-    : `<div class="lf-card-no-img" aria-hidden="true">${isLost ? '🔍' : '📦'}</div>`;
+  // ── Image/Media block — supports multiple images + videos ──
+  const mediaItems = item.mediaItems?.length
+    ? item.mediaItems
+    : (item.imageSrc ? [{ url: item.imageSrc, type: 'image' }] : []);
+
+  let imgBlock;
+  if (mediaItems.length === 0) {
+    imgBlock = `<div class="lf-card-no-img" aria-hidden="true">${isLost ? '🔍' : '📦'}</div>`;
+  } else if (mediaItems.length === 1 && mediaItems[0].type === 'image') {
+    imgBlock = `<div class="lf-card-img-wrap" role="button" tabindex="0"
+        aria-label="View full image of ${sanitize(item.name)}"
+        data-lf-media='${JSON.stringify(mediaItems)}'
+        data-lf-media-index="0">
+      <img src="${sanitize(mediaItems[0].url)}" class="lf-card-img"
+           alt="${sanitize(item.name)}" loading="lazy">
+      <span class="lf-zoom-hint" aria-hidden="true">Tap to expand</span>
+    </div>`;
+  } else {
+    // Multi-media carousel
+    const carId = 'lf-car-' + id;
+    const count = mediaItems.length;
+    const slides = mediaItems.map((m, i) => {
+      if (m.type === 'video') {
+        return `<div class="lf-carousel-slide" data-index="${i}">
+          <div class="lf-vid-wrap">
+            <video src="${sanitize(m.url)}" preload="metadata" playsinline muted
+                   style="width:100%;height:100%;object-fit:cover;display:block;"></video>
+          </div>
+        </div>`;
+      }
+      return `<div class="lf-carousel-slide media-cell--image" data-index="${i}"
+                   data-lf-media='${JSON.stringify(mediaItems)}' data-lf-media-index="${i}"
+                   style="cursor:zoom-in;">
+        <img src="${sanitize(m.url)}" alt="Media ${i+1}" loading="lazy"
+             style="width:100%;height:100%;object-fit:cover;display:block;" />
+      </div>`;
+    }).join('');
+
+    const dots = count > 1
+      ? `<div class="lf-car-dots">${mediaItems.map((_, i) =>
+          `<span class="lf-car-dot${i===0?' active':''}" data-dot="${i}"></span>`
+        ).join('')}</div>` : '';
+
+    imgBlock = `<div class="lf-carousel" id="${carId}" data-current="0" data-count="${count}"
+                     data-lf-media='${JSON.stringify(mediaItems)}'>
+      <div class="lf-car-track">${slides}</div>
+      ${count > 1 ? `
+        <button class="lf-car-arrow lf-car-prev" aria-label="Previous">‹</button>
+        <button class="lf-car-arrow lf-car-next" aria-label="Next">›</button>
+        <span class="lf-car-counter">1 / ${count}</span>
+        ${dots}` : dots}
+    </div>`;
+  }
 
   // ── Resolved banner — shown to ALL users when item is resolved ──
   const resolvedBanner = isResolved
@@ -1554,6 +1940,12 @@ export function setupLostFound() {
           });
           feed.innerHTML = html;
 
+          // Init video player on first slide of each carousel
+          feed.querySelectorAll('.lf-carousel').forEach(car => {
+            const firstVidWrap = car.querySelector('.lf-carousel-slide:first-child .lf-vid-wrap');
+            if (firstVidWrap) _lfInitVideo(firstVidWrap);
+          });
+
           applyFilters();
           startTtlRefresh(feed);
         },
@@ -1622,10 +2014,38 @@ export function setupLostFound() {
         return;
       }
 
-      // Lightbox
-      const imgWrap = e.target.closest('[data-lightbox-src]');
-      if (imgWrap) {
-        openLightbox(imgWrap.dataset.lightboxSrc, imgWrap.dataset.lightboxAlt);
+      // Lightbox — single image wrap or carousel image slide
+      const mediaEl = e.target.closest('[data-lf-media]');
+      if (mediaEl && !e.target.closest('.lf-car-arrow') && !e.target.closest('.lf-car-dot')) {
+        // Don't open lightbox if click is on video or its controls
+        if (e.target.closest('.lf-vid-wrap') || e.target.closest('.lf-vid-controls') || e.target.closest('.lf-vid-overlay')) return;
+        try {
+          const items = JSON.parse(mediaEl.dataset.lfMedia);
+          const idx   = parseInt(mediaEl.dataset.lfMediaIndex || '0', 10);
+          openLightbox(items, idx);
+        } catch { /* ignore parse errors */ }
+        return;
+      }
+
+      // Carousel arrows
+      const arrow = e.target.closest('.lf-car-arrow');
+      if (arrow) {
+        const car   = arrow.closest('.lf-carousel');
+        if (!car) return;
+        const cur   = parseInt(car.dataset.current, 10);
+        const cnt   = parseInt(car.dataset.count, 10);
+        const next  = arrow.classList.contains('lf-car-next')
+          ? Math.min(cur + 1, cnt - 1)
+          : Math.max(cur - 1, 0);
+        _lfGoToSlide(car, next);
+        return;
+      }
+
+      // Carousel dots
+      const dot = e.target.closest('.lf-car-dot');
+      if (dot) {
+        const car = dot.closest('.lf-carousel');
+        if (car) _lfGoToSlide(car, parseInt(dot.dataset.dot, 10));
         return;
       }
 
@@ -1720,48 +2140,75 @@ export function setupLostFound() {
 
   if (!form) return;
 
-  // Image preview
-  const photoInput = document.getElementById('item-photo');
-  if (photoInput) {
-    const previewWrap = document.createElement('div');
-    previewWrap.id = 'lf-img-preview-wrap';
-    previewWrap.innerHTML = `
-      <img id="lf-img-preview" alt="Preview of selected photo">
-      <button type="button" id="lf-img-clear" aria-label="Remove photo">✕</button>
-    `;
-    photoInput.parentElement?.appendChild(previewWrap);
+  // ── Multi-media upload (images + videos, up to 6 files) — dropzone ──
+  const photoInput  = document.getElementById('item-photo');
+  const dropzone    = document.getElementById('lf-media-dropzone');
+  const previewGrid = document.getElementById('lf-media-preview-grid');
 
-    photoInput.addEventListener('change', () => {
-      const file = photoInput.files[0];
-      if (!file) { previewWrap.classList.remove('visible'); return; }
+  const _lfFiles = [];
 
-      if (!file.type.startsWith('image/')) {
-        showToast('Only image files are accepted.', 'error');
-        photoInput.value = '';
-        previewWrap.classList.remove('visible');
-        return;
+  function renderLfPreview() {
+    if (!previewGrid) return;
+    if (!_lfFiles.length) { previewGrid.style.display = 'none'; previewGrid.innerHTML = ''; return; }
+    previewGrid.style.display = 'grid';
+    previewGrid.innerHTML = '';
+    _lfFiles.forEach((file, i) => {
+      const cell = document.createElement('div');
+      cell.className = 'media-preview-cell';
+      if (file.type.startsWith('video/')) {
+        const thumb = file._thumbDataUrl;
+        cell.innerHTML = `
+          <div class="media-preview-thumb media-preview-thumb--video">
+            ${thumb ? `<img src="${thumb}" style="width:100%;height:100%;object-fit:cover;border-radius:6px;">` : ''}
+            <div class="media-preview-video-badge">▶ VIDEO</div>
+          </div>
+          <button class="media-preview-remove" data-index="${i}" title="Remove" aria-label="Remove file">✕</button>
+          <div class="media-preview-label">${file.name.length > 18 ? file.name.slice(0, 16) + '…' : file.name}</div>`;
+      } else {
+        const url = URL.createObjectURL(file);
+        cell.innerHTML = `
+          <img src="${url}" class="media-preview-thumb" alt="Preview ${i + 1}">
+          <button class="media-preview-remove" data-index="${i}" title="Remove" aria-label="Remove file">✕</button>`;
       }
-      if (file.size > MAX_FILE_MB * 1024 * 1024) {
-        showToast(`Photo must be under ${MAX_FILE_MB} MB.`, 'error');
-        photoInput.value = '';
-        previewWrap.classList.remove('visible');
-        return;
-      }
-
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        const prev = document.getElementById('lf-img-preview');
-        if (prev) prev.src = ev.target.result;
-        previewWrap.classList.add('visible');
-      };
-      reader.readAsDataURL(file);
+      cell.querySelector('.media-preview-remove').addEventListener('click', () => {
+        _lfFiles.splice(i, 1);
+        renderLfPreview();
+      });
+      previewGrid.appendChild(cell);
     });
+  }
 
-    document.getElementById('lf-img-clear')?.addEventListener('click', () => {
-      photoInput.value = '';
-      const prev = document.getElementById('lf-img-preview');
-      if (prev) prev.src = '';
-      previewWrap.classList.remove('visible');
+  async function addLfFiles(newFiles) {
+    const allowed = 6 - _lfFiles.length;
+    if (allowed <= 0) { showToast('Maximum 6 media files allowed.', 'info'); return; }
+    const toAdd = Array.from(newFiles).slice(0, allowed);
+    for (const f of toAdd) {
+      const isImg = f.type.startsWith('image/');
+      const isVid = f.type.startsWith('video/');
+      if (!isImg && !isVid) { showToast(`${f.name}: unsupported type.`, 'error'); continue; }
+      if (isImg && f.size > MAX_FILE_MB * 1024 * 1024) { showToast(`${f.name}: too large (max ${MAX_FILE_MB} MB).`, 'error'); continue; }
+      if (isVid && f.size > 50 * 1024 * 1024) { showToast(`${f.name}: video too large (max 50 MB).`, 'error'); continue; }
+      if (isVid) { f._thumbDataUrl = await getVideoThumbnail(f).catch(() => null); }
+      _lfFiles.push(f);
+    }
+    if (photoInput) photoInput.value = '';
+    renderLfPreview();
+    if (_lfFiles.length >= 6) showToast('Maximum 6 files reached.', 'info');
+  }
+
+  if (photoInput) {
+    photoInput.addEventListener('change', () => { addLfFiles(photoInput.files); });
+    // Expose file list to the submit handler
+    photoInput._lfFiles = _lfFiles;
+  }
+
+  if (dropzone) {
+    dropzone.addEventListener('dragover',  (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      addLfFiles(e.dataTransfer.files);
     });
   }
 
@@ -1849,20 +2296,25 @@ export function setupLostFound() {
     setProgress(20);
 
     try {
-      const file = document.getElementById('item-photo')?.files[0] ?? null;
-      let imageUrl = null;
-      if (file) imageUrl = await uploadImage(file, 'lostfound');
+      let mediaItems = [];
+      let imageUrl   = null;
+
+      if (_lfFiles.length) {
+        mediaItems = await uploadMediaFiles(_lfFiles, 'lostfound');
+        imageUrl   = mediaItems.find(m => m.type === 'image')?.url ?? null;
+      }
       setProgress(60);
 
       if (submitBtn) submitBtn.textContent = 'Saving…';
 
       await addDoc(collection(db, COLLECTION), {
-        name:         document.getElementById('item-name')?.value.trim()         ?? '',
-        status:       document.getElementById('item-status')?.value              ?? 'Lost',
-        description:  document.getElementById('item-description')?.value.trim() ?? '',
+        name:         document.getElementById('item-name')?.value.trim()          ?? '',
+        status:       document.getElementById('item-status')?.value               ?? 'Lost',
+        description:  document.getElementById('item-description')?.value.trim()  ?? '',
         phone:        document.getElementById('item-contact-phone')?.value.trim() ?? '',
         contactEmail: document.getElementById('item-contact-email')?.value.trim() ?? '',
         imageSrc:     imageUrl ?? null,
+        mediaItems:   mediaItems.length ? mediaItems : null,
         authorEmail:  currentUser.email,
         authorUid:    currentUser.uid ?? null,
         resolved:     false,
@@ -1873,12 +2325,10 @@ export function setupLostFound() {
 
       setProgress(100);
       showToast('Item reported successfully!', 'success');
+      // clear multi-media file list and preview grid
+      _lfFiles.length = 0;
+      renderLfPreview();
       form.reset();
-
-      // Clear preview
-      document.getElementById('lf-img-preview-wrap')?.classList.remove('visible');
-      const previewImg = document.getElementById('lf-img-preview');
-      if (previewImg) previewImg.src = '';
 
       // Reset char counter
       if (descField) {

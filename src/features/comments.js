@@ -839,15 +839,17 @@ export function setupComments() {
         commentsPage.dataset.currentPostId = postId;
         commentLimit = PAGE_SIZE;
 
-        if (summarizeBtn) summarizeBtn.style.display = 'flex';
+        if (summarizeBtn) { summarizeBtn.classList.remove('hidden'); summarizeBtn.style.display = 'flex'; }
         if (summaryOutput) summaryOutput.classList.add('hidden');
         if (summaryText)   summaryText.innerHTML = '';
 
         try {
             const postSnap = await getDoc(doc(db, 'posts', postId));
             if (postSnap.exists()) {
+                const postData = { id: postId, ...postSnap.data() };
                 document.getElementById('comments-page-post-container').innerHTML =
-                    createPostCardHTML({ id: postId, ...postSnap.data() }, currentUser, true);
+                    createPostCardHTML(postData, currentUser, true);
+                _attachPostCardHandlers(postId, postData);
             }
         } catch (err) {
             console.error('[comments] Failed to load post:', err);
@@ -868,7 +870,7 @@ export function setupComments() {
 
                 if (snapshot.empty) {
                     commentsList.innerHTML = '<p class="text-slate-500 dark:text-slate-400 text-center py-8">No comments yet. Be the first!</p>';
-                    if (summarizeBtn) summarizeBtn.style.display = 'none';
+                    if (summarizeBtn) { summarizeBtn.style.display = 'none'; summarizeBtn.classList.add('hidden'); }
                     return;
                 }
 
@@ -911,6 +913,173 @@ export function setupComments() {
 
         showPage('page-comments');
     } // end _openCommentsPage
+
+    // ── Post-card interaction handlers for the comments page ─────────────────
+    // posts.js only delegates on #posts-feed, so the post card rendered at the
+    // top of the comments page needs its own handler here.
+    //
+    // KEY FIXES vs. previous version:
+    //  - The 3-dot button has class "post-options-btn" (not "post-options-trigger")
+    //    and the dropdown is toggled by templates.js initPostOptionsDropdowns via
+    //    document-level delegation — so we do NOT re-implement dropdown open here.
+    //    We only handle the ACTION clicks on items inside the dropdown.
+    //  - Upvote uses class "upvote-btn" (not "action-btn--upvote").
+    //  - All handlers are attached to document (not container) so they survive
+    //    re-renders when comments.js clones the container node.
+    //  - Guard with closest('#comments-page-post-container') so we don't steal
+    //    events from other parts of the page.
+
+    // One document-level handler, registered once per setupComments() call.
+    document.addEventListener('click', async (e) => {
+        // Only act when the click is inside the comments-page post container
+        const container = document.getElementById('comments-page-post-container');
+        if (!container || !container.contains(e.target)) return;
+
+        const postCard = e.target.closest('.post-card');
+        // postId comes from the live dataset (re-fetched each call so it's always current)
+        const postId   = commentsPage?.dataset.currentPostId;
+        if (!postId) return;
+
+        // Close dropdown helper
+        const closeDropdown = () =>
+            container.querySelectorAll('.post-options-dropdown')
+                     .forEach(d => d.classList.add('hidden'));
+
+        // ── Upvote ──────────────────────────────────────────────────────────
+        if (e.target.closest('.upvote-btn')) {
+            if (!currentUser) return _safeToast('Sign in to upvote.', 'warn');
+            const btn     = e.target.closest('.upvote-btn');
+            const isVoted = btn.classList.contains('action-btn--active');
+            const counter = btn.querySelector('.upvote-count');
+            const current = parseInt(counter?.textContent || '0', 10) || 0;
+
+            // Optimistic UI
+            btn.classList.toggle('action-btn--active', !isVoted);
+            btn.setAttribute('aria-pressed', String(!isVoted));
+            const svg = btn.querySelector('svg');
+            if (svg) svg.setAttribute('fill', isVoted ? 'none' : 'currentColor');
+            if (counter) counter.textContent = String(isVoted ? Math.max(0, current - 1) : current + 1);
+            btn.animate(
+                [{ transform: 'scale(1)' }, { transform: 'scale(1.25)' }, { transform: 'scale(1)' }],
+                { duration: 280, easing: 'ease' }
+            );
+            try {
+                await updateDoc(doc(db, 'posts', postId), {
+                    upvotedBy:   isVoted ? arrayRemove(currentUser.email) : arrayUnion(currentUser.email),
+                    upvoteCount: isVoted ? Math.max(0, current - 1) : current + 1,
+                });
+            } catch {
+                // Revert on failure
+                btn.classList.toggle('action-btn--active', isVoted);
+                if (svg) svg.setAttribute('fill', isVoted ? 'currentColor' : 'none');
+                if (counter) counter.textContent = String(current);
+                _safeToast('Upvote failed. Try again.', 'error');
+            }
+            return;
+        }
+
+        // ── AI Summarize (post-card inline button) ───────────────────────────
+        if (e.target.closest('.ai-summarize-btn')) {
+            if (!currentUser) return _safeToast('Sign in to use AI features.', 'warn');
+            // Delegate to posts.js handler if available, otherwise basic inline summary
+            if (typeof window.aiSummarizePost === 'function' && postCard) {
+                const snap = await getDoc(doc(db, 'posts', postId));
+                if (snap.exists()) window.aiSummarizePost(postCard, { id: postId, ...snap.data() });
+            } else {
+                _safeToast('AI summary not available here.', 'info');
+            }
+            return;
+        }
+
+        // ── Share ────────────────────────────────────────────────────────────
+        if (e.target.closest('.share-btn')) {
+            closeDropdown();
+            const url = `${location.origin}${location.pathname}?post=${postId}`;
+            if (navigator.share) {
+                navigator.share({ title: 'Check this post', url }).catch(() => {});
+            } else {
+                navigator.clipboard.writeText(url).then(() => _safeToast('Link copied!', 'success'));
+            }
+            return;
+        }
+
+        // ── Message author ───────────────────────────────────────────────────
+        if (e.target.closest('.message-author-btn')) {
+            if (!currentUser) return _safeToast('Sign in to message.', 'warn');
+            closeDropdown();
+            const btn = e.target.closest('.message-author-btn');
+            document.querySelector('a[data-target="page-chat"]')?.click();
+            window.startDirectChat?.(btn.dataset.email, btn.dataset.name);
+            return;
+        }
+
+        // ── Edit post ────────────────────────────────────────────────────────
+        if (e.target.closest('.edit-post-btn')) {
+            closeDropdown();
+            if (!currentUser) return;
+            if (typeof window.openEditModal === 'function') {
+                window.openEditModal(postId);
+            } else {
+                _safeToast('Edit is not available here — open the post from the feed.', 'info');
+            }
+            return;
+        }
+
+        // ── Delete post ──────────────────────────────────────────────────────
+        if (e.target.closest('.delete-post-btn')) {
+            if (!currentUser) return;
+            closeDropdown();
+            const isAdmin = currentUser.role === 'admin';
+            // Fetch post data to verify ownership
+            let authorEmail = '';
+            try {
+                const snap = await getDoc(doc(db, 'posts', postId));
+                authorEmail = snap.data()?.authorEmail || '';
+            } catch { /* ignore */ }
+            if (authorEmail && authorEmail !== currentUser.email && !isAdmin) {
+                return _safeToast('You can only delete your own posts.', 'warn');
+            }
+            if (!confirm('Permanently delete this post? This cannot be undone.')) return;
+            const delBtn = e.target.closest('.delete-post-btn');
+            delBtn.textContent = 'Deleting…'; delBtn.disabled = true;
+            try {
+                await deleteDoc(doc(db, 'posts', postId));
+                _safeToast('Post deleted.', 'success');
+                showPage('page-posts');
+            } catch (err) {
+                _safeToast(`Delete failed: ${err.message}`, 'error');
+                delBtn.textContent = '🗑️ Delete post'; delBtn.disabled = false;
+            }
+            return;
+        }
+
+        // ── Pin post (admin) ─────────────────────────────────────────────────
+        if (e.target.closest('.pin-post-btn')) {
+            closeDropdown();
+            if (currentUser?.role !== 'admin') return _safeToast('Admins only.', 'warn');
+            try {
+                const snap = await getDoc(doc(db, 'posts', postId));
+                const isPinned = !!snap.data()?.pinned;
+                await updateDoc(doc(db, 'posts', postId), { pinned: !isPinned });
+                _safeToast(isPinned ? 'Post unpinned.' : 'Post pinned.', 'success');
+            } catch { _safeToast('Failed to update pin.', 'error'); }
+            return;
+        }
+
+        // ── Report ───────────────────────────────────────────────────────────
+        if (e.target.closest('.report-btn')) {
+            e.stopPropagation();
+            closeDropdown();
+            if (!currentUser) return _safeToast('Sign in to report.', 'warn');
+            window.openReportModal?.(postId, 'post', postId, null, '');
+            return;
+        }
+    });
+
+    // Expose _attachPostCardHandlers as a no-op — the document handler above
+    // uses commentsPage.dataset.currentPostId dynamically, so no per-call
+    // wiring is needed. Kept for call-site compatibility.
+    function _attachPostCardHandlers(_postId, _postData) { /* handled globally above */ }
 
     // ── 2. Submit Main Comment ────────────────────────────────────────────────
     submitCommentBtn?.addEventListener('click', async () => {

@@ -373,6 +373,67 @@ header, nav, main, #report-modal, footer {
 }
 
 /* --------------------------------------------------------------------------
+   THEME TOGGLE BUTTON
+   Sits beside the profile avatar / sign-in button in the top-right corner.
+   Uses the existing signal tokens so it inherits both light and dark modes
+   automatically — no extra overrides needed.
+   -------------------------------------------------------------------------- */
+#theme-toggle-btn {
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--edge-strong);
+    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--ink-dim);
+    transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
+    flex-shrink: 0;
+    position: relative;
+    overflow: hidden;
+}
+
+#theme-toggle-btn:hover {
+    background: var(--tint-violet);
+    border-color: var(--tint-violet-border);
+    color: var(--signal-violet);
+    transform: scale(1.08);
+}
+
+#theme-toggle-btn svg {
+    width: 1.15rem;
+    height: 1.15rem;
+    flex-shrink: 0;
+    transition: opacity 0.15s ease;
+}
+
+/* Spin + scale animation triggered by JS adding .spinning */
+@keyframes themeIconSpin {
+    0%   { transform: rotate(0deg)   scale(1);    opacity: 1; }
+    30%  { transform: rotate(140deg) scale(0.65); opacity: 0.4; }
+    60%  { transform: rotate(300deg) scale(1.15); opacity: 0.9; }
+    100% { transform: rotate(360deg) scale(1);    opacity: 1; }
+}
+
+#theme-toggle-btn.spinning svg {
+    animation: themeIconSpin 0.52s var(--ease-spring) forwards;
+}
+
+/* Sun icon gets a warm amber glow in dark mode */
+body.dark-mode #theme-toggle-btn svg {
+    color: var(--signal-amber);
+    filter: drop-shadow(0 0 5px rgba(255, 180, 84, 0.55));
+}
+
+body.dark-mode #theme-toggle-btn:hover {
+    background: rgba(255, 180, 84, 0.12);
+    border-color: rgba(255, 180, 84, 0.38);
+    color: var(--signal-amber);
+}
+
+/* --------------------------------------------------------------------------
    9. BUTTONS
    -------------------------------------------------------------------------- */
 .btn-primary {
@@ -711,9 +772,11 @@ input[type="file"] {
     border-radius: inherit;
     border: 1.5px solid transparent;
     background: var(--gradient-signal);
-    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0) padding-box;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0) padding-box;
+
+    -webkit-mask-composite: destination-out;
     mask-composite: exclude;
-    -webkit-mask-composite: xor;
     opacity: 0;
     transition: opacity var(--t-base);
 }

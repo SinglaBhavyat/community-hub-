@@ -24,7 +24,7 @@
 
 import { db } from '../config/firebase.js';
 import { addDocument, currentUser } from '../store/db.js';
-import { uploadImage } from '../utils/storage.js';
+import { uploadImage, uploadMediaFiles, getVideoThumbnail } from '../utils/storage.js';
 import {
     doc, updateDoc, arrayUnion, arrayRemove, getDoc,
     collection, addDoc, serverTimestamp,
@@ -565,11 +565,85 @@ function _updateRsvpCounts(postCard, attendance) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Create Event
+// Create Event  — multi-media dropzone (images + videos, up to 6)
 // ─────────────────────────────────────────────────────────────────
 function setupCreateEvent() {
-    attachCharCounter('event-content', 'event-content-counter');
+    attachCharCounter('event-content', 'event-content-counter', 1000);
 
+    // ── Dropzone wiring ──────────────────────────────────────────
+    const photoInput  = document.getElementById('event-photo');
+    const dropzone    = document.getElementById('event-media-dropzone');
+    const previewGrid = document.getElementById('event-media-preview');
+
+    const _evFiles = [];      // module-level file list for this form
+
+    function renderEventPreview() {
+        if (!previewGrid) return;
+        if (!_evFiles.length) {
+            previewGrid.style.display = 'none';
+            previewGrid.innerHTML = '';
+            return;
+        }
+        previewGrid.style.display = 'grid';
+        previewGrid.innerHTML = '';
+        _evFiles.forEach((file, i) => {
+            const cell = document.createElement('div');
+            cell.className = 'media-preview-cell';
+            if (file.type.startsWith('video/')) {
+                const thumb = file._thumbDataUrl;
+                cell.innerHTML = `
+                    <div class="media-preview-thumb media-preview-thumb--video">
+                        ${thumb ? `<img src="${thumb}" style="width:100%;height:100%;object-fit:cover;border-radius:6px;">` : ''}
+                        <div class="media-preview-video-badge">▶ VIDEO</div>
+                    </div>
+                    <button class="media-preview-remove" data-index="${i}" title="Remove" aria-label="Remove file">✕</button>
+                    <div class="media-preview-label">${file.name.length > 18 ? file.name.slice(0, 16) + '…' : file.name}</div>`;
+            } else {
+                const url = URL.createObjectURL(file);
+                cell.innerHTML = `
+                    <img src="${url}" class="media-preview-thumb" alt="Preview ${i + 1}">
+                    <button class="media-preview-remove" data-index="${i}" title="Remove" aria-label="Remove file">✕</button>`;
+            }
+            cell.querySelector('.media-preview-remove').addEventListener('click', () => {
+                _evFiles.splice(i, 1);
+                renderEventPreview();
+            });
+            previewGrid.appendChild(cell);
+        });
+    }
+
+    async function addEventFiles(newFiles) {
+        const allowed = 6 - _evFiles.length;
+        if (allowed <= 0) { showToast('Maximum 6 media files allowed.', 'info'); return; }
+        const toAdd = Array.from(newFiles).slice(0, allowed);
+        for (const f of toAdd) {
+            const isImg = f.type.startsWith('image/');
+            const isVid = f.type.startsWith('video/');
+            if (!isImg && !isVid) { showToast(`${f.name}: unsupported type.`, 'warning'); continue; }
+            if (isImg && f.size > 10 * 1024 * 1024) { showToast(`${f.name}: image must be under 10 MB.`, 'warning'); continue; }
+            if (isVid && f.size > 50 * 1024 * 1024) { showToast(`${f.name}: video must be under 50 MB.`, 'warning'); continue; }
+            if (isVid) { f._thumbDataUrl = await getVideoThumbnail(f).catch(() => null); }
+            _evFiles.push(f);
+        }
+        if (photoInput) photoInput.value = '';
+        renderEventPreview();
+        if (_evFiles.length >= 6) showToast('Maximum 6 files reached.', 'info');
+    }
+
+    if (photoInput) {
+        photoInput.addEventListener('change', () => addEventFiles(photoInput.files));
+    }
+    if (dropzone) {
+        dropzone.addEventListener('dragover',  (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            addEventFiles(e.dataTransfer.files);
+        });
+    }
+
+    // ── Form submission ──────────────────────────────────────────
     const form = document.getElementById('form-event')?.querySelector('form');
     if (!form) return;
 
@@ -584,33 +658,48 @@ function setupCreateEvent() {
         const restore = setBtnLoading(btn, '⏳ Creating…');
 
         try {
-            const imageFile = document.getElementById('event-photo')?.files[0];
-            const imageUrl  = imageFile
-                ? await uploadImage(imageFile, 'events').catch(() => null)
-                : null;
+            let mediaItems = [];
+            let imageUrl   = null;
+
+            if (_evFiles.length) {
+                showToast('Uploading media…', 'info', 10000);
+                mediaItems = await uploadMediaFiles(_evFiles, 'events');
+                imageUrl   = mediaItems.find(m => m.type === 'image')?.url ?? null;
+            }
+
+            // Extract #hashtags from description
+            const rawContent = document.getElementById('event-content')?.value.trim() || '';
+            const tags = (rawContent.match(/#[\w]+/g) || []).map(t => t.replace('#', '').toLowerCase());
 
             await addDocument('posts', {
                 type:          'event',
-                title:         document.getElementById('event-title')?.value.trim()    || '',
-                content:       document.getElementById('event-content')?.value.trim()  || '',
-                eventDate:     document.getElementById('event-date')?.value             || '',
-                eventTime:     document.getElementById('event-time')?.value             || '',
-                eventLocation: document.getElementById('event-location')?.value.trim()  || '',
+                title:         document.getElementById('event-title')?.value.trim()   || '',
+                content:       rawContent,
+                eventDate:     document.getElementById('event-date')?.value            || '',
+                eventTime:     document.getElementById('event-time')?.value            || '',
+                eventLocation: document.getElementById('event-location')?.value.trim() || '',
                 eventCapacity: parseInt(document.getElementById('event-capacity')?.value || '0', 10) || null,
                 attendance:    { going: [], maybe: [], notGoing: [] },
                 imageSrc:      imageUrl,
+                mediaItems:    mediaItems.length ? mediaItems : null,
                 author:        currentUser.name,
                 authorEmail:   currentUser.email,
                 commentCount:  0,
                 upvotedBy:     [],
                 upvoteCount:   0,
                 community:     document.getElementById('event-community')?.value || 'Global',
-                tags:          [],
+                tags,
                 pinned:        false,
                 timestamp:     Date.now(),
             });
 
+            // Reset
+            _evFiles.length = 0;
+            renderEventPreview();
             form.reset();
+            const counter = document.getElementById('event-content-counter');
+            if (counter) counter.textContent = '0 / 1000';
+
             showToast('Event created! 🎉', 'success');
             document.querySelector('[data-target="page-posts"]')?.click();
 

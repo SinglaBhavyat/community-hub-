@@ -9,6 +9,7 @@ import { setupAiChat } from './features/aiChat.js';
 import { setupAchievements } from './features/achievements.js';
 import { setupProfile } from './features/profile.js';
 import { setupAdmin } from './features/admin.js';
+import { initPostOptionsDropdowns } from './ui/templates.js';
 
 // Firebase & DB Imports
 import { db, auth, googleProvider } from './config/firebase.js';
@@ -159,6 +160,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupNavigation();
     setupThemeToggle();
     setupAuth();
+    initPostOptionsDropdowns(); // registers global 3-dot dropdown handler (templates.js)
 
     // All modules that open Firestore listeners (posts, chat, admin, etc.) are
     // deferred until the app's own currentUser is fully populated — meaning
