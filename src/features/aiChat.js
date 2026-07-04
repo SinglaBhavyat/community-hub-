@@ -114,7 +114,7 @@ export function setApiKey(key) {
 }
 
 function resolveApiKey() {
-  const key = _configApiKey || window.__ECHO_API_KEY || import.meta.env.VITE_GEMINI_API_KEY;
+  const key = _configApiKey ?? window.__ECHO_API_KEY ?? 'AQ.Ab8RN6I89yl-Rx85i2IWwjrRdnW4oqlV6l4bFAO6BhT7qMvRcA';
   if (!key) console.warn('[Echo] No API key found. Call setApiKey(key) or set window.__ECHO_API_KEY before setupAiChat().');
   return key;
 }
