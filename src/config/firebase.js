@@ -4,7 +4,7 @@ import { getFirestore } from "https://www.gstatic.com/firebasejs/10.8.0/firebase
 import { getStorage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  apiKey: "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA",
   authDomain: "community-45e72.firebaseapp.com",
   projectId: "community-45e72",
   storageBucket: "community-45e72.appspot.com",
