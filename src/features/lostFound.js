@@ -1951,6 +1951,12 @@ export function setupLostFound() {
           startTtlRefresh(feed);
         },
         (err) => {
+          // permission-denied after sign-out is expected — credentials are
+          // revoked while the listener is still active. Detach silently.
+          if (err?.code === 'permission-denied' && !currentUser) {
+            if (_feedUnsub) { _feedUnsub(); _feedUnsub = null; }
+            return;
+          }
           console.error('[LF] Snapshot error:', err);
           // permission-denied right after page load almost always means this
           // listener started before auth was ready — it'll be retried

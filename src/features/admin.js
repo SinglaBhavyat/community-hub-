@@ -265,6 +265,12 @@ export function setupAdmin() {
     const adminPage = document.getElementById('page-admin');
     if (!adminPage) return;
 
+    // Guard: only wire up Firestore listeners and admin logic for actual admins.
+    // setupAdmin() is called for every authenticated user by main.js, but non-admin
+    // users must never open listeners against the 'reports' collection (or any other
+    // admin-only collection) — the Firestore rules will deny them and log errors.
+    if (currentUser?.role !== 'admin') return;
+
     // ── Inject keyframe animations once ──────────────────────────────────────
     if (!document.getElementById('admin-styles')) {
         const style = document.createElement('style');
@@ -454,6 +460,13 @@ export function setupAdmin() {
                 if (badge) {
                     badge.textContent = pending;
                     badge.classList.toggle('hidden', pending === 0);
+                }
+                // FIX: also update the global admin nav indicator in the header dropdown
+                // so admins see a live count even when not on the admin page.
+                const navIndicator = document.getElementById('admin-nav-indicator');
+                if (navIndicator) {
+                    navIndicator.textContent = pending > 99 ? '99+' : String(pending);
+                    navIndicator.classList.toggle('hidden', pending === 0);
                 }
             },
             (err) => console.warn('[Admin] Queue badge listener error:', err)

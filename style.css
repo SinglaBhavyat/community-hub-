@@ -346,6 +346,7 @@ header, nav, main, #report-modal, footer {
     letter-spacing: 0.02em;
     transition: color var(--t-base);
     text-decoration: none;
+    overflow: visible;
 }
 
 .nav-link::after {

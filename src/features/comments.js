@@ -43,7 +43,7 @@ const REPLY_MAX     = 500;
 const REACTIONS     = ['👍', '❤️', '😂', '😮', '😢'];
 
 // Gemini API — swap out key or model as needed
-const API_KEY = 'AIzaSyC91ADdrp0yY16w0dPN67PjUh5Ca3cREwM';
+const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`;
 
 // ─── Module state ─────────────────────────────────────────────────────────────

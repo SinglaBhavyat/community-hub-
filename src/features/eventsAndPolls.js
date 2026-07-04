@@ -555,6 +555,7 @@ function _updateRsvpCounts(postCard, attendance) {
     const m = attendance?.maybe?.length    ?? 0;
     const n = attendance?.notGoing?.length ?? 0;
 
+    // Update the summary row count spans (always rendered in the new template)
     const goingEl    = postCard.querySelector('.rsvp-going-count');
     const maybeEl    = postCard.querySelector('.rsvp-maybe-count');
     const notGoingEl = postCard.querySelector('.rsvp-not-going-count');
@@ -788,10 +789,14 @@ function setupCreateStudy() {
 // Feed interactions (RSVP, Poll vote, Join Study, Report)
 // ─────────────────────────────────────────────────────────────────
 function setupFeedInteractions() {
-    const feed = document.getElementById('posts-feed');
-    if (!feed) return;
+    const feeds = [
+        document.getElementById('posts-feed'),
+        document.getElementById('bookmarked-posts-feed'),
+        document.getElementById('my-posts-feed'),
+    ].filter(Boolean);
+    if (feeds.length === 0) return;
 
-    feed.addEventListener('click', async (e) => {
+    const handler = async (e) => {
         if (!currentUser) return;
 
         const postCard = e.target.closest('.post-card');
@@ -1023,7 +1028,11 @@ function setupFeedInteractions() {
             openReportModal(postId, 'post', preview);
             return;
         }
-    });
+    };
+
+    // Attach to all three feed containers so RSVP / poll / study buttons
+    // work in the global feed, the bookmarked feed, and "my posts" feed.
+    feeds.forEach(feed => feed.addEventListener('click', handler));
 }
 
 // ─────────────────────────────────────────────────────────────────

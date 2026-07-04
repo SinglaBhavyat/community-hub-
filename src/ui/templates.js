@@ -267,6 +267,7 @@ export function createPostCardHTML(post, currentUser, isDetailed = false) {
         const notGoing = post.attendance?.notGoing?.length || 0;
         const isGoing  = !!(post.attendance?.going?.includes(currentUser?.email));
         const isMaybe  = !!(post.attendance?.maybe?.includes(currentUser?.email));
+        const isNotGoing = !!(post.attendance?.notGoing?.includes(currentUser?.email));
         const total    = going + maybe + notGoing;
 
         eventHTML = `
@@ -283,22 +284,34 @@ export function createPostCardHTML(post, currentUser, isDetailed = false) {
                 </div>
                 ${total > 0 ? `
                 <div class="flex items-center gap-1 mb-3 text-xs text-gray-400 dark:text-gray-500">
-                    <span class="font-semibold text-emerald-600 dark:text-emerald-400">${going} going</span>
+                    <span class="font-semibold text-emerald-600 dark:text-emerald-400"><span class="rsvp-going-count">${going}</span> going</span>
                     <span>·</span>
-                    <span>${maybe} maybe</span>
+                    <span><span class="rsvp-maybe-count">${maybe}</span> maybe</span>
                     <span>·</span>
-                    <span>${notGoing} not going</span>
-                </div>` : ''}
+                    <span><span class="rsvp-not-going-count">${notGoing}</span> not going</span>
+                </div>` : `
+                <div class="flex items-center gap-1 mb-3 text-xs text-gray-400 dark:text-gray-500">
+                    <span class="font-semibold text-emerald-600 dark:text-emerald-400"><span class="rsvp-going-count">0</span> going</span>
+                    <span>·</span>
+                    <span><span class="rsvp-maybe-count">0</span> maybe</span>
+                    <span>·</span>
+                    <span><span class="rsvp-not-going-count">0</span> not going</span>
+                </div>`}
                 <div class="flex gap-2">
                     <button class="rsvp-btn rsvp-going flex-1 py-2 rounded-xl text-sm font-semibold border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-emerald-400 ${isGoing
-                        ? 'bg-emerald-500 text-white border-emerald-500 shadow-md'
+                        ? 'bg-emerald-500 text-white border-emerald-500 shadow-md rsvp-active'
                         : 'border-gray-300 dark:border-zinc-600 text-gray-600 dark:text-gray-400 hover:border-emerald-400 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 bg-white dark:bg-zinc-800'}">
-                        ✓ Going (${going})
+                        ✓ Going
                     </button>
                     <button class="rsvp-btn rsvp-maybe flex-1 py-2 rounded-xl text-sm font-semibold border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-amber-400 ${isMaybe
-                        ? 'bg-amber-400 text-white border-amber-400 shadow-md'
+                        ? 'bg-amber-400 text-white border-amber-400 shadow-md rsvp-active'
                         : 'border-gray-300 dark:border-zinc-600 text-gray-600 dark:text-gray-400 hover:border-amber-400 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/20 bg-white dark:bg-zinc-800'}">
-                        ? Maybe (${maybe})
+                        ? Maybe
+                    </button>
+                    <button class="rsvp-btn rsvp-not-going flex-1 py-2 rounded-xl text-sm font-semibold border transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-red-400 ${isNotGoing
+                        ? 'bg-red-400 text-white border-red-400 shadow-md rsvp-active'
+                        : 'border-gray-300 dark:border-zinc-600 text-gray-600 dark:text-gray-400 hover:border-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 bg-white dark:bg-zinc-800'}">
+                        ✕ Not Going
                     </button>
                 </div>
             </div>
@@ -452,6 +465,14 @@ export function createPostCardHTML(post, currentUser, isDetailed = false) {
 
         <div class="flex items-center gap-1">
             <span class="hidden sm:inline text-xs text-gray-400 dark:text-gray-500 mr-1">${readingTime(post.content)}</span>
+            <button class="bookmark-btn p-2 rounded-xl transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-amber-300 ${isBookmarked
+                ? 'text-amber-500 bg-amber-50 dark:bg-amber-900/20'
+                : 'text-gray-400 dark:text-gray-500 hover:text-amber-500 dark:hover:text-amber-400 hover:bg-gray-100 dark:hover:bg-zinc-800'}"
+                    data-post-id="${post.id}" title="${isBookmarked ? 'Remove bookmark' : 'Bookmark'}" aria-label="${isBookmarked ? 'Remove bookmark' : 'Bookmark post'}" aria-pressed="${isBookmarked}">
+                <svg class="w-4 h-4" fill="${isBookmarked ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-5-7 5V5z"/>
+                </svg>
+            </button>
             <button class="share-btn p-2 rounded-xl text-gray-400 dark:text-gray-500 hover:text-indigo-500 dark:hover:text-indigo-400 hover:bg-gray-100 dark:hover:bg-zinc-800 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-indigo-300"
                     data-post-id="${post.id}" title="Share" aria-label="Share post">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -630,6 +651,13 @@ export function initPostOptionsDropdowns() {
 
         const btn = e.target.closest('.post-options-btn');
         if (!btn) return;
+
+        // posts.js attaches its own handler to the three feed containers and
+        // handles BOTH .post-options-trigger AND .post-options-btn clicks.
+        // If this click is inside one of those feeds, let posts.js handle it
+        // exclusively to prevent a double-open/close race.
+        const feedIds = ['posts-feed', 'bookmarked-posts-feed', 'my-posts-feed'];
+        if (feedIds.some(id => btn.closest(`#${id}`))) return;
 
         const dropdown = btn.nextElementSibling;
         if (!dropdown) return;

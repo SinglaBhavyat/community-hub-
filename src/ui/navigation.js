@@ -72,7 +72,10 @@ export function setupNavigation() {
                         googleProvider.setCustomParameters({ prompt: 'select_account' });
                         await signInWithPopup(auth, googleProvider);
                     } catch (err) {
-                        if (err.code !== 'auth/popup-closed-by-user') {
+                        // cancelled-popup-request fires when a previous popup
+                        // is still pending and a new one starts — harmless here.
+                        if (err.code !== 'auth/popup-closed-by-user' &&
+                            err.code !== 'auth/cancelled-popup-request') {
                             console.error('Switch account sign-in error:', err);
                         }
                     }

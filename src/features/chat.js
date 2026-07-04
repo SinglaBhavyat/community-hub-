@@ -3,10 +3,11 @@ import { currentUser } from '../store/db.js';
 import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 import { sanitize } from '../ui/templates.js';
 import { uploadToCloudinary } from '../utils/storage.js';
+import { onPageVisit } from '../ui/navigation.js';
 import {
     collection, doc, setDoc, addDoc, query, orderBy, onSnapshot,
     serverTimestamp, getDocs, limit, where, deleteDoc, updateDoc,
-    arrayUnion, arrayRemove, getDoc, writeBatch, runTransaction
+    arrayUnion, arrayRemove, getDoc, writeBatch, runTransaction, increment
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 
 // ─────────────────────────────────────────────
@@ -39,13 +40,21 @@ let recordingTimer       = null;
 let isRecording          = false;
 let recordingCancelled   = false;  // FIX: use flag instead of clearing audioChunks before stop fires
 let emojiPickerVisible   = false;
-let forwardingMsgId      = null;   // NOTE: unused — openForwardModal receives msgId as parameter directly
+// FIX Bug 9: removed forwardingMsgId — was never read; openForwardModal takes msgId as a direct parameter.
 let _totalUnread         = 0;   // FIX: track real total so _recomputeNavBadge doesn't parse DOM badges
 let _pendingReadRooms    = new Set(); // FIX: rooms where markRoomRead fired but server timestamp not yet resolved
+let _roomUnreadMap      = new Map(); // FIX BUG 5: per-room unread counts from last snapshot, used by markRoomRead
 let _hbInterval          = null;   // heartbeat interval ref for cleanup
 let _activeAudio         = null;   // FIX: was window._waAudio — keep audio state at module scope
 let _cleanupDropdown     = null;   // FIX #5: module-scope instead of DOM property
 let _lastTypingWriteMs   = 0;      // FIX #10: throttle typing writes to Firestore
+// FIX BUG-STARRED: dedicated real-time listener for the current user's starred messages,
+// so reactions/read-receipts on the messages snapshot no longer re-fetch starred data.
+let starredSub           = null;
+// FIX BUG-GLOBAL: persistent auth + page-visit listeners must be registered exactly once
+// per module lifetime.  teardownChat resets conversation state but must NOT reset this flag
+// because those listeners survive across login/logout cycles by design.
+let _globalListenersSetup = false;
 
 const TYPING_TTL_MS    = 6000;
 const EMOJI_LIST       = ['😀','😂','😍','🥰','😎','🤔','😮','😢','😡','👍','❤️','🙏','🎉','🔥','✅','💯','🤣','😭','😊','🥺','🤩','😴','🤯','💀','👋','🤝','💪','👀','🫡','🫶'];
@@ -263,9 +272,12 @@ function showConfirm({ title, body, confirmLabel = 'Confirm', tone = 'default' }
 const getPrivateRoomId = (a, b) => [a, b].sort().join('_');
 
 function unsubscribeRoomListeners() {
-    chatSub?.();     chatSub     = null;
-    rootChatSub?.(); rootChatSub = null;
-    presenceSub?.(); presenceSub = null;
+    chatSub?.();       chatSub     = null;
+    rootChatSub?.();   rootChatSub = null;
+    presenceSub?.();   presenceSub = null;
+    // FIX BUG-STARRED: always tear down the starred listener when leaving a room so
+    // it doesn't keep writing to a stale starredMessages Set for the old room.
+    starredSub?.();    starredSub  = null;
     clearTypingState();
 }
 
@@ -306,17 +318,36 @@ export function teardownChat() {
     unsubscribeRecent();
     stopRecording(true);
     if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
-    // FIX: stop any playing voice note audio on teardown
+    // FIX BUG-DROPDOWN: remove the document-level click listener that closes the
+    // header dropdown.  Previously teardownChat only nulled the reference without
+    // removing the listener, leaving a dangling handler on document after logout.
+    if (_cleanupDropdown) {
+        document.removeEventListener('click', _cleanupDropdown);
+        _cleanupDropdown = null;
+    }
+    // Stop any playing voice note audio on teardown
     if (_activeAudio && !_activeAudio.paused) { _activeAudio.pause(); }
     _activeAudio      = null;
     activeRoomId      = null;
     activeRoomDetails = null;
     replyingTo        = null;
     editingMsgId      = null;
-    // FIX: invalidate contacts cache on teardown so a fresh mount picks up new users
+    // Invalidate contacts cache so a fresh mount picks up new users
     cachedUsersHTML   = null;
     cachedUsersData   = null;
-    // FIX: remove injected hidden file inputs on teardown to prevent accumulation
+    cachedUsersAt     = 0;
+    // FIX: reset unread counters and pending-read tracking so stale state from
+    // a previous authenticated user cannot bleed into the next session after
+    // sign-out / re-authentication or a fast user switch.
+    _totalUnread      = 0;
+    _pendingReadRooms.clear();
+    _roomUnreadMap.clear();
+    // FIX: clear message snapshot so previous user's messages never appear
+    lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
+    // FIX: reset nav badge immediately so previous user's unread dot disappears
+    const navDot = document.getElementById('chat-nav-indicator');
+    if (navDot) { navDot.classList.add('hidden'); navDot.textContent = ''; }
+    // Remove injected hidden file inputs on teardown to prevent accumulation
     document.querySelectorAll('[data-chat-input="true"]').forEach(el => el.remove());
     delete window.startDirectChat;
     const chatContainer = document.getElementById('chat-messages');
@@ -753,8 +784,15 @@ function buildMessageHTML(msg, index, messages, chatType) {
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                     Copy text
                 </button>
-                <button class="wa-drop-item msg-delete-me-btn" data-msg-id="${msg.id}">Delete for me</button>
-                ${isMe ? `<button class="wa-drop-item wa-drop-item--danger msg-delete-everyone-btn" data-msg-id="${msg.id}">Delete for everyone</button>` : ''}
+                <!-- FIX Bug 8: added trash icons so delete buttons match icon+label rhythm of all other dropdown items -->
+                <button class="wa-drop-item msg-delete-me-btn" data-msg-id="${msg.id}">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                    Delete for me
+                </button>
+                ${isMe ? `<button class="wa-drop-item wa-drop-item--danger msg-delete-everyone-btn" data-msg-id="${msg.id}">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                    Delete for everyone
+                </button>` : ''}
             </div>
         </div>`;
 
@@ -961,7 +999,7 @@ function ensureChatStyles() {
             border-radius: 20px;
             border: 1px solid var(--wa-border);
             box-shadow: var(--wa-shadow-lg);
-            overflow: hidden;
+            overflow: clip; /* FIX Bug 1: was overflow:hidden which clipped absolutely-positioned dropdowns (forward/delete/pin). overflow:clip preserves the border-radius crop on layout content without creating a new clipping rect for absolute descendants. */
             height: 100%;
             display: flex;
         }
@@ -1049,9 +1087,12 @@ function ensureChatStyles() {
         .wa-sidebar-avatar { flex-shrink: 0; }
         .wa-sidebar-body   { flex: 1; min-width: 0; }
         .wa-sidebar-top    { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 3px; }
-        .wa-sidebar-name   { font-size: 14px; font-weight: 600; color: var(--wa-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+        /* FIX Bug 6: was max-width:160px which hard-truncated names at ~20 chars even on
+           wide screens where space was available. flex:1 + min-width:0 lets the name fill
+           remaining space and only ellipsis when the timestamp actually needs room. */
+        .wa-sidebar-name   { font-size: 14px; font-weight: 600; color: var(--wa-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
         .wa-sidebar-name--unread { color: #000; font-weight: 700; }
-        .wa-sidebar-time   { font-size: 11px; color: var(--wa-sub); white-space: nowrap; flex-shrink: 0; }
+        .wa-sidebar-time   { font-size: 11px; color: var(--wa-sub); white-space: nowrap; flex-shrink: 0; margin-left: 6px; }
         .wa-sidebar-time--unread { color: var(--wa-accent); font-weight: 600; }
         .wa-sidebar-bottom { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
         .wa-sidebar-preview { font-size: 13px; color: var(--wa-sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
@@ -1313,9 +1354,15 @@ function ensureChatStyles() {
         .wa-reaction-pill span  { font-size: 11px; font-weight: 700; color: var(--wa-sub); }
 
         /* ═══ Message context menu ═══ */
-        .wa-msg-menu { position: absolute; top: 4px; z-index: 10; opacity: 0; transition: opacity .15s; }
-        .wa-msg-row--me   .wa-msg-menu { right: calc(100% + 4px); }
-        .wa-msg-row--them .wa-msg-menu { left: calc(100% + 4px); }
+        /* FIX Bug 2: was left:calc(100%+4px) for --them which resolved against the full
+           wa-msg-wrap width (wider than the bubble), pushing the button too far right.
+           Now both sides anchor from the right edge of the wrap so the button always sits
+           just outside the bubble regardless of wrap width. */
+        .wa-msg-menu { position: absolute; top: 4px; z-index: 100; opacity: 0; transition: opacity .15s; }
+        /* "Me" bubbles: menu button sits to the LEFT of the bubble (before the text area) */
+        .wa-msg-row--me   .wa-msg-menu { right: calc(100% + 4px); left: auto; }
+        /* "Them" bubbles: menu button sits to the RIGHT of the bubble */
+        .wa-msg-row--them .wa-msg-menu { left: calc(100% + 4px); right: auto; }
         .wa-msg-wrap:hover .wa-msg-menu { opacity: 1; }
         .wa-msg-menu-btn {
             width: 28px; height: 28px; border-radius: 8px; background: var(--wa-panel);
@@ -1325,9 +1372,12 @@ function ensureChatStyles() {
         }
         .wa-msg-menu-btn:hover { background: var(--wa-input-bg); color: var(--wa-text); }
         .wa-msg-dropdown {
-            position: absolute; top: 32px; min-width: 210px;
+            /* FIX Bug 3: was top:32px (hardcoded button height) which overflowed on short
+               bubbles. top:100% + margin-top always places the dropdown flush below the
+               trigger button regardless of bubble or font size. */
+            position: absolute; top: 100%; margin-top: 4px; min-width: 210px;
             background: var(--wa-panel); border: 1px solid var(--wa-border);
-            border-radius: 14px; box-shadow: var(--wa-shadow-lg); overflow: hidden; z-index: 60;
+            border-radius: 14px; box-shadow: var(--wa-shadow-lg); overflow: hidden; z-index: 200;
         }
         .wa-msg-row--me   .wa-msg-dropdown { right: 0; }
         .wa-msg-row--them .wa-msg-dropdown { left: 0; }
@@ -1751,13 +1801,13 @@ async function openForwardModal(msgId) {
                     if (_fwdTargetData?.type === 'private') {
                         const _fwdRecip = _fwdMembers.find(e => e !== currentUser.email);
                         if (_fwdRecip) {
-                            _fwdUpdate[`unreadCount.${_fwdRecip}`] = (_fwdTargetData?.unreadCount?.[_fwdRecip] || 0) + 1;
+                            _fwdUpdate[`unreadCount.${_fwdRecip}`] = increment(1);
                         }
                     } else if (_fwdTargetData?.type === 'group') {
                         // FIX #3: bump all group members except sender
                         for (const _gm of _fwdMembers) {
                             if (_gm && _gm !== currentUser.email) {
-                                _fwdUpdate[`unreadCount.${_gm}`] = (_fwdTargetData?.unreadCount?.[_gm] || 0) + 1;
+                                _fwdUpdate[`unreadCount.${_gm}`] = increment(1);
                             }
                         }
                     }
@@ -1813,6 +1863,36 @@ function openStarredPanel() {
 }
 
 // ─────────────────────────────────────────────
+// STARRED MESSAGES SUBSCRIPTION
+// FIX BUG-STARRED: Previously the messages onSnapshot callback called getDoc() for
+// the starred document on EVERY snapshot event (reactions, read-receipts, edits all
+// trigger a new snapshot).  That is O(snapshots) extra Firestore reads per room open.
+// Now a single onSnapshot listener tracks the starred document reactively: it fires
+// only when the user actually stars/unstars a message, keeping starredMessages in sync
+// without any redundant reads inside the messages listener.
+// ─────────────────────────────────────────────
+function subscribeStarred(roomId) {
+    starredSub?.(); starredSub = null;
+    if (!roomId || !currentUser?.email) return;
+    const starredRef = doc(db, `chats/${roomId}/starred`, currentUser.email);
+    starredSub = onSnapshot(starredRef, snap => {
+        starredMessages.clear();
+        if (snap.exists()) {
+            const ids = snap.data().ids || [];
+            ids.forEach(id => {
+                if (typeof id === 'string' && id.length > 0 && id.length < 200 && !/[\s/]/.test(id)) {
+                    starredMessages.add(id);
+                }
+            });
+        }
+        // Re-render so star badges are always accurate without an extra read.
+        renderMessages();
+    }, () => {
+        // Non-fatal: starred fetch failed — leave starredMessages as-is.
+    });
+}
+
+// ─────────────────────────────────────────────
 // TYPING SUBSCRIPTION (with server-side TTL awareness)
 // ─────────────────────────────────────────────
 function subscribeTypingIndicator(roomId, chatType) {
@@ -1837,7 +1917,10 @@ function subscribeTypingIndicator(roomId, chatType) {
 
         if (typingName) {
             if (!existing) {
-                chatContainer.insertAdjacentHTML('beforeend', buildTypingIndicatorHTML(typingName));
+                // FIX Bug 3: chat-messages uses flex-direction:column-reverse.
+                // 'beforeend' puts the element at the DOM end → visually at the TOP.
+                // 'afterbegin' puts it at the DOM start → visually at the BOTTOM, below the newest message.
+                chatContainer.insertAdjacentHTML('afterbegin', buildTypingIndicatorHTML(typingName));
             } else {
                 const label = existing.querySelector('.wa-typing-label');
                 if (label) label.textContent = `${typingName} is typing`;
@@ -1865,27 +1948,23 @@ function markRoomRead(roomId) {
         _pendingReadRooms.delete(roomId);
     });
 
-    // Immediately reflect in the sidebar without waiting for the snapshot to round-trip.
-    // FIX: read and zero out the badge BEFORE removing it so _recomputeNavBadge gets
-    // an accurate total (the badge DOM node is gone by the time _recomputeNavBadge runs).
-    let clearedCount = 0;
+    // FIX BUG 5: read cleared count from _roomUnreadMap (set by the snapshot)
+    // instead of scraping the DOM. The DOM may be filtered, hidden, or not yet
+    // rendered — making DOM-based clearedCount unreliable and leaving the nav
+    // badge non-zero even after the room is opened.
+    const clearedCount = _roomUnreadMap.get(roomId) || 0;
+    _roomUnreadMap.set(roomId, 0); // zero it immediately
+
+    // Also clear the visual badge in the DOM if the item is currently visible.
     document.querySelectorAll(`.wa-sidebar-item[data-email]`).forEach(item => {
         const itemRoomId = item.dataset.type === 'group'
             ? item.dataset.email
             : getPrivateRoomId(currentUser.email, item.dataset.email);
         if (itemRoomId !== roomId) return;
-        const badge = item.querySelector('.wa-badge[data-count]');
-        if (badge) {
-            const n = parseInt(badge.dataset.count, 10);
-            if (!isNaN(n)) clearedCount += n;
-            badge.remove();
-        }
-        const nameEl    = item.querySelector('.wa-sidebar-name');
-        const timeEl    = item.querySelector('.wa-sidebar-time');
-        const previewEl = item.querySelector('.wa-sidebar-preview');
-        nameEl?.classList.remove('wa-sidebar-name--unread');
-        timeEl?.classList.remove('wa-sidebar-time--unread');
-        previewEl?.classList.remove('wa-sidebar-preview--unread');
+        item.querySelector('.wa-badge[data-count]')?.remove();
+        item.querySelector('.wa-sidebar-name')?.classList.remove('wa-sidebar-name--unread');
+        item.querySelector('.wa-sidebar-time')?.classList.remove('wa-sidebar-time--unread');
+        item.querySelector('.wa-sidebar-preview')?.classList.remove('wa-sidebar-preview--unread');
     });
 
     // Recompute the nav-level badge immediately (subtract this room's count)
@@ -1893,17 +1972,33 @@ function markRoomRead(roomId) {
     _recomputeNavBadge();
 }
 function _recomputeNavBadge() {
-    // FIX: use the module-level _totalUnread counter (kept in sync by loadRecentChats
+    // Use the module-level _totalUnread counter (kept in sync by loadRecentChats
     // snapshot and decremented in markRoomRead) instead of re-summing DOM badges.
     // Re-reading the DOM here is unreliable because markRoomRead may have already
     // removed the badge node for the just-opened room before this function runs.
-    const total = _totalUnread;
+    // FIX: if no authenticated user exists, force total to 0 so a signed-out
+    // state never shows a stale unread indicator from the previous session.
+    const total = currentUser ? _totalUnread : 0;
     const navDot = document.getElementById('chat-nav-indicator');
     if (!navDot) return;
-    navDot.classList.toggle('hidden', total === 0);
-    navDot.textContent = total > 99 ? '99+' : total > 0 ? String(total) : '';
-    navDot.classList.toggle('chat-nav-dot--count', total > 0);
+    if (total === 0) {
+        // FIX Bug 5: explicitly reset pill shape and content when total hits zero.
+        // Relying solely on classList.toggle left chat-nav-dot--count in place if the
+        // element was briefly un-hidden (e.g. CSS transition race), showing an empty pill.
+        navDot.classList.add('hidden');
+        navDot.classList.remove('chat-nav-dot--count');
+        navDot.textContent = '';
+    } else {
+        navDot.classList.remove('hidden');
+        navDot.classList.toggle('chat-nav-dot--count', true);
+        navDot.textContent = total > 99 ? '99+' : String(total);
+    }
 }
+
+// FIX Bug 1: track message IDs for which we've already fired a seenBy write this
+// session so each updateDoc is sent at most once per room-open, not once per snapshot.
+// The Set is keyed by "roomId:msgId" so switching rooms resets nothing incorrectly.
+const _seenBySubmitted = new Set();
 
 function markMessagesSeenBy(roomId) {
     if (!roomId || !currentUser?.email) return;
@@ -1912,14 +2007,20 @@ function markMessagesSeenBy(roomId) {
         m.senderEmail !== 'system' &&   // FIX: system messages have no seenBy — skip them
         !m.seenBy?.includes(currentUser.email) &&
         !m.isDeletedForEveryone &&
-        !m._pending && !m._failed
+        !m._pending && !m._failed &&
+        // FIX Bug 1: skip if we've already submitted the write for this message
+        !_seenBySubmitted.has(`${roomId}:${m.id}`)
     );
     // FIX: skip the whole write loop if there's nothing to mark (saves Firestore reads on every snapshot)
     if (!unseen.length) return;
     unseen.forEach(m => {
+        const key = `${roomId}:${m.id}`;
+        _seenBySubmitted.add(key); // mark before the write so concurrent snapshots don't re-submit
         updateDoc(doc(db, `chats/${roomId}/messages`, m.id), {
             seenBy: arrayUnion(currentUser.email)
-        }).catch(() => {});
+        }).catch(() => {
+            _seenBySubmitted.delete(key); // allow retry on transient failure
+        });
     });
 }
 
@@ -2216,6 +2317,9 @@ export function setupChat() {
     }, { once: true });
 
     // ── Recent chats ────────────────────────────
+    // Track which user's recent-chats subscription is currently live.
+    let _recentSubOwner = null; // email of the user whose sub is active
+
     const loadRecentChats = () => {
         // Guard: currentUser is populated asynchronously from store/db.js.
         // If it isn't ready yet we return false so the caller can retry.
@@ -2223,14 +2327,34 @@ export function setupChat() {
         // Guard: recentList may be null if setupChat() ran before the DOM was
         // fully rendered (e.g. the chat page is lazily injected).
         if (!recentList) return false;
+        // FIX BUG 1+4: skip re-subscribe if a live subscription already exists
+        // for THIS user — avoids blank-list flash on every page-chat visit.
+        // Only re-subscribe when: no sub exists, or it belongs to a different user.
+        const _ownerEmail = currentUser.email;
+        if (recentChatsSub && _recentSubOwner === _ownerEmail) return true;
+        _recentSubOwner = _ownerEmail;
         unsubscribeRecent();
-        const q = query(
-            collection(db, 'chats'),
-            where('members', 'array-contains', currentUser.email)
-        );
-        recentChatsSub = onSnapshot(q, snap => {
+
+        // FIX: if the composite index (members ARRAY_CONTAINS + lastUpdated DESC) isn't
+        // ready yet, Firestore returns a 'failed-precondition' / index-required error and
+        // kills the listener — the recent list goes blank permanently.
+        // Solution: try the ordered query first; on index error fall back to the simpler
+        // unordered query and sort client-side, so the list always works.
+        // Deploy firestore.indexes.json to build the index (takes ~1-2 min on first deploy).
+        const _buildRecentQuery = (withOrder) => withOrder
+            ? query(collection(db, 'chats'), where('members', 'array-contains', _ownerEmail), orderBy('lastUpdated', 'desc'))
+            : query(collection(db, 'chats'), where('members', 'array-contains', _ownerEmail));
+
+        const _attachRecentListener = (withOrder) => {
+            recentChatsSub?.();
+            recentChatsSub = onSnapshot(_buildRecentQuery(withOrder), snap => {
+            // FIX: discard snapshot if the authenticated user changed between
+            // when this listener was registered and when the snapshot arrived.
+            // This prevents cross-user leakage when the app is fast-switched.
+            if (!currentUser || currentUser.email !== _ownerEmail) return;
             const chats = [];
             snap.forEach(d => chats.push({ id: d.id, ...d.data() }));
+            // Secondary client-side sort as a safety net (already ordered by server).
             chats.sort((a, b) => (b.lastUpdated?.toMillis() || 0) - (a.lastUpdated?.toMillis() || 0));
 
             if (!chats.length) {
@@ -2240,8 +2364,10 @@ export function setupChat() {
                         <p class="text-gray-700 text-sm font-medium">No conversations yet</p>
                         <p class="text-gray-400 text-xs">Start one from the Contacts tab</p>
                     </div>`;
-                const navDot = document.getElementById('chat-nav-indicator');
-                if (navDot) navDot.classList.add('hidden');
+                // FIX BUG 3: reset _totalUnread and go through _recomputeNavBadge so
+                // the pill class and text are also cleared — not just the hidden class.
+                _totalUnread = 0;
+                _recomputeNavBadge();
                 return;
             }
 
@@ -2252,7 +2378,13 @@ export function setupChat() {
                 const email      = isGroup ? chat.id : (chat.members?.find(e => e !== currentUser.email) || '');
                 const name       = isGroup
                     ? chat.name
-                    : (chat.memberNames?.find(n => n && n !== currentUser.name) || email.split('@')[0] || 'Unknown');
+                    // Prefer an authoritative name lookup by email from the contacts cache.
+                    // The memberNames array uses display names as keys, which breaks silently
+                    // when two users share the same name — email is the stable identity.
+                    : (cachedUsersData?.find(u => u.email === email)?.name
+                        || chat.memberNames?.find(n => n && n !== currentUser.name)
+                        || email.split('@')[0]
+                        || 'Unknown');
                 const isBlocked  = chat.blockedBy?.length > 0;
                 const lastMessage = isBlocked ? '🔒 Chat Blocked' : (chat.lastMessage || 'New Chat');
                 const time        = formatRelativeTime(chat.lastUpdated);
@@ -2292,7 +2424,16 @@ export function setupChat() {
                 const effectiveUnread = pendingCount > 0 ? Math.max(unread, pendingCount) : unread;
 
                 html += createSidebarItemHTML({ id: chat.id, email, name, type: chat.type, lastMessage: effectiveLastMessage, time, unread: effectiveUnread, online, isActive: isActiveRoom });
-                totalUnread += unread;
+                // FIX BUG 5: record per-room unread in Map so markRoomRead can look up
+                // the count without parsing the DOM (DOM may be filtered/hidden/empty).
+                _roomUnreadMap.set(chat.id, effectiveUnread);
+                // Use effectiveUnread (not unread) so the module-level total stays in sync.
+                // FIX Bug 4: exclude pending-read rooms from the total so a racing snapshot
+                // (arriving before the serverTimestamp() resolves) doesn't re-add this room's
+                // count and cause the nav indicator to flicker back on after opening a chat.
+                if (!isActiveRoom && !isPendingRead) {
+                    totalUnread += effectiveUnread;
+                }
             });
             recentList.innerHTML = html;
             // FIX: re-apply active search filter after sidebar re-render
@@ -2300,16 +2441,35 @@ export function setupChat() {
 
             // ── Nav indicator: show unread count badge ──
             _totalUnread = totalUnread; // FIX: keep module-level total in sync with snapshot
-            const navDot = document.getElementById('chat-nav-indicator');
-            if (navDot) {
-                navDot.classList.toggle('hidden', totalUnread === 0);
-                navDot.textContent = totalUnread > 99 ? '99+' : totalUnread > 0 ? String(totalUnread) : '';
-                navDot.classList.toggle('chat-nav-dot--count', totalUnread > 0);
-            }
+            _recomputeNavBadge(); // FIX Bug 5: centralise all nav-dot updates through
+            // _recomputeNavBadge so the explicit zero-reset (remove pill class, clear text)
+            // is always applied consistently — avoids the empty-pill flash on toggle.
         }, err => {
+            // FIX: if Firestore rejects because the composite index doesn't exist yet,
+            // fall back to the unordered query and sort client-side. This is a one-time
+            // degraded mode; once the index builds, reload will use the fast path.
+            const isIndexError = err?.code === 'failed-precondition' ||
+                (err?.message || '').toLowerCase().includes('index');
+            if (withOrder && isIndexError) {
+                console.warn('[Chat] recent: composite index not ready, falling back to client-side sort. Deploy firestore.indexes.json to fix.');
+                _attachRecentListener(false); // retry without orderBy
+                return;
+            }
             console.error('[Chat] recent:', err);
+            // FIX BUG-DEAD-SUB: On a permanent (non-index) Firestore error the SDK stops
+            // delivering snapshots and the listener is effectively dead.  If we leave
+            // recentChatsSub non-null and _recentSubOwner set, subsequent calls to
+            // loadRecentChats() will hit the early-return guard and never re-subscribe,
+            // leaving the sidebar frozen with stale data indefinitely.
+            // Clearing both variables lets the next loadRecentChats() call (triggered by
+            // the next page visit, auth change, or onPageVisit callback) re-establish the
+            // listener cleanly.
+            recentChatsSub  = null;
+            _recentSubOwner = null;
             showToast('Lost connection to chat list.', 'error');
         });
+        };
+        _attachRecentListener(true); // start with the indexed (ordered) query
     };
 
     // Gate ALL Firestore subscriptions behind Firebase Auth being confirmed.
@@ -2319,25 +2479,85 @@ export function setupChat() {
     // to see request.auth == null → permission-denied on every collection.
     // onAuthStateChanged fires exactly once with the resolved user (or null) and
     // is the canonical way to know the token is ready.
-    const _unsubAuth = onAuthStateChanged(auth, firebaseUser => {
-        _unsubAuth(); // one-shot — stop listening after first resolution
-        if (!firebaseUser) return; // not signed in; nothing to load
-        // Now auth is confirmed — safe to open Firestore listeners.
-        if (loadRecentChats() === false) {
-            // DOM may not be ready yet (chat page lazily injected); retry briefly.
-            let _rcRetries = 0;
-            const _rcRetryId = setInterval(() => {
-                _rcRetries++;
-                if (loadRecentChats() !== false || _rcRetries > 50) {
-                    clearInterval(_rcRetryId);
-                }
-            }, 200);
-        }
-    });
-    // Also refresh/re-subscribe when user navigates back to the chat page.
-    document.querySelector('[data-target="page-chat"]')?.addEventListener('click', () => {
-        if (!recentChatsSub) loadRecentChats();
-    });
+    //
+    // FIX BUG-GLOBAL: teardownChat() clears the chatWired flag so the DOM can be
+    // re-wired after a logout/re-login cycle. But this means setupChat() can be called
+    // more than once in a page session. The global listeners below (persistent auth
+    // observer + onPageVisit) must NOT be re-registered on subsequent calls — each
+    // extra registration stacks another duplicate listener that fires alongside all
+    // previous ones, causing double sign-out teardowns, double nav-badge updates, and
+    // double loadRecentChats() calls (which opens a second live Firestore subscription).
+    // Guard with _globalListenersSetup, which is never reset by teardownChat().
+    if (!_globalListenersSetup) {
+        _globalListenersSetup = true;
+
+        // One-shot auth check: confirms Firebase JWT is valid before the first
+        // Firestore listener opens.  Self-unsubscribes immediately after firing.
+        const _unsubAuth = onAuthStateChanged(auth, firebaseUser => {
+            _unsubAuth(); // one-shot — stop listening after first resolution
+            if (!firebaseUser) return; // not signed in; nothing to load
+            // Now auth is confirmed — safe to open Firestore listeners.
+            if (loadRecentChats() === false) {
+                // DOM may not be ready yet (chat page lazily injected); retry briefly.
+                let _rcRetries = 0;
+                const _rcRetryId = setInterval(() => {
+                    _rcRetries++;
+                    if (loadRecentChats() !== false || _rcRetries > 50) {
+                        clearInterval(_rcRetryId);
+                    }
+                }, 200);
+            }
+        });
+
+        // Persistent auth observer: tears down state on sign-out and re-subscribes on
+        // sign-in (including account switches within the same page session).
+        // FIX: Listen for Firebase Auth sign-out (or user switch) so all Firestore
+        // listeners, counters, and cached state are torn down the instant the user
+        // signs out. Without this, the previous user's recent-chats subscription
+        // keeps running after sign-out and their unread badge remains visible.
+        onAuthStateChanged(auth, firebaseUser => {
+            if (!firebaseUser) {
+                // User signed out — immediately tear down all listeners and reset state
+                unsubscribeRoomListeners();
+                unsubscribeRecent();
+                _recentSubOwner   = null; // FIX BUG 2: clear owner so next sign-in re-subscribes
+                _totalUnread      = 0;
+                _pendingReadRooms.clear();
+                _roomUnreadMap.clear();
+                lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
+                activeRoomId      = null;
+                activeRoomDetails = null;
+                cachedUsersHTML   = null;
+                cachedUsersData   = null;
+                cachedUsersAt     = 0;
+                _recomputeNavBadge();
+            } else {
+                // FIX BUG 2: on sign-in (including account switch), immediately start
+                // the recent-chats subscription so the nav badge updates even before
+                // the user navigates to page-chat. currentUser may lag behind firebaseUser
+                // by one microtask (auth.js sets it asynchronously), so retry briefly.
+                let _signInRetries = 0;
+                const _signInRetryId = setInterval(() => {
+                    _signInRetries++;
+                    if (loadRecentChats() !== false || _signInRetries > 30) {
+                        clearInterval(_signInRetryId);
+                    }
+                }, 200);
+            }
+        });
+
+        // FIX: Use onPageVisit so recent chats are ALWAYS refreshed every time the
+        // user navigates to the Chat section — not only when recentChatsSub is null.
+        // The old click-listener only restarted the subscription if it had been torn
+        // down, meaning stale data could linger indefinitely within a session.
+        // onPageVisit fires for every visit (including subsequent ones), ensuring the
+        // listener is always re-attached with the current user's email-scoped query.
+        onPageVisit('page-chat', () => {
+            if (!currentUser) return;
+            // Always re-subscribe to guarantee the list is fresh for this user.
+            loadRecentChats();
+        });
+    } // end _globalListenersSetup guard
 
     // ── Handle ?joinGroup= deep-link ────────────
     // FIX: the invite link generator builds ?joinGroup=<code> URLs but there
@@ -2668,6 +2888,9 @@ export function setupChat() {
             ? targetEmail
             : getPrivateRoomId(currentUser.email, targetEmail);
         activeRoomDetails = { id: activeRoomId, type: chatType, targetEmail, targetName };
+        // FIX Bug 1: clear the seenBy-submitted set when entering a new room so the
+        // new room's messages are marked seen correctly on first snapshot.
+        _seenBySubmitted.clear();
 
         if (chatType === 'private') {
             // FIX: await the setDoc before any Firestore listeners open.
@@ -2689,6 +2912,11 @@ export function setupChat() {
 
         markRoomRead(activeRoomId); // FIX: markRoomRead already calls _recomputeNavBadge — removed duplicate call
         subscribeTypingIndicator(activeRoomId, chatType);
+        // FIX BUG-STARRED: start the dedicated starred listener immediately on room open so
+        // the first renderMessages() call in the messages snapshot already has the correct
+        // starred set — eliminates the per-snapshot getDoc that previously fired for every
+        // reaction, read receipt, or edit event.
+        subscribeStarred(activeRoomId);
 
         const targetUserDoc = chatType === 'private'
             ? cachedUsersData?.find(u => u.email === targetEmail)
@@ -2840,23 +3068,11 @@ export function setupChat() {
             }
             // FIX #1: splice in-place so external references to the array stay valid
             lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length, ...pending, ...fromFirestore);
-            // FIXED: starred messages now stored in Firestore (no localStorage).
-            // Load starred IDs from the user's starred sub-collection in this room.
-            starredMessages.clear();
-            getDoc(doc(db, `chats/${activeRoomId}/starred`, currentUser.email))
-                .then(sSnap => {
-                    if (sSnap.exists()) {
-                        const ids = sSnap.data().ids || [];
-                        ids.forEach(id => {
-                            if (typeof id === 'string' && id.length > 0 && id.length < 200 && !/[\s/]/.test(id)) {
-                                starredMessages.add(id);
-                            }
-                        });
-                    }
-                    // Re-render after starred set loads so star badges appear correctly
-                    renderMessages();
-                })
-                .catch(() => { /* non-fatal — leave set empty */ });
+            // FIX BUG-STARRED: starred messages are now kept up-to-date by a dedicated
+            // onSnapshot listener (subscribeStarred), so renderMessages() can be called
+            // directly here — no getDoc needed on every message snapshot.  This eliminates
+            // O(snapshot) Firestore reads that previously fired for every reaction, read
+            // receipt, and edit event inside the active room.
             renderMessages();
             markMessagesSeenBy(activeRoomId);
         }, err => { console.error('[Chat] messages:', err); showToast('Error loading messages.', 'error'); });
@@ -2887,10 +3103,21 @@ export function setupChat() {
     handleSidebarClick(usersListContent);
     window.startDirectChat = (email, name) => openChatRoom(email, name, 'private');
 
+    // ── Helper: close all message dropdowns and clear fixed positioning ──
+    function closeAllDropdowns() {
+        document.querySelectorAll('.wa-msg-dropdown').forEach(d => {
+            d.classList.add('hidden');
+            d.style.removeProperty('position');
+            d.style.removeProperty('top');
+            d.style.removeProperty('left');
+            d.style.removeProperty('right');
+        });
+    }
+
     // ── Message click delegation ─────────────────
     chatContainer?.addEventListener('click', async e => {
         if (!e.target.closest('.wa-msg-menu')) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
         }
 
         // Menu toggle
@@ -2900,8 +3127,26 @@ export function setupChat() {
             const dropdown = menuBtn.nextElementSibling;
             if (!dropdown) return;
             const wasHidden = dropdown.classList.contains('hidden');
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
-            if (wasHidden) dropdown.classList.remove('hidden');
+            closeAllDropdowns();
+            if (wasHidden) {
+                dropdown.classList.remove('hidden');
+                // FIX: position as fixed so the dropdown escapes the overflow-y:auto
+                // clipping context of #chat-messages. Without this, the dropdown is
+                // invisible when it extends above/below the visible scroll area.
+                const btnRect = menuBtn.getBoundingClientRect();
+                const isMe    = !!menuBtn.closest('.wa-msg-row--me');
+                const vpW     = window.innerWidth;
+                const dropW   = 220;
+                dropdown.style.position = 'fixed';
+                dropdown.style.top      = `${btnRect.bottom + 4}px`;
+                if (isMe || btnRect.right + dropW > vpW) {
+                    dropdown.style.right = `${vpW - btnRect.right}px`;
+                    dropdown.style.left  = 'auto';
+                } else {
+                    dropdown.style.left  = `${btnRect.left}px`;
+                    dropdown.style.right = 'auto';
+                }
+            }
             return;
         }
 
@@ -2910,7 +3155,7 @@ export function setupChat() {
 
         const reactBtn = e.target.closest('.msg-react-btn');
         if (reactBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             await toggleReaction(reactBtn.dataset.msgId, reactBtn.dataset.emoji); return;
         }
 
@@ -2919,7 +3164,7 @@ export function setupChat() {
 
         const replyBtn = e.target.closest('.msg-reply-btn');
         if (replyBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             const msg = lastMessagesSnapshot.find(m => m.id === replyBtn.dataset.msgId);
             if (msg) {
                 showReplyPreview(msg, chatHeader, input);
@@ -2942,7 +3187,7 @@ export function setupChat() {
         // EXT: handle edit button
         const editBtn = e.target.closest('.msg-edit-btn');
         if (editBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             const msgId   = editBtn.dataset.msgId;
             const msgText = editBtn.dataset.text || '';
             // Show an "Editing" bar the same way showReplyPreview shows a reply bar
@@ -2976,13 +3221,13 @@ export function setupChat() {
 
         const fwdBtn = e.target.closest('.msg-forward-btn');
         if (fwdBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             await openForwardModal(fwdBtn.dataset.msgId); return;
         }
 
         const starBtn = e.target.closest('.msg-star-btn');
         if (starBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             const msgId = starBtn.dataset.msgId;
             if (starredMessages.has(msgId)) { starredMessages.delete(msgId); showToast('Unstarred.'); }
             else { starredMessages.add(msgId); showToast('Message starred. ⭐'); }
@@ -2997,7 +3242,7 @@ export function setupChat() {
 
         const pinBtn = e.target.closest('.msg-pin-btn');
         if (pinBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             const msgId = pinBtn.dataset.msgId;
             // FIX: mutate in place
             const newPinned = [msgId, ...pinnedMessages.filter(id => id !== msgId)].slice(0, 3);
@@ -3009,7 +3254,7 @@ export function setupChat() {
 
         const copyBtn = e.target.closest('.msg-copy-btn');
         if (copyBtn) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             try { await navigator.clipboard.writeText(copyBtn.dataset.text); showToast('Copied.', 'success'); }
             catch { showToast('Copy failed.', 'error'); }
             return;
@@ -3017,7 +3262,7 @@ export function setupChat() {
 
         const delMeBtn = e.target.closest('.msg-delete-me-btn');
         if (delMeBtn && activeRoomId) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             try {
                 await updateDoc(doc(db, `chats/${activeRoomId}/messages`, delMeBtn.dataset.msgId), {
                     deletedFor: arrayUnion(currentUser.email)
@@ -3028,7 +3273,7 @@ export function setupChat() {
 
         const delEveryoneBtn = e.target.closest('.msg-delete-everyone-btn');
         if (delEveryoneBtn && activeRoomId) {
-            document.querySelectorAll('.wa-msg-dropdown').forEach(d => d.classList.add('hidden'));
+            closeAllDropdowns();
             const ok = await showConfirm({
                 title: 'Delete for everyone?',
                 body: 'This message will be removed for all participants.',
@@ -3050,8 +3295,7 @@ export function setupChat() {
                 const unreadBump = {};
                 for (const e of roomMembers) {
                     if (e && e !== currentUser.email) {
-                        const snap = await getDoc(doc(db, 'chats', _delRoomId)).catch(() => null);
-                        unreadBump[`unreadCount.${e}`] = (snap?.data()?.unreadCount?.[e] || 0) + 1;
+                        unreadBump[`unreadCount.${e}`] = increment(1);
                     }
                 }
                 await setDoc(doc(db, 'chats', _delRoomId), {
@@ -3370,16 +3614,19 @@ export function setupChat() {
                 lastUpdated: serverTimestamp(),
                 [`unreadCount.${currentUser.email}`]: 0
             };
+            // FIX Bug 4: read the room doc once and build the entire unread update
+            // in a single pass. Previously the group branch also called getDoc()
+            // separately from the result it was already using — two reads for the same doc.
             if (_roomType === 'private' && _recipEmail) {
-                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                _sendUpdate[`unreadCount.${_recipEmail}`] = (_rSnap?.data()?.unreadCount?.[_recipEmail] || 0) + 1;
+                // Use server-side increment so concurrent sends from multiple
+                // devices can't clobber each other's unread count.
+                _sendUpdate[`unreadCount.${_recipEmail}`] = increment(1);
             } else if (_roomType === 'group') {
-                // FIX: bump unread for every group member except the sender
                 const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
                 const _groupMembers = _rSnap?.data()?.members || [];
                 for (const _gm of _groupMembers) {
                     if (_gm && _gm !== currentUser.email) {
-                        _sendUpdate[`unreadCount.${_gm}`] = (_rSnap?.data()?.unreadCount?.[_gm] || 0) + 1;
+                        _sendUpdate[`unreadCount.${_gm}`] = increment(1);
                     }
                 }
             }
@@ -3586,16 +3833,21 @@ export function setupChat() {
                 lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp(),
                 [`unreadCount.${currentUser.email}`]: 0
             };
+            // FIX BUG-ATOMIC-MEDIA: use server-side increment() instead of (current + 1).
+            // The old pattern read the doc, added 1 client-side, then wrote back — two
+            // concurrent uploads from different devices would both read 0 and both write 1,
+            // effectively capping the counter at 1 regardless of how many messages were sent.
+            // increment() is atomic on the Firestore server and handles all concurrency correctly.
             if (_fileRoomType === 'private' && _fileRecip) {
-                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                _fileUpdate[`unreadCount.${_fileRecip}`] = (_rSnap?.data()?.unreadCount?.[_fileRecip] || 0) + 1;
+                // Private: no getDoc needed — recipient is already known from pre-captured context.
+                _fileUpdate[`unreadCount.${_fileRecip}`] = increment(1);
             } else if (_fileRoomType === 'group') {
-                // FIX: bump unread for every group member except the sender
+                // Group: still need a getDoc to enumerate members, but counts use increment().
                 const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                const _groupMembers = _rSnap?.data()?.members || [];
+                const _groupMembers = (_rSnap?.data()?.members) || [];
                 for (const _gm of _groupMembers) {
                     if (_gm && _gm !== currentUser.email) {
-                        _fileUpdate[`unreadCount.${_gm}`] = (_rSnap?.data()?.unreadCount?.[_gm] || 0) + 1;
+                        _fileUpdate[`unreadCount.${_gm}`] = increment(1);
                     }
                 }
             }
@@ -3820,16 +4072,19 @@ export function setupChat() {
                         lastUpdated: serverTimestamp(),
                         [`unreadCount.${currentUser.email}`]: 0
                     };
+                    // FIX BUG-ATOMIC-VOICE: same race-condition fix as sendMediaFile — use
+                    // server-side increment() so concurrent voice sends from multiple devices
+                    // can't clobber each other's unread counter.
                     if (_voiceRoomType === 'private' && _voiceRecip) {
-                        const _vSnap = await getDoc(doc(db, 'chats', _voiceRoomId)).catch(() => null);
-                        _voiceUpdate[`unreadCount.${_voiceRecip}`] = (_vSnap?.data()?.unreadCount?.[_voiceRecip] || 0) + 1;
+                        // Private: recipient known from pre-captured context — no getDoc needed.
+                        _voiceUpdate[`unreadCount.${_voiceRecip}`] = increment(1);
                     } else if (_voiceRoomType === 'group') {
-                        // FIX: bump unread for every group member except the sender
+                        // Group: need member list, but counts use increment().
                         const _vSnap = await getDoc(doc(db, 'chats', _voiceRoomId)).catch(() => null);
-                        const _vGroupMembers = _vSnap?.data()?.members || [];
+                        const _vGroupMembers = (_vSnap?.data()?.members) || [];
                         for (const _gm of _vGroupMembers) {
                             if (_gm && _gm !== currentUser.email) {
-                                _voiceUpdate[`unreadCount.${_gm}`] = (_vSnap?.data()?.unreadCount?.[_gm] || 0) + 1;
+                                _voiceUpdate[`unreadCount.${_gm}`] = increment(1);
                             }
                         }
                     }

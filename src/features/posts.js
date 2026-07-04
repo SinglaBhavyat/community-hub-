@@ -876,6 +876,35 @@ function renderPost(post) {
 
         ${renderMediaItems(mediaItems)}
         ${post.poll ? _renderPoll(post) : ''}
+        ${post.type === 'event' ? (() => {
+            const going      = post.attendance?.going?.length    || 0;
+            const maybe      = post.attendance?.maybe?.length   || 0;
+            const notGoing   = post.attendance?.notGoing?.length || 0;
+            const isGoing    = !!(post.attendance?.going?.includes(currentUser?.email));
+            const isMaybe    = !!(post.attendance?.maybe?.includes(currentUser?.email));
+            const isNotGoing = !!(post.attendance?.notGoing?.includes(currentUser?.email));
+            return `
+        <div class="mt-4 rounded-2xl border overflow-hidden transition-all duration-300"
+             style="background: rgba(249,115,22,0.04); border-color: rgba(249,115,22,0.2);">
+            <div class="px-4 pt-3 pb-2">
+                <div class="flex flex-wrap gap-x-5 gap-y-1 text-sm mb-3">
+                    ${post.eventDate ? `<span class="flex items-center gap-1.5 text-orange-600 font-semibold">📅 ${post.eventDate}${post.eventTime ? ' · ' + post.eventTime : ''}</span>` : ''}
+                    ${post.eventLocation ? `<span class="flex items-center gap-1.5 text-gray-500">📍 ${post.eventLocation}</span>` : ''}
+                </div>
+                <div class="flex items-center gap-1 mb-3 text-xs text-gray-400">
+                    <span class="font-semibold text-emerald-600"><span class="rsvp-going-count">${going}</span> going</span>
+                    <span>·</span>
+                    <span><span class="rsvp-maybe-count">${maybe}</span> maybe</span>
+                    <span>·</span>
+                    <span><span class="rsvp-not-going-count">${notGoing}</span> not going</span>
+                </div>
+                <div class="flex gap-2">
+                    <button class="rsvp-btn rsvp-going flex-1 py-2 rounded-xl text-sm font-semibold border transition-all duration-200 ${isGoing ? 'bg-emerald-500 text-white border-emerald-500 shadow-md rsvp-active' : 'border-gray-300 text-gray-600 hover:border-emerald-400 hover:text-emerald-600 bg-white'}">✓ Going</button>
+                    <button class="rsvp-btn rsvp-maybe flex-1 py-2 rounded-xl text-sm font-semibold border transition-all duration-200 ${isMaybe ? 'bg-amber-400 text-white border-amber-400 shadow-md rsvp-active' : 'border-gray-300 text-gray-600 hover:border-amber-400 hover:text-amber-600 bg-white'}">? Maybe</button>
+                    <button class="rsvp-btn rsvp-not-going flex-1 py-2 rounded-xl text-sm font-semibold border transition-all duration-200 ${isNotGoing ? 'bg-red-400 text-white border-red-400 shadow-md rsvp-active' : 'border-gray-300 text-gray-600 hover:border-red-400 hover:text-red-600 bg-white'}">✕ Not Going</button>
+                </div>
+            </div>
+        </div>`; })() : ''}
 
         ${post.tags?.length ? `
             <div class="post-tags">
@@ -1179,6 +1208,13 @@ export function setupPosts() {
                 feed.querySelectorAll('.vid-wrapper:not([data-player-init])').forEach(w => initVideoPlayer(w));
             });
         }, (error) => {
+            // permission-denied after sign-out is expected — the listener fires
+            // one last time as credentials are revoked. Unsubscribe and stay quiet
+            // rather than flashing an error card the user will never see.
+            if (error?.code === 'permission-denied') {
+                if (activeFeedUnsub) { activeFeedUnsub(); activeFeedUnsub = null; }
+                return;
+            }
             console.error('Feed error:', error);
             feed.innerHTML = `<div class="feed-error" role="alert"><p>⚠️ Failed to load posts.</p><button onclick="location.reload()" class="action-btn">Refresh</button></div>`;
         });
@@ -1328,28 +1364,50 @@ export function setupPosts() {
     });
 
     // ── FEED INTERACTION DELEGATION ──
-    feed?.addEventListener('click', async (e) => {
+    // Named handler so we can attach it to all feed containers
+    // (bookmarked-posts-feed and my-posts-feed share the same post card markup)
+    const handleFeedClick = async (e) => {
         const postCard = e.target.closest('.post-card');
         if (!postCard || postCard.classList.contains('post-card--skeleton')) return;
         const postId  = postCard.dataset.postId;
         if (!postId) return;
         const postRef = doc(db, 'posts', postId);
 
-        if (e.target.closest('.post-options-trigger')) {
-            const dropdown = postCard.querySelector('.post-options-dropdown');
-            const isOpen   = dropdown?.classList.contains('open');
+        // Helper: close all open dropdowns (handles both class systems)
+        const closeAllDropdowns = () => {
             document.querySelectorAll('.post-options-dropdown.open').forEach(d => d.classList.remove('open'));
+            document.querySelectorAll('.post-options-dropdown:not(.hidden)').forEach(d => {
+                if (d.innerHTML.trim()) d.classList.add('hidden');
+            });
+        };
+        const closeDropdown = (card) => {
+            const dd = card?.querySelector('.post-options-dropdown');
+            if (!dd) return;
+            dd.classList.remove('open');
+            dd.classList.add('hidden');
+        };
+
+        // Handle both class names: post-options-trigger (posts.js CSS) and
+        // post-options-btn (templates.js — used by the imported createPostCardHTML)
+        if (e.target.closest('.post-options-trigger') || e.target.closest('.post-options-btn')) {
+            e.stopPropagation(); // prevent initPostOptionsDropdowns (templates.js) from double-handling (would open then immediately close)
+            const dropdown = postCard.querySelector('.post-options-dropdown');
+            // Detect open state for both systems
+            const isOpen = dropdown?.classList.contains('open') || 
+                           (dropdown && !dropdown.classList.contains('hidden') && dropdown.innerHTML.trim() !== '');
+            closeAllDropdowns();
             if (dropdown && !isOpen) {
                 _buildDropdown(dropdown);
                 dropdown.classList.add('open');
-                const close = () => dropdown.classList.remove('open');
+                dropdown.classList.remove('hidden');
+                const close = () => closeDropdown(postCard);
                 setTimeout(() => document.addEventListener('click', close, { once: true }), 0);
             }
             return;
         }
 
         if (e.target.closest('.edit-post-btn')) {
-            postCard.querySelector('.post-options-dropdown')?.classList.remove('open');
+            closeDropdown(postCard);
             if (!currentUser) return;
             openEditModal(postId);
             return;
@@ -1357,7 +1415,7 @@ export function setupPosts() {
 
         if (e.target.closest('.delete-post-btn')) {
             if (!currentUser) return;
-            postCard.querySelector('.post-options-dropdown')?.classList.remove('open');
+            closeDropdown(postCard);
             const post    = _postCache.get(postId);
             const isAdmin = currentUser.role === 'admin';
             if (post && post.authorEmail !== currentUser.email && !isAdmin) {
@@ -1381,7 +1439,7 @@ export function setupPosts() {
         }
 
         if (e.target.closest('.pin-post-btn')) {
-            postCard.querySelector('.post-options-dropdown')?.classList.remove('open');
+            closeDropdown(postCard);
             if (currentUser?.role !== 'admin') return showToast('Admins only.', 'warn');
             const post     = _postCache.get(postId);
             const isPinned = !!post?.pinned;
@@ -1394,7 +1452,7 @@ export function setupPosts() {
 
         if (e.target.closest('.report-btn')) {
             e.stopPropagation();
-            postCard.querySelector('.post-options-dropdown')?.classList.remove('open');
+            closeDropdown(postCard);
             if (!currentUser) return showToast('Sign in to report content.', 'warn');
             const reportBtn = e.target.closest('.report-btn');
             window.openReportModal?.(reportBtn.dataset.contentId || postId, 'post', postId, null, reportBtn.dataset.contentAuthorEmail || '');
@@ -1410,7 +1468,7 @@ export function setupPosts() {
         }
 
         if (e.target.closest('.share-btn')) {
-            postCard.querySelector('.post-options-dropdown')?.classList.remove('open');
+            closeDropdown(postCard);
             const url = `${location.origin}${location.pathname}?post=${postId}`;
             if (navigator.share) {
                 navigator.share({ title: _postCache.get(postId)?.title || 'Check this post', url });
@@ -1423,13 +1481,35 @@ export function setupPosts() {
         if (e.target.closest('.upvote-btn')) {
             if (!currentUser) return showToast('Sign in to upvote.', 'warn');
             const btn     = e.target.closest('.upvote-btn');
-            const isVoted = btn.classList.contains('action-btn--active');
             const counter = btn.querySelector('.upvote-count');
             const current = parseInt(counter?.textContent || '0', 10);
 
+            // Detect voted state from either card type:
+            //   renderPost()         → action-btn--active
+            //   createPostCardHTML() → bg-indigo-50 / aria-pressed="true"
+            const isVoted = btn.classList.contains('action-btn--active') ||
+                            btn.getAttribute('aria-pressed') === 'true' ||
+                            btn.classList.contains('bg-indigo-50');
+
+            // Update posts.js-style classes
             btn.classList.toggle('action-btn--active', !isVoted);
+            // Update templates.js-style classes
+            if (!isVoted) {
+                btn.classList.add('bg-indigo-50', 'text-indigo-600', 'border-indigo-200',
+                    'dark:bg-indigo-900/30', 'dark:text-indigo-400', 'dark:border-indigo-800');
+                btn.classList.remove('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+                const svg = btn.querySelector('svg');
+                if (svg) svg.setAttribute('fill', 'currentColor');
+            } else {
+                btn.classList.remove('bg-indigo-50', 'text-indigo-600', 'border-indigo-200',
+                    'dark:bg-indigo-900/30', 'dark:text-indigo-400', 'dark:border-indigo-800');
+                btn.classList.add('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+                const svg = btn.querySelector('svg');
+                if (svg) svg.setAttribute('fill', 'none');
+            }
+
             btn.setAttribute('aria-pressed', String(!isVoted));
-            if (counter) counter.textContent = String(isVoted ? current - 1 : current + 1);
+            if (counter) counter.textContent = String(isVoted ? Math.max(0, current - 1) : current + 1);
             btn.animate(
                 [{ transform: 'scale(1)' }, { transform: 'scale(1.25)' }, { transform: 'scale(1)' }],
                 { duration: 280, easing: 'ease' }
@@ -1440,7 +1520,15 @@ export function setupPosts() {
                     upvoteCount: isVoted ? Math.max(0, current - 1) : current + 1,
                 });
             } catch {
+                // Rollback
                 btn.classList.toggle('action-btn--active', isVoted);
+                if (isVoted) {
+                    btn.classList.add('bg-indigo-50', 'text-indigo-600', 'border-indigo-200');
+                } else {
+                    btn.classList.remove('bg-indigo-50', 'text-indigo-600', 'border-indigo-200');
+                    btn.classList.add('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+                }
+                btn.setAttribute('aria-pressed', String(isVoted));
                 if (counter) counter.textContent = String(current);
                 showToast('Upvote failed. Try again.', 'error');
             }
@@ -1450,11 +1538,39 @@ export function setupPosts() {
         if (e.target.closest('.bookmark-btn')) {
             if (!currentUser) return showToast('Sign in to bookmark.', 'warn');
             const btn     = e.target.closest('.bookmark-btn');
-            const isSaved = btn.classList.contains('action-btn--saved');
             const userRef = doc(db, 'users', currentUser.email);
 
+            // Detect saved state from either card type:
+            //   renderPost()         → action-btn--saved class
+            //   createPostCardHTML() → aria-pressed="true" or text-amber-500 class
+            const isSaved = btn.classList.contains('action-btn--saved') ||
+                            btn.getAttribute('aria-pressed') === 'true' ||
+                            btn.classList.contains('text-amber-500');
+
+            // Update UI — posts.js style (action-btn--saved)
             btn.classList.toggle('action-btn--saved', !isSaved);
+
+            // Update UI — templates.js style (amber color classes)
+            if (!isSaved) {
+                btn.classList.add('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
+                btn.classList.remove('text-gray-400', 'dark:text-gray-500',
+                    'hover:text-amber-500', 'dark:hover:text-amber-400',
+                    'hover:bg-gray-100', 'dark:hover:bg-zinc-800');
+                // Fill the SVG bookmark icon
+                const svgPath = btn.querySelector('svg');
+                if (svgPath) svgPath.setAttribute('fill', 'currentColor');
+            } else {
+                btn.classList.remove('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
+                btn.classList.add('text-gray-400', 'dark:text-gray-500',
+                    'hover:text-amber-500', 'dark:hover:text-amber-400',
+                    'hover:bg-gray-100', 'dark:hover:bg-zinc-800');
+                const svgPath = btn.querySelector('svg');
+                if (svgPath) svgPath.setAttribute('fill', 'none');
+            }
+
             btn.setAttribute('aria-pressed', String(!isSaved));
+            btn.title = isSaved ? 'Bookmark' : 'Remove bookmark';
+
             if (!currentUser.savedPosts) currentUser.savedPosts = [];
             if (isSaved) {
                 currentUser.savedPosts = currentUser.savedPosts.filter(id => id !== postId);
@@ -1469,7 +1585,15 @@ export function setupPosts() {
             try {
                 await updateDoc(userRef, { savedPosts: isSaved ? arrayRemove(postId) : arrayUnion(postId) });
             } catch {
+                // Rollback both style systems
                 btn.classList.toggle('action-btn--saved', isSaved);
+                if (isSaved) {
+                    btn.classList.add('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
+                    btn.classList.remove('text-gray-400', 'dark:text-gray-500');
+                } else {
+                    btn.classList.remove('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
+                    btn.classList.add('text-gray-400', 'dark:text-gray-500');
+                }
                 showToast('Bookmark failed.', 'error');
             }
             return;
@@ -1487,6 +1611,7 @@ export function setupPosts() {
             return;
         }
 
+        // poll-option = posts.js renderPost cards; poll-vote-btn = templates.js createPostCardHTML cards
         const pollOption = e.target.closest('.poll-option');
         if (pollOption) {
             const idx = parseInt(pollOption.dataset.optionIndex, 10);
@@ -1494,18 +1619,141 @@ export function setupPosts() {
             return;
         }
 
+        // poll-vote-btn is used by createPostCardHTML (bookmarks / my-posts feed)
+        const pollVoteBtn = e.target.closest('.poll-vote-btn');
+        if (pollVoteBtn) {
+            if (!currentUser) return showToast('Sign in to vote.', 'warn');
+            const optIdx = parseInt(pollVoteBtn.dataset.pollIndex, 10);
+            if (!isNaN(optIdx)) await handlePollVote(postId, optIdx);
+            return;
+        }
+
+        // ── RSVP buttons (going / maybe / not-going) ──────────────────────
+        // These are rendered in both renderPost() and createPostCardHTML().
+        // eventsAndPolls.js has its own handler but posts.js must also handle
+        // them so they work regardless of which module's listener fires first.
+        // Each RSVP button has exactly one of these classes (they don't overlap)
+        const rsvpGoing    = e.target.closest('.rsvp-going');
+        const rsvpMaybe    = !rsvpGoing && e.target.closest('.rsvp-maybe');
+        const rsvpNotGoing = !rsvpGoing && !rsvpMaybe && e.target.closest('.rsvp-not-going');
+        const rsvpBtn      = rsvpGoing || rsvpMaybe || rsvpNotGoing;
+
+        if (rsvpBtn) {
+            if (!currentUser) return showToast('Sign in to RSVP.', 'warn');
+            if (rsvpBtn.disabled) return;
+            // Stop the eventsAndPolls.js handler (also attached to these feeds)
+            // from firing its own partial RSVP logic on the same click.
+            e.stopImmediatePropagation();
+            rsvpBtn.disabled = true;
+
+            const rsvpKey  = rsvpGoing ? 'going' : rsvpMaybe ? 'maybe' : 'notGoing';
+            const isAlready = rsvpBtn.classList.contains('rsvp-active');
+
+            // ── Visual RSVP state helper ──────────────────────────────────────
+            // Both renderPost() (posts.js) and createPostCardHTML() (templates.js)
+            // bake color classes directly into each button at render time, so toggling
+            // rsvp-active alone doesn't change colors. We must swap the full class sets.
+            //
+            // Active classes per button type:
+            //   going    → bg-emerald-500 text-white border-emerald-500 shadow-md
+            //   maybe    → bg-amber-400   text-white border-amber-400   shadow-md
+            //   not-going→ bg-red-400     text-white border-red-400     shadow-md
+            //
+            // Inactive classes (shared by both card types, with dark variants):
+            //   bg-white dark:bg-zinc-800 border-gray-300 dark:border-zinc-600
+            //   text-gray-600 dark:text-gray-400
+            const INACTIVE_ADD    = ['bg-white', 'dark:bg-zinc-800', 'border-gray-300',
+                                     'dark:border-zinc-600', 'text-gray-600', 'dark:text-gray-400'];
+            const INACTIVE_REMOVE = ['text-white', 'shadow-md', 'rsvp-active',
+                                     'bg-emerald-500', 'border-emerald-500',
+                                     'bg-amber-400',   'border-amber-400',
+                                     'bg-red-400',     'border-red-400'];
+
+            const ACTIVE_CLASSES = {
+                going:    ['bg-emerald-500', 'border-emerald-500', 'text-white', 'shadow-md', 'rsvp-active'],
+                maybe:    ['bg-amber-400',   'border-amber-400',   'text-white', 'shadow-md', 'rsvp-active'],
+                notGoing: ['bg-red-400',     'border-red-400',     'text-white', 'shadow-md', 'rsvp-active'],
+            };
+
+            function _setRsvpActive(btn, key) {
+                btn.classList.remove(...INACTIVE_ADD);
+                btn.classList.add(...ACTIVE_CLASSES[key]);
+            }
+            function _setRsvpInactive(btn) {
+                btn.classList.remove(...INACTIVE_REMOVE);
+                btn.classList.add(...INACTIVE_ADD);
+            }
+
+            // Optimistic UI update — reset all to inactive then activate chosen one
+            const goingBtn    = postCard.querySelector('.rsvp-going');
+            const maybeBtn    = postCard.querySelector('.rsvp-maybe');
+            const notGoingBtn = postCard.querySelector('.rsvp-not-going');
+            [goingBtn, maybeBtn, notGoingBtn].forEach(b => { if (b) _setRsvpInactive(b); });
+            if (!isAlready) _setRsvpActive(rsvpBtn, rsvpKey);
+
+            try {
+                const updatePayload = {
+                    'attendance.going':    arrayRemove(currentUser.email),
+                    'attendance.maybe':    arrayRemove(currentUser.email),
+                    'attendance.notGoing': arrayRemove(currentUser.email),
+                };
+                if (!isAlready) updatePayload[`attendance.${rsvpKey}`] = arrayUnion(currentUser.email);
+
+                await updateDoc(postRef, updatePayload);
+
+                // Refresh attendance counts from Firestore
+                const snap = await getDoc(postRef);
+                if (snap.exists()) {
+                    const att = snap.data().attendance || {};
+                    const goingEl    = postCard.querySelector('.rsvp-going-count');
+                    const maybeEl    = postCard.querySelector('.rsvp-maybe-count');
+                    const notGoingEl = postCard.querySelector('.rsvp-not-going-count');
+                    if (goingEl)    goingEl.textContent    = att.going?.length    ?? 0;
+                    if (maybeEl)    maybeEl.textContent    = att.maybe?.length    ?? 0;
+                    if (notGoingEl) notGoingEl.textContent = att.notGoing?.length ?? 0;
+                }
+            } catch (err) {
+                console.error('RSVP error:', err);
+                // Rollback optimistic UI
+                [goingBtn, maybeBtn, notGoingBtn].forEach(b => { if (b) _setRsvpInactive(b); });
+                if (isAlready) _setRsvpActive(rsvpBtn, rsvpKey);
+                showToast('RSVP failed. Please try again.', 'error');
+            } finally {
+                rsvpBtn.disabled = false;
+            }
+            return;
+        }
+
         if (e.target.closest('.ai-summarize-btn')) {
             if (!currentUser) return showToast('Sign in to use AI features.', 'warn');
             const postData = _postCache.get(postId);
-            if (postData) await aiSummarizePost(postCard, postData);
+            if (!postData) return;
+
+            // Support both card types:
+            //   renderPost()           → .ai-summary-box (posts.js local function)
+            //   createPostCardHTML()   → .ai-summary-container + .ai-summary-text (templates.js)
+            const templatesContainer = postCard.querySelector('.ai-summary-container');
+            if (templatesContainer) {
+                await handleAiSummarize(postCard, postData);
+            } else {
+                await aiSummarizePost(postCard, postData);
+            }
             return;
         }
-    });
+    };
+
+    // Attach the same handler to all three feed containers so that
+    // upvote / comment / share / AI-summarize / 3-dots all work in
+    // Bookmarked Posts and My Posts as well as the main feed.
+    feed?.addEventListener('click', handleFeedClick);
+    document.getElementById('bookmarked-posts-feed')?.addEventListener('click', handleFeedClick);
+    document.getElementById('my-posts-feed')?.addEventListener('click', handleFeedClick);
 
     // Global report delegation
     document.addEventListener('click', (e) => {
         const reportBtn = e.target.closest('.report-btn');
-        if (!reportBtn || reportBtn.closest('#posts-feed')) return;
+        // Skip if already handled by a feed's own listener
+        if (!reportBtn || reportBtn.closest('#posts-feed') || reportBtn.closest('#bookmarked-posts-feed') || reportBtn.closest('#my-posts-feed')) return;
         e.stopPropagation();
         if (!currentUser) return showToast('Sign in to report content.', 'warn');
         const contentId    = reportBtn.dataset.contentId || '';
@@ -1555,7 +1803,11 @@ export function setupPosts() {
                 feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">You haven't posted anything yet.</p></div>`;
             } else {
                 feed.innerHTML = '';
-                snap.forEach(d => { feed.innerHTML += createPostCardHTML({ id: d.id, ...d.data() }, currentUser); });
+                snap.forEach(d => {
+                    const post = { id: d.id, ...d.data() };
+                    _postCache.set(post.id, post);
+                    feed.innerHTML += createPostCardHTML(post, currentUser);
+                });
             }
         } catch (err) {
             console.error('[My Posts] load error:', err);
@@ -1592,7 +1844,12 @@ export function setupPosts() {
                 feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts found.</p></div>`;
             } else {
                 feed.innerHTML = '';
-                posts.forEach(p => { feed.innerHTML += createPostCardHTML(p, currentUser); });
+                posts.forEach(p => {
+                    // Populate cache so AI summarize, pin, and other cache-
+                    // dependent actions work correctly in the bookmarked feed.
+                    _postCache.set(p.id, p);
+                    feed.innerHTML += createPostCardHTML(p, currentUser);
+                });
             }
         } catch (err) {
             console.error('[Bookmarked Posts] load error:', err);
@@ -1719,8 +1976,8 @@ function _injectGlobalStyles() {
             background: var(--surface-2, #fff);
             border: 0.5px solid var(--border, #ebebeb);
             border-radius: 16px;
-            padding: 18px 20px;
-            margin-bottom: 12px;
+            padding: 20px 22px;
+            margin-bottom: 20px;
             box-shadow: var(--card-shadow);
             transition: box-shadow 0.3s ease, border-color 0.3s ease, transform 0.2s ease;
             animation: cardEntrance 0.4s cubic-bezier(0.34,1.2,0.64,1) both;

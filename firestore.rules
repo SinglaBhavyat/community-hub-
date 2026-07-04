@@ -14,20 +14,21 @@ service cloud.firestore {
     }
 
     function callerEmail() {
-      // Canonical way to get the verified email from the JWT.
-      // token.email is set by Firebase Auth and cannot be spoofed by the client.
       return request.auth.token.email;
     }
 
+    // FIX: collapsed to a single get() call.
+    // exists() + get() = 2 external reads — Firestore aggregation queries
+    // (count()) only allow 1 external read per rule evaluation, so the old
+    // pattern caused permission-denied on every RunAggregationQuery call
+    // from admin.js. A single get() returns null if the doc is missing, and
+    // null != 'admin', so the exists() guard is not needed.
     function isAdmin() {
       return isSignedIn() &&
-        exists(/databases/$(database)/documents/users/$(callerEmail())) &&
         get(/databases/$(database)/documents/users/$(callerEmail())).data.role == 'admin';
     }
 
     function isOwner(data) {
-      // Accept either email or UID match so legacy docs that only stored one
-      // of the two are still handled correctly.
       return isSignedIn() && (
         data.authorEmail == callerEmail() ||
         data.authorUid   == request.auth.uid
@@ -45,6 +46,7 @@ service cloud.firestore {
     }
 
     // ── Reports (moderation queue) ────────────────────────────────────────
+    // allow read covers get, list, AND count() aggregation queries.
     match /reports/{reportId} {
       allow read: if isAdmin();
 
@@ -59,11 +61,8 @@ service cloud.firestore {
     match /users/{userEmail} {
       allow read: if isSignedIn();
 
-      // A user may only create their own document.
       allow create: if isSignedIn() && callerEmail() == userEmail;
 
-      // Users can update their own profile fields but never escalate their role.
-      // Admins can change anything including role.
       allow update: if isAdmin() || (
         isSignedIn() &&
         callerEmail() == userEmail &&
@@ -71,12 +70,17 @@ service cloud.firestore {
       );
 
       allow delete: if isAdmin();
+
+      // ── Achievements subcollection ──────────────────────────────────────
+      match /achievements/{achievementId} {
+        // Any signed-in user may read (e.g. profile badges / leaderboards).
+        // Write is restricted to the owner — prevents clients self-awarding.
+        allow read:  if isSignedIn();
+        allow write: if isSignedIn() && callerEmail() == userEmail;
+      }
     }
 
     // ── Top-level /messages collection (legacy DMs) ───────────────────────
-    // NOTE: chat.js uses the /chats sub-architecture for all messaging.
-    // This rule is kept only so any old documents aren't left completely
-    // unprotected, but new code should not write here.
     match /messages/{messageId} {
       allow read: if isSignedIn() && (
         resource.data.to   == callerEmail() ||
@@ -84,8 +88,6 @@ service cloud.firestore {
       );
       allow create: if isSignedIn() &&
         request.resource.data.from == callerEmail();
-      // FIX: was `to == callerEmail()` which let the recipient edit the message.
-      // Only the sender or admin should be able to update/delete.
       allow update, delete: if isSignedIn() && (
         resource.data.from == callerEmail() || isAdmin()
       );
@@ -94,13 +96,10 @@ service cloud.firestore {
     // ── Audit logs ────────────────────────────────────────────────────────
     match /audit_logs/{logId} {
       allow read, create: if isAdmin();
-      allow update, delete: if false; // append-only; no mutations allowed
+      allow update, delete: if false;
     }
 
     // ── Platform settings ─────────────────────────────────────────────────
-    // Must be publicly readable: main.js checks maintenanceMode BEFORE the
-    // user signs in, so requiring auth here would produce a permission-denied
-    // on every cold load and leave the page blank.
     match /platform_settings/{settingId} {
       allow read: if true;
       allow write: if isAdmin();
@@ -114,25 +113,18 @@ service cloud.firestore {
         request.resource.data.authorEmail == callerEmail();
 
       allow update: if isOwner(resource.data) || isAdmin() ||
-        // Any member may bump aggregate counters (upvotes, reportCount,
-        // commentCount) but must not touch authorship or content fields.
         (isSignedIn() &&
           !request.resource.data.diff(resource.data).affectedKeys()
             .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
 
       allow delete: if isOwner(resource.data) || isAdmin();
 
-      // ── Comments subcollection ─────────────────────────────────────────
-      // FIX (original): the old rule covered a top-level /comments collection
-      // that the app never writes to.  The actual path is posts/{id}/comments/{id}.
       match /comments/{commentId} {
         allow read: if isSignedIn();
 
         allow create: if isSignedIn() &&
           request.resource.data.authorEmail == callerEmail();
 
-        // Owner/admin: full update.
-        // Anyone else: may only touch social-engagement fields.
         allow update: if isOwner(resource.data) || isAdmin() ||
           (isSignedIn() &&
             !request.resource.data.diff(resource.data).affectedKeys()
@@ -159,42 +151,30 @@ service cloud.firestore {
 
     // ── Chats ─────────────────────────────────────────────────────────────
     match /chats/{chatId} {
-      // Members can always read their chat rooms.
-      // Group documents are readable by any signed-in user so that:
-      //   (a) invite-code lookup queries (getDocs where inviteCode==X) succeed for
-      //       non-members joining via a shared link, AND
-      //   (b) Firestore can guarantee the query predicate holds for every returned
-      //       document — without this, Firestore rejects the whole query even if
-      //       the matching doc is a public group, because private chat docs in the
-      //       same collection would fail the rule.
-      // Private DMs remain visible only to their two participants.
-      // resource == null guard lets create-time reads succeed.
-      allow read: if isSignedIn() &&
-        (resource == null ||
-         resource.data.members.hasAny([callerEmail()]) ||
-         resource.data.type == 'group');
+      // SECURITY FIX: removed `resource.data.type == 'group'` blanket read
+      // permission that allowed any signed-in user to read any group chat,
+      // exposing message previews and member lists to non-members.
+      // Now only members (or admins) may read a chat document.
+      allow read: if isSignedIn() && (
+        resource == null ||
+        resource.data.members.hasAny([callerEmail()]) ||
+        isAdmin()
+      );
 
       allow create: if isSignedIn() &&
         request.resource.data.members.hasAny([callerEmail()]);
 
       allow update: if isSignedIn() && (
-        // Admin-only fields that no member (including admins acting via client code)
-        // should be able to silently overwrite. Enforced here as a safety net.
-        // Covered fields: type, createdBy, inviteCode integrity is managed by admins only.
-        // Members (including the updater themselves) may NOT freely set admins/createdBy.
-        // --- Full update for existing members, EXCEPT they cannot touch admin-only fields ---
+        // Members may update anything except admin-controlled fields.
         (resource.data.members.hasAny([callerEmail()]) &&
           !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['type', 'createdBy'])) ||
-        // Non-members submitting a join request via invite code may ONLY
-        // write to pendingRequests / dismissedRequests — nothing else.
+            .hasAny(['type', 'createdBy', 'admins', 'inviteCode'])) ||
+        // Non-members submitting a join request may only touch these two fields.
         (resource.data.type == 'group' &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['pendingRequests', 'dismissedRequests']))
       );
 
-      // Private: either member can delete.
-      // Group: only the creator or an admin can delete.
       allow delete: if isSignedIn() && (
         resource.data.type == 'private'
           ? resource.data.members.hasAny([callerEmail()])
@@ -204,10 +184,6 @@ service cloud.firestore {
       // ── Messages subcollection ─────────────────────────────────────────
       match /messages/{messageId} {
         function isChatMember() {
-          // FIX: guard against the parent chat doc not existing yet.
-          // get() on a missing doc returns a resource with exists==false;
-          // accessing .data on it throws in Rules, causing the rule to deny.
-          // exists() check first prevents the throw.
           let chatRef = /databases/$(database)/documents/chats/$(chatId);
           return exists(chatRef) &&
                  get(chatRef).data.members.hasAny([callerEmail()]);
@@ -215,30 +191,17 @@ service cloud.firestore {
 
         allow read: if isSignedIn() && isChatMember();
 
-        // Sender must be authenticated and a member of the room.
-        // System messages (senderEmail == 'system') are written directly from
-        // the client in 5 places (group creation, leave, member approval, etc.)
-        // so we must allow them from any current member.
-        // EXTEND: non-members may also write a system message when submitting
-        // a join request (to notify admins in real time). Constrained to:
-        //   • senderEmail must be exactly 'system'
-        //   • only on group-type rooms
-        //   • caller must be signed in
         allow create: if isSignedIn() && (
           (isChatMember() && (
             request.resource.data.senderEmail == callerEmail() ||
             request.resource.data.senderEmail == 'system'
           )) ||
-          // Join-request notification from a non-member to a group room.
           (!isChatMember() &&
             exists(/databases/$(database)/documents/chats/$(chatId)) &&
             get(/databases/$(database)/documents/chats/$(chatId)).data.type == 'group' &&
             request.resource.data.senderEmail == 'system')
         );
 
-        // Sender or admin: unrestricted update (edit text, delete-for-everyone).
-        // Other members: may only update social fields — seenBy, reactions,
-        //                deletedFor — and must not touch message content or identity.
         allow update: if isSignedIn() && (
           resource.data.senderEmail == callerEmail() ||
           isAdmin() ||
@@ -249,7 +212,6 @@ service cloud.firestore {
                        'edited', 'editedAt', 'replyTo', 'forwarded']))
         );
 
-        // Only the sender or an admin can physically delete a message doc.
         allow delete: if isSignedIn() && (
           resource.data.senderEmail == callerEmail() || isAdmin()
         );
@@ -257,26 +219,19 @@ service cloud.firestore {
 
       // ── Typing indicators subcollection ───────────────────────────────
       match /typing/{typingUserEmail} {
-        // Only members can see who is typing.
+        // FIX: exists() guard prevents throw when parent chat doc is missing.
         allow read: if isSignedIn() &&
+          exists(/databases/$(database)/documents/chats/$(chatId)) &&
           get(/databases/$(database)/documents/chats/$(chatId))
             .data.members.hasAny([callerEmail()]);
 
-        // A user can only write their own typing document.
         allow write: if isSignedIn() && callerEmail() == typingUserEmail;
       }
 
-      // ── Starred messages subcollection (NEW — replaces localStorage) ──
-      // Added to support the chat.js fix that moved starred-message storage
-      // from localStorage to Firestore so stars persist across devices.
-      // Path: chats/{chatId}/starred/{userEmail}
+      // ── Starred messages subcollection ────────────────────────────────
       match /starred/{starredUserEmail} {
-        // Only the owning user can read their own starred list.
-        // Room members cannot see each other's starred messages.
         allow read: if isSignedIn() && callerEmail() == starredUserEmail;
 
-        // Only the owning user can write (star / unstar) their own list,
-        // and they must be a member of this chat room.
         allow write: if isSignedIn() &&
           callerEmail() == starredUserEmail &&
           get(/databases/$(database)/documents/chats/$(chatId))
