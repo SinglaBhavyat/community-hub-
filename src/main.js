@@ -10,7 +10,7 @@ import { setupAchievements } from './features/achievements.js';
 import { setupProfile } from './features/profile.js';
 import { setupAdmin } from './features/admin.js';
 import { initPostOptionsDropdowns } from './ui/templates.js';
-import { setupLiveChat, teardownLiveChat } from './features/liveChat.js';
+import { setupLiveChat, teardownLiveChat } from './features/Livechat.js';
 
 // Firebase & DB Imports
 import { db, auth, googleProvider } from './config/firebase.js';
