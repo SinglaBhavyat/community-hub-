@@ -2238,23 +2238,31 @@ function ensureChatStyles() {
 // MOBILE NAV STATE HELPERS
 // ─────────────────────────────────────────────
 
-// Returns true when the viewport is in "mobile single-panel" mode (< 640 px)
+// Returns true when the viewport is in "mobile single-panel" mode (< 640 px).
+// Uses visualViewport.width when available (more accurate on iOS Safari with
+// keyboard open or pinch-zoom) and falls back to window.innerWidth.
 function _isMobileLayout() {
-    return window.innerWidth < 640;
+    const w = (window.visualViewport?.width ?? window.innerWidth);
+    return w < 640;
 }
 
-// The chat container wrapper that carries data-mobile-view
+// The chat container wrapper that carries data-mobile-view.
+// IMPORTANT: This MUST return #page-chat itself because the CSS mobile styles
+// are written as `#page-chat[data-mobile-view="conversation"] .sm\:w-80` etc.
+// Setting the attribute on any child element breaks all CSS selectors.
 function _getChatWrapper() {
-    // The container is: #page-chat > .max-w-6xl > div (the flex card)
-    const pageChat = document.getElementById('page-chat');
-    if (!pageChat) return null;
-    return pageChat.querySelector('.max-w-6xl > div') || null;
+    return document.getElementById('page-chat') || null;
 }
 
-// Show the conversation panel on mobile, pushing history so Back works
+// Show the conversation panel on mobile, pushing history so Back works.
+// Only sets the attribute when on mobile; desktop callers guard with _isMobileLayout().
 function _mobileShowConversation() {
     const wrapper = _getChatWrapper();
     if (!wrapper) return;
+    // Safety: don't set the attribute if the chat page is currently hidden,
+    // as it would persist and confuse the layout when the page becomes visible.
+    // The onPageVisit handler will set it correctly when the user navigates to chat.
+    if (wrapper.classList.contains('hidden')) return;
     wrapper.setAttribute('data-mobile-view', 'conversation');
     // Push a history entry so the browser Back button returns to the list.
     // Use replaceState if we're already in conversation state (e.g. switching rooms)
@@ -2275,18 +2283,22 @@ function _mobileShowList() {
     if (!wrapper) return;
     wrapper.removeAttribute('data-mobile-view');
     // Restore focus to the sidebar so keyboard users land somewhere sensible
-    const sidebar = document.querySelector('#page-chat .sm\\:w-80');
+    // The sidebar has classes "w-full sm:w-80 ..."
+    const sidebar = document.querySelector('#page-chat .sm\\:w-80, #page-chat [class*="sm:w-80"]');
     if (sidebar) {
         const firstItem = sidebar.querySelector('.wa-sidebar-item, .chat-contact');
         firstItem?.focus({ preventScroll: true });
     }
 }
 
-// Inject the mobile back button into the chat header (called once per openChatRoom)
+// Inject the mobile back button into the chat header (called once per openChatRoom).
+// The button is always injected (CSS hides it on ≥640px via media query) so that:
+//  • It's immediately visible on mobile without requiring JS to re-check width.
+//  • Orientation changes from portrait→landscape→portrait don't lose the button.
+// We always remove the old button first so switching rooms never leaves a stale one.
 function _ensureMobileBackButton(chatHeader, onBack) {
-    // Remove any stale back button from a previous room open
+    // Always remove any stale back button from previous room
     document.getElementById('chat-mobile-back-btn')?.remove();
-    if (!_isMobileLayout()) return; // no-op on desktop
 
     const btn = document.createElement('button');
     btn.id = 'chat-mobile-back-btn';
@@ -3240,18 +3252,30 @@ export function setupChat() {
             // Always re-subscribe to guarantee the list is fresh for this user.
             loadRecentChats();
 
-            // MOBILE: when navigating to the chat page always start in list view
-            // so the user sees their conversations, not a blank conversation panel.
+            // MOBILE: when navigating to the chat page decide which panel to show.
+            // _getChatWrapper() now returns #page-chat itself, so we check mobile
+            // layout before touching the attribute to avoid breaking desktop layout.
             if (_isMobileLayout()) {
                 const wrapper = _getChatWrapper();
                 if (wrapper) {
-                    // If there's no active room, always show list.
-                    // If there IS an active room, keep conversation view so returning
-                    // to the page after briefly switching tabs doesn't reset the chat.
                     if (!activeRoomId) {
+                        // No active room — always show the list so user can pick a chat.
                         wrapper.removeAttribute('data-mobile-view');
+                    } else {
+                        // Active room — restore conversation view (user just switched
+                        // tabs or navigated away and back; don't lose their place).
+                        wrapper.setAttribute('data-mobile-view', 'conversation');
+                        requestAnimationFrame(() => {
+                            const msgs = document.getElementById('chat-messages');
+                            if (msgs) msgs.scrollTop = 0;
+                        });
                     }
                 }
+            } else {
+                // Desktop/tablet: always remove mobile attribute to ensure
+                // side-by-side layout is not broken by a stale attribute.
+                const wrapper = _getChatWrapper();
+                if (wrapper) wrapper.removeAttribute('data-mobile-view');
             }
         });
 
@@ -3288,6 +3312,8 @@ export function setupChat() {
         //     side-by-side layout is restored (CSS handles the rest).
         //   • On crossing into mobile: if a room is active, re-enter
         //     conversation view so the message panel is visible.
+        // Use visualViewport if available so the breakpoint detection is consistent
+        // with _isMobileLayout() on iOS Safari.
         let _prevWasDesktop = !_isMobileLayout();
         const _onViewportChange = () => {
             const nowDesktop = !_isMobileLayout();
