@@ -17,7 +17,7 @@ service cloud.firestore {
       return request.auth.token.email;
     }
 
-    // FIX: collapsed to a single get() call.
+    // Collapsed to a single get() call.
     // exists() + get() = 2 external reads — Firestore aggregation queries
     // (count()) only allow 1 external read per rule evaluation, so the old
     // pattern caused permission-denied on every RunAggregationQuery call
@@ -35,6 +35,75 @@ service cloud.firestore {
       );
     }
 
+    // ── Global Live Chat ──────────────────────────────────────────────────
+    // All authenticated users can read and create messages.
+    // Users may only edit/delete their own messages (soft-delete via isDeleted
+    // flag; mediaUrl and text are nulled). Admins can hard-delete any message.
+    // Reactions (a map field) may be updated by any signed-in user.
+    match /global_chat/{messageId} {
+      allow read: if isSignedIn();
+
+      // FIX 1: operator-precedence bug — the original `||` between the two
+      // text checks made the entire `allow create` condition always-true for
+      // any signed-in user, because `text == null` is a top-level OR clause.
+      // Wrapping both alternatives in parentheses fixes the precedence so
+      // senderEmail and isDeleted are always enforced.
+      allow create: if isSignedIn() &&
+        request.resource.data.senderEmail == callerEmail() &&
+        request.resource.data.isDeleted   == false &&
+        (request.resource.data.text is string || request.resource.data.text == null);
+
+      // Own update: author may edit text/editedAt or soft-delete (isDeleted,
+      // mediaUrl, text set to null). Immutable fields are explicitly blocked.
+      // Reactions-only update: any signed-in user may toggle their reaction.
+      // Admins: unrestricted updates.
+      allow update: if isSignedIn() && (
+        (resource.data.senderEmail == callerEmail() &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['senderEmail', 'senderName', 'senderAvatar', 'timestamp'])) ||
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions'])) ||
+        isAdmin()
+      );
+
+      // FIX 2: hard deletes were blocked for the message author (only admins
+      // could delete). Live chat uses soft-delete (isDeleted flag), but a
+      // hard delete rule matching the author prevents Firestore from returning
+      // permission-denied if the client ever calls deleteDoc directly.
+      // Keeping hard-delete admin-only is the correct policy; soft-delete via
+      // updateDoc is the author path — no change needed, documented clearly.
+      allow delete: if isAdmin();
+    }
+
+    // ── Global Presence ───────────────────────────────────────────────────
+    // Each user writes only their own presence document (keyed by email).
+    // Dots in email addresses are valid Firestore document IDs; no escaping
+    // needed at the rules level — callerEmail() is matched verbatim.
+    match /global_presence/{userEmail} {
+      allow read:  if isSignedIn();
+      allow write: if isSignedIn() && callerEmail() == userEmail;
+    }
+
+    // ── Global Typing Indicators ──────────────────────────────────────────
+    // Document key is derived from the caller's email by typingDocKey() in JS:
+    //   email.replace(/[^a-zA-Z0-9]/g, c => 'x' + c.charCodeAt(0).toString(16).padStart(2,'0'))
+    //
+    // FIX-3: replaceAll() is NOT available in Firestore Rules despite being
+    // listed in some docs — the emulator rejects it. replace() only replaces
+    // the FIRST occurrence, so we cannot reconstruct the full key in Rules for
+    // emails with multiple dots/special chars.
+    //
+    // Solution: the typing collection is low-sensitivity ephemeral data (TTL
+    // ~5 s). We allow any signed-in user to write any key. The JS always
+    // derives the key deterministically from the caller's own email, so
+    // cross-user key pollution is only possible if a user deliberately crafts
+    // a collision — harmless since typing indicators auto-expire and carry no
+    // private data. Reads are also open to signed-in users (needed to show
+    // "X is typing…" to all participants).
+    match /global_typing/{typingKey} {
+      allow read:  if isSignedIn();
+      allow write: if isSignedIn();
+    }
+
     // ── Lost & Found ──────────────────────────────────────────────────────
     match /lost_found/{itemId} {
       allow read: if isSignedIn();
@@ -50,9 +119,15 @@ service cloud.firestore {
     match /reports/{reportId} {
       allow read: if isAdmin();
 
+      // RP-02: Livechat.js submitReport() writes status:'pending' (lowercase).
+      // The old rule checked == 'Pending' (capital-P) causing every create to
+      // be denied with a silent permission error. Accept both casings so
+      // legacy reports (if any) also validate, but the canonical value is now
+      // lowercase 'pending' in the JS writer.
       allow create: if isSignedIn() &&
         request.resource.data.reporterEmail == callerEmail() &&
-        request.resource.data.status == 'Pending';
+        (request.resource.data.status == 'pending' ||
+         request.resource.data.status == 'Pending');
 
       allow update, delete: if isAdmin();
     }
@@ -71,10 +146,10 @@ service cloud.firestore {
 
       allow delete: if isAdmin();
 
-      // ── Achievements subcollection ──────────────────────────────────────
+      // ── Achievements subcollection ────────────────────────────────────
+      // Carried over from production rules — was missing from the live-chat
+      // output file (FIX 4: re-added).
       match /achievements/{achievementId} {
-        // Any signed-in user may read (e.g. profile badges / leaderboards).
-        // Write is restricted to the owner — prevents clients self-awarding.
         allow read:  if isSignedIn();
         allow write: if isSignedIn() && callerEmail() == userEmail;
       }
@@ -97,6 +172,19 @@ service cloud.firestore {
     match /audit_logs/{logId} {
       allow read, create: if isAdmin();
       allow update, delete: if false;
+    }
+
+    // ── Media cleanup queue ───────────────────────────────────────────────
+    // When a message is deleted-for-everyone or its media is replaced, the
+    // client writes the old Cloudinary URL(s) here so a Cloud Function can
+    // call Cloudinary's authenticated destroy endpoint server-side.
+    // Only the message owner may create a cleanup record; only admins and
+    // Cloud Functions (via the Admin SDK, which bypasses rules) may delete.
+    match /media_cleanup/{cleanupId} {
+      allow create: if isSignedIn() &&
+        request.resource.data.requestedBy == callerEmail();
+      allow read, delete: if isAdmin();
+      allow update: if false;
     }
 
     // ── Platform settings ─────────────────────────────────────────────────
@@ -203,13 +291,32 @@ service cloud.firestore {
         );
 
         allow update: if isSignedIn() && (
-          resource.data.senderEmail == callerEmail() ||
+          // ── Admin: unrestricted ──────────────────────────────────────────
           isAdmin() ||
+
+          // ── Message owner: may edit text, replace media, soft-delete.
+          // Immutable fields (senderEmail, senderName, createdAt, replyTo,
+          // forwarded) are blocked so an owner cannot impersonate another
+          // sender or rewrite the message history.
+          (resource.data.senderEmail == callerEmail() &&
+            !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['senderEmail', 'senderName', 'createdAt',
+                       'replyTo', 'forwarded'])) ||
+
+          // ── Any chat member: may update only seenBy, deletedFor, reactions.
+          // Content-bearing and metadata fields remain locked so members
+          // cannot edit or delete each other's messages through this path.
+          // FIX #7: _deletedMediaUrls added to the blocked list — only the
+          // message owner (handled by the owner path above) may write this
+          // field.  Without this guard any member could write arbitrary
+          // Cloudinary URLs to trigger server-side cleanup of assets they
+          // don't own, potentially deleting another user's media.
           (isChatMember() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['text', 'imageUrl', 'voiceUrl', 'fileUrl',
                        'isDeletedForEveryone', 'senderEmail', 'senderName',
-                       'edited', 'editedAt', 'replyTo', 'forwarded']))
+                       'edited', 'editedAt', 'replyTo', 'forwarded',
+                       'fileName', 'fileMime', 'fileSize', '_deletedMediaUrls']))
         );
 
         allow delete: if isSignedIn() && (

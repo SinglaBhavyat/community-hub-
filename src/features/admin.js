@@ -550,8 +550,10 @@ export function setupAdmin() {
             const [usersR, postsR, pendingR, resolvedR] = await Promise.all([
                 getCountFromServer(collection(db, 'users')),
                 getCountFromServer(collection(db, 'posts')),
-                getCountFromServer(query(collection(db, 'reports'), where('status', '==', 'Pending'))),
-                getCountFromServer(query(collection(db, 'reports'), where('status', 'in', ['Resolved (Dismissed)', 'Resolved (Purged)']))),
+                // RP-02: Livechat.js now writes status:'pending' (lowercase).
+                // Accept both casings so legacy 'Pending' docs still count.
+                getCountFromServer(query(collection(db, 'reports'), where('status', 'in', ['pending', 'Pending']))),
+                getCountFromServer(query(collection(db, 'reports'), where('status', 'in', ['Resolved (Dismissed)', 'Resolved (Purged)', 'resolved (dismissed)', 'resolved (purged)']))),
             ]);
 
             animateCount(document.getElementById('stat-users'),    usersR.data().count);
@@ -735,7 +737,17 @@ export function setupAdmin() {
                         } catch (_) {}
 
                         try {
-                            if (contentType === 'reply') {
+                            if (contentType === 'chat_message') {
+                                // Soft-delete so live chat hides it immediately via onSnapshot
+                                if (contentId) {
+                                    await updateDoc(doc(db, 'global_chat', contentId), {
+                                        isDeleted:   true,
+                                        text:        null,
+                                        attachments: null,
+                                        mediaUrl:    null,
+                                    });
+                                }
+                            } else if (contentType === 'reply') {
                                 if (contentId && parentPostId) {
                                     const commentRef = doc(db, 'posts', parentPostId, 'comments', contentId);
                                     const rSnap2 = await getDoc(doc(db, 'reports', reportId));
@@ -854,7 +866,59 @@ export function setupAdmin() {
                 let authorDetails  = '<span class="text-slate-500">Unknown author</span>';
 
                 try {
-                    if (report.contentId) {
+                    if (report.contentType === 'chat_message') {
+                        // ── Live-chat message reports carry the full snapshot inline ──
+                        // (stored by Livechat.js submitReport: msgText, msgAttachments,
+                        //  reportedName, reportedEmail, msgId, msgTimestamp)
+                        const authorName  = report.reportedName  || '—';
+                        const authorEmail = report.reportedEmail || '';
+                        authorDetails = `
+                            <span class="text-sky-400 font-bold">${sanitize(authorName)}</span>
+                            ${authorEmail ? `<span class="text-slate-500 font-mono text-xs ml-2">${sanitize(authorEmail)}</span>` : ''}`;
+
+                        const msgText = report.msgText || '';
+                        const atts    = report.msgAttachments || [];
+                        const mediaHTML = atts.length
+                            ? atts.map(a => {
+                                if (a.type === 'image') {
+                                    return `<img src="${sanitize(a.url)}" alt="${sanitize(a.name || 'Image')}"
+                                                 loading="lazy"
+                                                 style="max-width:100%;max-height:180px;object-fit:contain;
+                                                        border-radius:8px;background:#0f172a;display:block;margin-top:8px;">`;
+                                }
+                                if (a.type === 'video') {
+                                    return `<div style="margin-top:8px;font-size:12px;color:#94a3b8;">
+                                                📹 Video: ${sanitize(a.name || 'video')}</div>`;
+                                }
+                                return `<div style="margin-top:8px;font-size:12px;color:#94a3b8;">
+                                            📎 File: ${sanitize(a.name || 'file')}</div>`;
+                            }).join('')
+                            : '';
+
+                        contentPreview = `
+                            <div class="bg-slate-950/80 border border-slate-800 rounded-2xl p-5 space-y-2">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <span class="text-[10px] bg-violet-500/15 text-violet-400 border border-violet-500/20
+                                                 px-2 py-0.5 rounded-full uppercase tracking-widest font-black">
+                                        Live Chat
+                                    </span>
+                                    <span class="text-[10px] text-slate-600 font-mono">msg id: ${sanitize(report.msgId || report.contentId || '—')}</span>
+                                </div>
+                                ${msgText
+                                    ? `<p class="text-slate-300 text-sm leading-relaxed line-clamp-6">${sanitize(msgText)}</p>`
+                                    : '<em class="text-slate-500 text-sm">No text content</em>'}
+                                ${mediaHTML}
+                            </div>`;
+
+                        // Attempt a live fetch to check if the message still exists
+                        try {
+                            const liveSnap = await getDoc(doc(db, 'global_chat', report.contentId));
+                            if (!liveSnap.exists() || liveSnap.data()?.isDeleted) {
+                                contentPreview += `<p class="text-amber-400 text-xs mt-2">⚠ This message has already been deleted from the chat.</p>`;
+                            }
+                        } catch (_) { /* non-fatal */ }
+
+                    } else if (report.contentId) {
                         let snap;
                         if (report.contentType === 'comment' && report.postId) {
                             snap = await getDoc(doc(db, 'posts', report.postId, 'comments', report.contentId));
@@ -971,10 +1035,10 @@ export function setupAdmin() {
                         ${contentPreview}
                     </div>
 
-                    ${report.detail ? `
+                    ${(report.detail || report.comment) ? `
                     <div class="mb-6 p-4 bg-amber-500/5 border border-amber-500/15 rounded-xl">
                         <p class="text-[10px] text-amber-400 uppercase font-black tracking-widest mb-1">Reporter Note</p>
-                        <p class="text-slate-300 text-sm leading-relaxed">${sanitize(report.detail)}</p>
+                        <p class="text-slate-300 text-sm leading-relaxed">${sanitize(report.detail || report.comment)}</p>
                     </div>` : ''}
 
                     ${filterStatus === 'Pending' ? `
@@ -1004,6 +1068,103 @@ export function setupAdmin() {
                     if (e.target.checked) selected.add(reportId);
                     else selected.delete(reportId);
                     syncBulkBar();
+                });
+
+                // ── Wire per-card action buttons ──────────────────────────────
+                // BUG FIX: buttons were rendered via innerHTML but listeners were
+                // never attached, so Dismiss and Delete Content had no effect.
+                card.querySelector('.admin-dismiss-btn')?.addEventListener('click', () => {
+                    dangerModal({
+                        title: 'Dismiss Report',
+                        body: 'Mark this report as dismissed. The flagged content will remain.',
+                        confirmText: 'Dismiss',
+                        onConfirm: async () => {
+                            try {
+                                await updateDoc(doc(db, 'reports', reportId), {
+                                    status:     'Resolved (Dismissed)',
+                                    resolvedBy: currentUser.email,
+                                    resolvedAt: serverTimestamp(),
+                                });
+                                await writeAudit('REPORT_DISMISSED', { reportId, contentId: report.contentId, contentType: report.contentType });
+                                toast('Report dismissed.', 'success');
+                                renderModeration(filterStatus);
+                            } catch (err) {
+                                console.error('[Admin] Dismiss error:', err);
+                                toast('Failed to dismiss report.', 'error');
+                            }
+                        },
+                    });
+                });
+
+                card.querySelector('.admin-delete-btn')?.addEventListener('click', () => {
+                    dangerModal({
+                        title: 'Delete Content',
+                        body: 'Permanently delete the reported content. This cannot be undone.',
+                        confirmText: 'Delete Content',
+                        onConfirm: async () => {
+                            try {
+                                const contentId   = report.contentId;
+                                const contentType = report.contentType;
+                                if (contentType === 'chat_message') {
+                                    if (contentId) {
+                                        await updateDoc(doc(db, 'global_chat', contentId), {
+                                            isDeleted:   true,
+                                            text:        null,
+                                            attachments: null,
+                                            mediaUrl:    null,
+                                        });
+                                    }
+                                } else if (contentType === 'comment' && report.postId) {
+                                    await deleteDoc(doc(db, 'posts', report.postId, 'comments', contentId));
+                                } else if (contentType === 'reply' && report.postId) {
+                                    const commentRef = doc(db, 'posts', report.postId, 'comments', contentId);
+                                    const cSnap = await getDoc(commentRef);
+                                    if (cSnap.exists() && report.replyId) {
+                                        const target = (cSnap.data().replies || []).find(r => r.id === report.replyId);
+                                        if (target) await updateDoc(commentRef, { replies: arrayRemove(target) });
+                                    }
+                                } else {
+                                    const collMap = { post: 'posts', lostFound: 'lost_found', event: 'events' };
+                                    const coll = collMap[contentType] || contentType;
+                                    if (contentId && coll) await deleteDoc(doc(db, coll, contentId));
+                                }
+                                await updateDoc(doc(db, 'reports', reportId), {
+                                    status:     'Resolved (Purged)',
+                                    resolvedBy: currentUser.email,
+                                    resolvedAt: serverTimestamp(),
+                                });
+                                await writeAudit('CONTENT_PURGED', { reportId, targetId: contentId, targetType: contentType });
+                                toast('Content deleted and report resolved.', 'success');
+                                renderModeration(filterStatus);
+                            } catch (err) {
+                                console.error('[Admin] Delete content error:', err);
+                                toast('Failed to delete content.', 'error');
+                            }
+                        },
+                    });
+                });
+
+                card.querySelector('.admin-reopen-btn')?.addEventListener('click', () => {
+                    dangerModal({
+                        title: 'Re-open Report',
+                        body: 'Move this report back to the pending queue for re-review.',
+                        confirmText: 'Re-open',
+                        onConfirm: async () => {
+                            try {
+                                await updateDoc(doc(db, 'reports', reportId), {
+                                    status:     'pending',
+                                    resolvedBy: null,
+                                    resolvedAt: null,
+                                });
+                                await writeAudit('REPORT_REOPENED', { reportId });
+                                toast('Report re-opened.', 'success');
+                                renderModeration(filterStatus);
+                            } catch (err) {
+                                console.error('[Admin] Re-open error:', err);
+                                toast('Failed to re-open report.', 'error');
+                            }
+                        },
+                    });
                 });
 
                 fragment.appendChild(card);
@@ -1815,7 +1976,20 @@ export function setupAdmin() {
                         const btn     = reportCard.querySelector('.admin-delete-btn');
                         const restore = btn ? btnLoading(btn, 'Deleting…') : () => {};
                         try {
-                            if (contentType === 'reply') {
+                            if (contentType === 'chat_message') {
+                                // Soft-delete: set isDeleted=true so the live chat hides it
+                                // without losing the document (preserves audit trail).
+                                if (!contentId) {
+                                    toast('Cannot delete chat message — message ID missing.', 'warn');
+                                } else {
+                                    await updateDoc(doc(db, 'global_chat', contentId), {
+                                        isDeleted:   true,
+                                        text:        null,
+                                        attachments: null,
+                                        mediaUrl:    null,
+                                    });
+                                }
+                            } else if (contentType === 'reply') {
                                 const replyId      = reportReplyId || null;
                                 const parentPostId = reportPostId;
                                 if (!contentId || !parentPostId) {

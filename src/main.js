@@ -3,13 +3,14 @@ import { setupAuth } from './features/auth.js';
 import { setupPosts } from './features/posts.js';
 import { setupEventsAndPolls } from './features/eventsAndPolls.js';
 import { setupComments } from './features/comments.js';
-import { setupChat } from './features/chat.js';
+import { setupChat, teardownChat } from './features/chat.js';
 import { setupLostFound } from './features/lostFound.js';
 import { setupAiChat } from './features/aiChat.js';
 import { setupAchievements } from './features/achievements.js';
 import { setupProfile } from './features/profile.js';
 import { setupAdmin } from './features/admin.js';
 import { initPostOptionsDropdowns } from './ui/templates.js';
+import { setupLiveChat, teardownLiveChat } from './features/liveChat.js';
 
 // Firebase & DB Imports
 import { db, auth, googleProvider } from './config/firebase.js';
@@ -162,6 +163,10 @@ document.addEventListener('DOMContentLoaded', () => {
     setupAuth();
     initPostOptionsDropdowns(); // registers global 3-dot dropdown handler (templates.js)
 
+    // Live chat button wiring runs immediately so unauthenticated users see
+    // the button and get redirected to sign-in on click.
+    setupLiveChat();
+
     // All modules that open Firestore listeners (posts, chat, admin, etc.) are
     // deferred until the app's own currentUser is fully populated — meaning
     // auth.js has finished fetching the user's Firestore profile (including role).
@@ -176,6 +181,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // the earliest moment currentUser.role is actually available.
     let _modulesInitialised = false;
     onCurrentUserChange((user) => {
+        if (!user && _modulesInitialised) {
+            // User signed out — tear down ALL module subscriptions so stale
+            // Firestore listeners don't fire against a null currentUser.
+            teardownChat();
+            teardownLiveChat();
+            // Reset init flag so modules re-initialise cleanly on next sign-in
+            _modulesInitialised = false;
+        }
         if (user && !_modulesInitialised) {
             _modulesInitialised = true;
             setupPosts();

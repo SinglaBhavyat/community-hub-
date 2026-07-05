@@ -55,6 +55,15 @@ let starredSub           = null;
 // per module lifetime.  teardownChat resets conversation state but must NOT reset this flag
 // because those listeners survive across login/logout cycles by design.
 let _globalListenersSetup = false;
+// FIX PORTAL-LISTENER: Separate flag for the body-level portal click handler.
+// _globalListenersSetup is set to true BEFORE we reach the portal-listener block
+// inside setupChat(), so gating on !_globalListenersSetup caused the portal
+// handler to never be registered. This flag is used exclusively for that handler.
+let _portalListenerSetup = false;
+// FIX DUPLICATE-LISTENER: The body-level portal click handler is registered once (guarded
+// by _portalListenerSetup) and routes through this reference so it always calls the
+// handleMessageAction from the CURRENT setupChat() closure, even after re-login.
+let _globalPortalClickHandler = null;
 
 const TYPING_TTL_MS    = 6000;
 const EMOJI_LIST       = ['😀','😂','😍','🥰','😎','🤔','😮','😢','😡','👍','❤️','🙏','🎉','🔥','✅','💯','🤣','😭','😊','🥺','🤩','😴','🤯','💀','👋','🤝','💪','👀','🫡','🫶'];
@@ -271,6 +280,15 @@ function showConfirm({ title, body, confirmLabel = 'Confirm', tone = 'default' }
 // ─────────────────────────────────────────────
 const getPrivateRoomId = (a, b) => [a, b].sort().join('_');
 
+// FIX AUTH-GUARD: shared auth check for every action handler.
+// Returns true if the current user is authenticated, shows an error toast and
+// returns false otherwise. Callers should return immediately on false.
+function requireAuth() {
+    if (currentUser?.email) return true;
+    showToast('You must be signed in to do that.', 'error');
+    return false;
+}
+
 function unsubscribeRoomListeners() {
     chatSub?.();       chatSub     = null;
     rootChatSub?.();   rootChatSub = null;
@@ -344,6 +362,11 @@ export function teardownChat() {
     _roomUnreadMap.clear();
     // FIX: clear message snapshot so previous user's messages never appear
     lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
+    // FIX: clear seenBy tracking set so previous user's read receipts cannot
+    // bleed into the next session — _seenBySubmitted is module-level but was
+    // never reset on logout, meaning re-login saw all old keys as "submitted"
+    // and silently skipped marking new messages as seen.
+    _seenBySubmitted.clear();
     // FIX: reset nav badge immediately so previous user's unread dot disappears
     const navDot = document.getElementById('chat-nav-indicator');
     if (navDot) { navDot.classList.add('hidden'); navDot.textContent = ''; }
@@ -741,18 +764,38 @@ function buildMessageHTML(msg, index, messages, chatType) {
     }
 
     // Context menu — no video/call options
+    // The dropdown div is a TEMPLATE that MessageMenuController will detach from
+    // the DOM and re-attach to <body> as a fixed-position portal when opened.
+    // data-msg-id on the wrapper lets MessageMenuController find the right template.
+    const menuUID = `menu-${msg.id}`; // unique ID so aria-controls works
     const menuHTML = (msg.isDeletedForEveryone || isPending) ? '' : `
-        <div class="wa-msg-menu">
-            <button class="wa-msg-menu-btn msg-menu-btn" data-msg-id="${msg.id}" aria-label="Message options">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+        <div class="wa-msg-menu" data-open="false" data-msg-id="${msg.id}">
+            <button
+                class="wa-msg-menu-btn msg-menu-btn"
+                data-msg-id="${msg.id}"
+                aria-label="Message options"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                aria-controls="${menuUID}"
+                tabindex="0"
+            >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
             </button>
-            <div class="wa-msg-dropdown hidden msg-menu-dropdown">
-                <div class="wa-emoji-bar">
+            <div
+                id="${menuUID}"
+                class="wa-msg-dropdown msg-menu-dropdown"
+                role="menu"
+                aria-label="Message actions"
+                data-msg-id="${msg.id}"
+                data-me="${isMe}"
+            >
+                <div class="wa-emoji-bar" role="group" aria-label="Quick reactions">
                     ${REACTION_EMOJIS.map(e =>
-                        `<button class="wa-emoji-pick msg-react-btn" data-msg-id="${msg.id}" data-emoji="${e}">${e}</button>`
+                        `<button class="wa-emoji-pick msg-react-btn" role="menuitem" data-msg-id="${msg.id}" data-emoji="${e}" aria-label="React with ${e}" tabindex="-1">${e}</button>`
                     ).join('')}
                 </div>
-                <button class="wa-drop-item msg-reply-btn"
+                <div class="wa-msg-dropdown__scroll">
+                <button class="wa-drop-item msg-reply-btn" role="menuitem" tabindex="-1"
                     data-msg-id="${msg.id}"
                     data-sender="${sanitize(msg.senderName || '')}"
                     data-text="${sanitize(msg.text || '')}"
@@ -764,35 +807,71 @@ function buildMessageHTML(msg, index, messages, chatType) {
                     Reply
                 </button>
                 ${isMe && msg.text && !msg.imageUrl && !msg.voiceUrl && !msg.fileUrl ? `
-                <button class="wa-drop-item msg-edit-btn" data-msg-id="${msg.id}" data-text="${sanitize(msg.text || '')}">
+                <button class="wa-drop-item msg-edit-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}" data-text="${sanitize(msg.text || '')}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                     Edit
                 </button>` : ''}
-                <button class="wa-drop-item msg-forward-btn" data-msg-id="${msg.id}">
+                ${isMe && (msg.imageUrl || (msg.fileUrl && !msg.voiceUrl)) ? `
+                <button class="wa-drop-item msg-replace-media-btn" role="menuitem" tabindex="-1"
+                    data-msg-id="${msg.id}"
+                    data-has-image="${!!msg.imageUrl}"
+                    data-file-mime="${sanitize(msg.fileMime || '')}">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                    Replace media
+                </button>` : ''}
+                <button class="wa-drop-item msg-forward-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 9l3 3-3 3m-4 0a9 9 0 110-6"/></svg>
                     Forward
                 </button>
-                <button class="wa-drop-item msg-star-btn" data-msg-id="${msg.id}">
+                <button class="wa-drop-item msg-star-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}" aria-pressed="${isStarred}">
                     <svg width="14" height="14" fill="${isStarred ? '#f59e0b' : 'none'}" stroke="${isStarred ? '#f59e0b' : 'currentColor'}" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"/></svg>
                     ${isStarred ? 'Unstar' : 'Star'} message
                 </button>
-                ${isPinned ? '' : `<button class="wa-drop-item msg-pin-btn" data-msg-id="${msg.id}">
+                ${isPinned
+                    ? `<button class="wa-drop-item msg-unpin-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/><line x1="3" y1="3" x2="21" y2="21" stroke-linecap="round" stroke-width="2"/></svg>
+                    Unpin message
+                </button>`
+                    : `<button class="wa-drop-item msg-pin-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/></svg>
                     Pin message
                 </button>`}
-                <button class="wa-drop-item msg-copy-btn" data-msg-id="${msg.id}" data-text="${sanitize(msg.text || '')}">
+                ${msg.text ? `<button class="wa-drop-item msg-copy-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}" data-text="${sanitize(msg.text || '')}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                     Copy text
-                </button>
-                <!-- FIX Bug 8: added trash icons so delete buttons match icon+label rhythm of all other dropdown items -->
-                <button class="wa-drop-item msg-delete-me-btn" data-msg-id="${msg.id}">
+                </button>` : ''}
+                ${(msg.imageUrl || msg.fileUrl || msg.voiceUrl) ? `<button class="wa-drop-item msg-download-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}" data-url="${safeUrl(msg.imageUrl || msg.fileUrl || msg.voiceUrl || '') || ''}" data-filename="${sanitize(msg.fileName || (msg.imageUrl ? 'image' : msg.voiceUrl ? 'voice-note' : 'file'))}">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                    Download
+                </button>` : ''}
+                ${!isMe ? `<button class="wa-drop-item msg-report-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+                    Report
+                </button>` : ''}
+                <button class="wa-drop-item msg-delete-me-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                     Delete for me
                 </button>
-                ${isMe ? `<button class="wa-drop-item wa-drop-item--danger msg-delete-everyone-btn" data-msg-id="${msg.id}">
+                ${(() => {
+                    // FIX: Limit "Delete for everyone" to messages sent within the last 60 minutes.
+                    // After that window, it's unfair to silently erase a message others may have
+                    // already read and acted on. Still show the button (greyed out with a tooltip)
+                    // outside the window so users understand why it's unavailable.
+                    if (!isMe) return '';
+                    const sentMs   = msg.createdAt?.toDate?.()?.getTime?.() || Date.now();
+                    const agoMs    = Date.now() - sentMs;
+                    const withinWindow = agoMs < 60 * 60 * 1000; // 60 minutes
+                    return withinWindow
+                        ? `<button class="wa-drop-item wa-drop-item--danger msg-delete-everyone-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                     Delete for everyone
-                </button>` : ''}
+                </button>`
+                        : `<button class="wa-drop-item wa-drop-item--danger" role="menuitem" tabindex="-1" disabled title="Can only delete for everyone within 60 minutes of sending" style="opacity:.45;cursor:not-allowed">
+                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                    Delete for everyone <span style="font-size:10px;opacity:.7">(expired)</span>
+                </button>`;
+                })()}
+                </div>
             </div>
         </div>`;
 
@@ -933,10 +1012,14 @@ function ensureChatStyles() {
         body.dark-mode .wa-pin-close:hover { background: rgba(124,92,255,.2); }
         body.dark-mode .wa-system-msg span { background: rgba(255,255,255,.07); color: var(--wa-sub); border-color: var(--wa-border); }
         body.dark-mode .wa-reaction-pill { background: var(--wa-panel); border-color: var(--wa-border); color: var(--wa-text); }
-        body.dark-mode .wa-msg-dropdown { background: #1a1d35; border-color: rgba(255,255,255,.1); }
+        body.dark-mode .wa-msg-dropdown { background: #1a1d35; border-color: rgba(255,255,255,.1); box-shadow: 0 10px 48px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.35); }
+        body.dark-mode .wa-msg-dropdown__scroll { scrollbar-color: rgba(255,255,255,.15) transparent; }
         body.dark-mode .wa-drop-item { color: var(--wa-text); }
         body.dark-mode .wa-drop-item:hover { background: rgba(255,255,255,.06); }
+        body.dark-mode .wa-drop-item--focused { background: rgba(124,92,255,.18) !important; color: #a78bfa !important; }
         body.dark-mode .wa-drop-item--danger { border-color: rgba(255,255,255,.08); }
+        body.dark-mode .wa-drop-item--danger:hover { background: rgba(255,92,122,.10) !important; }
+        body.dark-mode .wa-emoji-bar { border-color: rgba(255,255,255,.08); }
         body.dark-mode .wa-file-attachment { background: rgba(255,255,255,.07); color: var(--wa-text); }
         body.dark-mode .wa-link-preview { background: rgba(255,255,255,.05); }
         body.dark-mode #chat-message-input { color: var(--wa-text) !important; }
@@ -944,6 +1027,7 @@ function ensureChatStyles() {
         body.dark-mode #send-msg-btn:disabled { background: #2a2d4a !important; }
         body.dark-mode .wa-header-dropdown { background: #1a1d35; border-color: rgba(255,255,255,.1); }
         body.dark-mode .wa-msg-menu-btn { background: #1a1d35; border-color: rgba(255,255,255,.1); }
+        body.dark-mode .wa-msg-menu-btn[aria-expanded="true"] { background: rgba(124,92,255,.2); border-color: var(--wa-accent); color: var(--wa-accent); }
         body.dark-mode #wa-recording-bar { background: var(--wa-panel); border-color: var(--wa-border); }
         body.dark-mode .wa-rec-timer { color: var(--wa-text); }
         body.dark-mode #chat-search-bar { background: var(--wa-panel); border-color: var(--wa-border); }
@@ -986,6 +1070,9 @@ function ensureChatStyles() {
         body.dark-mode .wa-highlight { background: #78350f; color: #fef3c7; }
         body.dark-mode .wa-welcome-icon { background: var(--wa-panel); border-color: var(--wa-border); }
         body.dark-mode .wa-welcome-title { color: var(--wa-text); }
+        /* Replace-media item is styled identically to the Edit item — accent colour, upload icon */
+        .msg-replace-media-btn { color: var(--wa-accent) !important; }
+        body.dark-mode .msg-replace-media-btn { color: var(--wa-accent) !important; }
         body.dark-mode .wa-welcome-enc { color: var(--wa-sub); }
         body.dark-mode .ch-profile-area:hover { background: rgba(255,255,255,.06); }
         body.dark-mode .wa-nav-btn:hover { background: rgba(255,255,255,.08); }
@@ -1188,7 +1275,16 @@ function ensureChatStyles() {
             display: flex !important;
             flex-direction: column-reverse;
             overflow-y: auto;
-            padding: 20px 16px 12px !important;
+            /* overflow-x must remain visible (or unset) so the absolutely-positioned
+               .wa-msg-menu trigger buttons — which sit OUTSIDE the bubble via
+               right/left: calc(100% + 8px) — are never clipped horizontally.
+               overflow-y:auto on a flex container does NOT create a clipping rect
+               for position:absolute children whose containing block is an in-flow
+               ancestor (the spec only clips content that overflows the scroll port).
+               The trigger buttons are still contained by .wa-msg-wrap which is
+               position:relative, so they will never scroll the container. */
+            overflow-x: visible;
+            padding: 20px 24px 12px !important;
             background: var(--wa-bg) !important;
             flex: 1 !important;
             space-y: 0 !important;
@@ -1214,14 +1310,22 @@ function ensureChatStyles() {
         /* ═══ Message rows ═══ */
         .wa-msg-row {
             display: flex; align-items: flex-end; gap: 6px;
+            /* 72% max-width keeps bubbles from touching edges.
+               The trigger button sits OUTSIDE the row's flex layout
+               (position:absolute on .wa-msg-wrap) so it adds no width. */
             max-width: 72%; margin-bottom: 2px;
             animation: waFadeIn .18s ease-out;
+            /* overflow:visible so the absolutely-positioned .wa-msg-menu
+               trigger is never clipped when it extends beyond the row's box */
+            overflow: visible;
         }
         .wa-msg-row--me   { align-self: flex-end; flex-direction: row-reverse; }
         .wa-msg-row--them { align-self: flex-start; }
         .wa-msg-avatar    { width: 30px; height: 30px; flex-shrink: 0; }
         .wa-msg-avatar-gap { width: 30px; flex-shrink: 0; }
-        .wa-msg-wrap      { position: relative; display: flex; flex-direction: column; }
+        /* position:relative creates the containing block for .wa-msg-menu.
+           overflow:visible is intentional — the trigger must never be clipped. */
+        .wa-msg-wrap      { position: relative; display: flex; flex-direction: column; overflow: visible; }
         .wa-msg-row--me  .wa-msg-wrap { align-items: flex-end; }
         .wa-msg-row--them .wa-msg-wrap { align-items: flex-start; }
 
@@ -1354,43 +1458,218 @@ function ensureChatStyles() {
         .wa-reaction-pill span  { font-size: 11px; font-weight: 700; color: var(--wa-sub); }
 
         /* ═══ Message context menu ═══ */
-        /* FIX Bug 2: was left:calc(100%+4px) for --them which resolved against the full
-           wa-msg-wrap width (wider than the bubble), pushing the button too far right.
-           Now both sides anchor from the right edge of the wrap so the button always sits
-           just outside the bubble regardless of wrap width. */
-        .wa-msg-menu { position: absolute; top: 4px; z-index: 100; opacity: 0; transition: opacity .15s; }
-        /* "Me" bubbles: menu button sits to the LEFT of the bubble (before the text area) */
-        .wa-msg-row--me   .wa-msg-menu { right: calc(100% + 4px); left: auto; }
-        /* "Them" bubbles: menu button sits to the RIGHT of the bubble */
-        .wa-msg-row--them .wa-msg-menu { left: calc(100% + 4px); right: auto; }
-        .wa-msg-wrap:hover .wa-msg-menu { opacity: 1; }
+        /*
+         * ARCHITECTURE: The trigger button (.wa-msg-menu / .wa-msg-menu-btn) lives
+         * inside .wa-msg-wrap (position:relative) as a sibling of .wa-bubble, so
+         * hover detection via CSS works naturally without any overflow issue.
+         * The dropdown (.wa-msg-dropdown) is PORTALED to <body> at open time via
+         * MessageMenuController so it escapes every stacking context, overflow:hidden/
+         * clip/auto ancestor, and CSS transform containing block. JS writes
+         * position:fixed + viewport-aware coords. This section styles only the
+         * trigger wrapper and the portal panel itself.
+         *
+         * KEY OVERFLOW FIX: .wa-msg-row max-width:72% + position:relative on
+         * .wa-msg-wrap means the absolute-positioned trigger sits OUTSIDE the
+         * bubble width but INSIDE the row. #chat-messages has overflow-y:auto
+         * which does NOT clip horizontal overflow of child elements whose containing
+         * block is an in-flow ancestor (per CSS spec). The trigger is safe.
+         * The dropdown is on <body> with position:fixed — it is NEVER clipped.
+         */
+
+        /* ── Trigger wrapper (stays in DOM tree, positioned relative to .wa-msg-wrap) ── */
+        .wa-msg-menu {
+            position: absolute;
+            top: 6px;
+            z-index: 20;           /* above bubble content, below portaled dropdown */
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .15s ease, transform .15s ease;
+            transform: scale(0.82);
+            /* Prevent the trigger from creating a new stacking context that
+               could interfere with sibling z-index ordering */
+            isolation: isolate;
+        }
+        /* FIX: place trigger OUTSIDE the bubble on each side so it never overlaps text */
+        .wa-msg-row--me   .wa-msg-menu { right: calc(100% + 8px); left: auto; }
+        .wa-msg-row--them .wa-msg-menu { left: calc(100% + 8px); right: auto; }
+
+        /* Show on hover, focus-within, or when dropdown is open */
+        .wa-msg-wrap:hover .wa-msg-menu,
+        .wa-msg-wrap:focus-within .wa-msg-menu,
+        .wa-msg-menu[data-open="true"] {
+            opacity: 1;
+            pointer-events: auto;
+            transform: scale(1);
+        }
+
+        /* Touch: always visible so it can be tapped */
+        @media (hover: none) {
+            .wa-msg-menu {
+                opacity: 1;
+                pointer-events: auto;
+                transform: scale(1);
+            }
+        }
+
+        /* ── Trigger button ── */
         .wa-msg-menu-btn {
-            width: 28px; height: 28px; border-radius: 8px; background: var(--wa-panel);
-            border: 1px solid var(--wa-border); color: var(--wa-sub);
+            width: 32px; height: 32px; border-radius: 10px;
+            background: var(--wa-panel);
+            border: 1px solid var(--wa-border);
+            color: var(--wa-sub);
             display: flex; align-items: center; justify-content: center;
-            cursor: pointer; transition: all .15s; box-shadow: var(--wa-shadow);
+            cursor: pointer;
+            transition: background .15s, color .15s, border-color .15s, box-shadow .15s;
+            box-shadow: 0 1px 6px rgba(0,0,0,.10);
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            /* Ensure it never triggers a transform that would make descendants
+               use this as a containing block for position:fixed */
         }
-        .wa-msg-menu-btn:hover { background: var(--wa-input-bg); color: var(--wa-text); }
+        .wa-msg-menu-btn:hover { background: var(--wa-input-bg); color: var(--wa-text); box-shadow: 0 2px 10px rgba(0,0,0,.13); }
+        .wa-msg-menu-btn:focus-visible {
+            outline: 2px solid var(--wa-accent);
+            outline-offset: 2px;
+        }
+        .wa-msg-menu-btn[aria-expanded="true"] {
+            background: var(--wa-accent-dim);
+            color: var(--wa-accent);
+            border-color: var(--wa-accent);
+            box-shadow: 0 0 0 3px rgba(79,70,229,.12);
+        }
+
+        /* ── Portal dropdown (appended to <body>, position:fixed written by JS) ── */
+        /*
+         * CRITICAL: This element lives on <body> when open — NEVER inside any
+         * scroll container, transformed ancestor, or overflow:hidden/clip element.
+         * position:fixed coords are set by positionDropdown() which does full
+         * viewport-edge collision detection (below-right → below-left → above-right
+         * → above-left). overflow:hidden on the PANEL (not visible) lets border-
+         * radius clip the emoji row while the JS-controlled maxHeight + overflow-y:auto
+         * handles tall menus on small screens without any outer clipping.
+         */
         .wa-msg-dropdown {
-            /* FIX Bug 3: was top:32px (hardcoded button height) which overflowed on short
-               bubbles. top:100% + margin-top always places the dropdown flush below the
-               trigger button regardless of bubble or font size. */
-            position: absolute; top: 100%; margin-top: 4px; min-width: 210px;
-            background: var(--wa-panel); border: 1px solid var(--wa-border);
-            border-radius: 14px; box-shadow: var(--wa-shadow-lg); overflow: hidden; z-index: 200;
+            position: fixed;           /* always fixed — never absolute */
+            min-width: 230px;
+            max-width: min(92vw, 288px);
+            background: var(--wa-panel);
+            border: 1px solid var(--wa-border);
+            border-radius: 18px;
+            box-shadow:
+                0 10px 48px rgba(0,0,0,.16),
+                0 2px 10px rgba(0,0,0,.09),
+                0 0 0 0.5px rgba(0,0,0,.04);
+            /* overflow:hidden clips rounded corners on the emoji row;
+               individual items use border-radius on their own hover states.
+               The panel itself never clips — maxHeight + overflow-y:auto handles overflow. */
+            overflow: hidden;
+            z-index: 99999;            /* above modals (400), lightboxes, toasts (500) */
+            /* Entry state — JS adds .wa-msg-dropdown--open to animate in */
+            opacity: 0;
+            transform: scale(0.90) translateY(-8px);
+            transform-origin: top center;
+            transition:
+                opacity .16s cubic-bezier(0.4, 0, 0.2, 1),
+                transform .16s cubic-bezier(0.4, 0, 0.2, 1);
+            pointer-events: none;
+            will-change: opacity, transform;
+            /* Ensure this never clips its own scrollable inner content */
+            display: flex;
+            flex-direction: column;
         }
-        .wa-msg-row--me   .wa-msg-dropdown { right: 0; }
-        .wa-msg-row--them .wa-msg-dropdown { left: 0; }
-        .wa-emoji-bar  { display: flex; justify-content: space-between; padding: 8px 10px; border-bottom: 1px solid var(--wa-border); gap: 2px; }
-        .wa-emoji-pick { font-size: 20px; background: none; border: none; cursor: pointer; transition: transform .15s; border-radius: 6px; padding: 3px 4px; line-height: 1; }
-        .wa-emoji-pick:hover { transform: scale(1.4); background: var(--wa-input-bg); }
+        .wa-msg-dropdown--open {
+            opacity: 1;
+            transform: scale(1) translateY(0);
+            pointer-events: auto;
+        }
+        /* Direction modifier classes set by positionDropdown() */
+        .wa-msg-dropdown--below { transform-origin: top center; }
+        .wa-msg-dropdown--above {
+            transform-origin: bottom center;
+            transform: scale(0.90) translateY(8px);
+        }
+        .wa-msg-dropdown--above.wa-msg-dropdown--open { transform: scale(1) translateY(0); }
+        /* Left/right alignment for transform-origin */
+        .wa-msg-dropdown--align-left  { transform-origin: top left; }
+        .wa-msg-dropdown--align-right { transform-origin: top right; }
+        .wa-msg-dropdown--above.wa-msg-dropdown--align-left  { transform-origin: bottom left; }
+        .wa-msg-dropdown--above.wa-msg-dropdown--align-right { transform-origin: bottom right; }
+
+        /* Scrollable inner list — keeps emoji row pinned at top */
+        .wa-msg-dropdown__scroll {
+            overflow-y: auto;
+            overflow-x: hidden;
+            overscroll-behavior: contain;
+            /* scrollbar styling */
+            scrollbar-width: thin;
+            scrollbar-color: var(--wa-border) transparent;
+        }
+        .wa-msg-dropdown__scroll::-webkit-scrollbar { width: 4px; }
+        .wa-msg-dropdown__scroll::-webkit-scrollbar-thumb { background: var(--wa-border); border-radius: 2px; }
+
+        /* Reduced-motion: fade only, no scale/translate */
+        @media (prefers-reduced-motion: reduce) {
+            .wa-msg-dropdown,
+            .wa-msg-dropdown--above,
+            .wa-msg-dropdown--above.wa-msg-dropdown--open {
+                transition: opacity .1s linear;
+                transform: none !important;
+            }
+        }
+
+        /* ── Inner sections ── */
+        .wa-emoji-bar {
+            display: flex; justify-content: space-between;
+            padding: 9px 10px 8px; border-bottom: 1px solid var(--wa-border);
+            gap: 2px;
+            /* Border-radius is handled by the panel's overflow:hidden at 18px.
+               No need for overflow:hidden here — emoji scale transforms would
+               be clipped. The panel clips everything at its own border edge. */
+            flex-shrink: 0; /* never shrink when menu is height-constrained */
+        }
+        .wa-emoji-pick {
+            font-size: 21px; background: none; border: none; cursor: pointer;
+            transition: transform .15s, background .12s;
+            border-radius: 8px; padding: 4px 5px; line-height: 1;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            min-width: 36px; text-align: center;
+        }
+        .wa-emoji-pick:hover  { transform: scale(1.45); background: var(--wa-input-bg); }
+        .wa-emoji-pick:focus-visible { outline: 2px solid var(--wa-accent); outline-offset: 2px; border-radius: 6px; }
+
+        /* Action items */
         .wa-drop-item {
-            display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+            display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
             padding: 10px 16px; font-size: 13.5px; color: var(--wa-text);
-            background: none; border: none; cursor: pointer; transition: background .1s;
+            background: none; border: none; cursor: pointer;
+            transition: background .1s;
+            -webkit-tap-highlight-color: transparent;
+            touch-action: manipulation;
+            /* Ensure icons and text align even when icon is absent */
+            min-height: 40px;
         }
-        .wa-drop-item:hover { background: var(--wa-input-bg); }
-        .wa-drop-item--danger { color: var(--wa-danger) !important; border-top: 1px solid var(--wa-border); }
+        .wa-drop-item:hover       { background: var(--wa-input-bg); }
+        .wa-drop-item:focus-visible {
+            outline: none;
+            background: var(--wa-accent-dim);
+            color: var(--wa-accent);
+        }
+        /* Keyboard-focused item — controlled by JS via .wa-drop-item--focused */
+        .wa-drop-item--focused {
+            background: var(--wa-accent-dim) !important;
+            color: var(--wa-accent) !important;
+        }
+        .wa-drop-item--danger {
+            color: var(--wa-danger) !important;
+            border-top: 1px solid var(--wa-border);
+        }
+        .wa-drop-item--danger:hover { background: rgba(239,68,68,.06) !important; }
+        .wa-drop-item svg { flex-shrink: 0; opacity: 0.75; }
+        .wa-drop-item:hover svg, .wa-drop-item--focused svg { opacity: 1; }
+
+        /* Last item rounded corners */
+        .wa-drop-item:last-child { border-radius: 0 0 16px 16px; }
 
         /* ═══ System messages ═══ */
         .wa-system-msg { display: flex; justify-content: center; margin: 14px 0; }
@@ -1734,6 +2013,8 @@ function openLightbox(url) {
 // FORWARD MODAL — light theme
 // ─────────────────────────────────────────────
 async function openForwardModal(msgId) {
+    // FIX AUTH-GUARD: verify auth before opening forward modal
+    if (!requireAuth()) return;
     document.getElementById('wa-forward-modal')?.remove();
     const modal = document.createElement('div');
     modal.id = 'wa-forward-modal';
@@ -1813,11 +2094,11 @@ async function openForwardModal(msgId) {
                     }
                     await setDoc(doc(db, 'chats', toRoom), _fwdUpdate, { merge: true });
                     showToast('Message forwarded!', 'success');
-                } catch { showToast('Failed to forward.', 'error'); }
+                } catch (err) { console.error('[Chat] forward error:', err); showToast('Failed to forward.', 'error'); }
                 close();
             });
         });
-    } catch { showToast('Failed to load conversations.', 'error'); close(); }
+    } catch (err) { console.error('[Chat] load-conversations error:', err); showToast('Failed to load conversations.', 'error'); close(); }
 }
 
 // ─────────────────────────────────────────────
@@ -2293,7 +2574,8 @@ export function setupChat() {
             cachedUsersHTML = html || '<p class="text-gray-400 text-sm text-center py-8">No contacts found.</p>';
             cachedUsersAt   = Date.now(); // FIX: record fetch time for TTL check
             usersListContent.innerHTML = cachedUsersHTML;
-        } catch {
+        } catch (err) {
+            console.error('[Chat] load-contacts error:', err);
             usersListContent.innerHTML = '<p class="text-red-400 text-sm text-center py-8">Failed to load contacts.</p>';
             showToast('Could not load contacts.', 'error');
         }
@@ -2348,9 +2630,10 @@ export function setupChat() {
         const _attachRecentListener = (withOrder) => {
             recentChatsSub?.();
             recentChatsSub = onSnapshot(_buildRecentQuery(withOrder), snap => {
-            // FIX: discard snapshot if the authenticated user changed between
-            // when this listener was registered and when the snapshot arrived.
-            // This prevents cross-user leakage when the app is fast-switched.
+            // FIX: discard snapshot if no user is signed in or if the user changed
+            // between when this listener was registered and when the snapshot arrived.
+            // Prevents "Unable to load chat list" ghost data from showing post-logout
+            // and cross-user leakage on fast account switches.
             if (!currentUser || currentUser.email !== _ownerEmail) return;
             const chats = [];
             snap.forEach(d => chats.push({ id: d.id, ...d.data() }));
@@ -2466,6 +2749,28 @@ export function setupChat() {
             // listener cleanly.
             recentChatsSub  = null;
             _recentSubOwner = null;
+            // FIX "Unable to load chat list": show inline error state in the sidebar
+            // so the user has a clear visual cue instead of just a transient toast
+            // that disappears. Also offer a retry button.
+            if (recentList && currentUser) {
+                recentList.innerHTML = `
+                    <div class="flex flex-col items-center justify-center py-16 px-4 text-center gap-3">
+                        <div class="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center text-2xl">⚠️</div>
+                        <p class="text-gray-700 text-sm font-semibold">Unable to load chat list</p>
+                        <p class="text-gray-400 text-xs leading-relaxed">Check your connection or try again</p>
+                        <button id="chat-list-retry-btn"
+                            class="mt-1 px-4 py-2 rounded-lg bg-indigo-600 text-white text-xs font-bold hover:bg-indigo-700 transition">
+                            Retry
+                        </button>
+                    </div>`;
+                document.getElementById('chat-list-retry-btn')?.addEventListener('click', () => {
+                    recentList.innerHTML = `<div class="flex justify-center py-10 text-sm text-gray-400">Reconnecting…</div>`;
+                    // Clear state so loadRecentChats re-subscribes
+                    recentChatsSub  = null;
+                    _recentSubOwner = null;
+                    setTimeout(() => loadRecentChats(), 300);
+                });
+            }
             showToast('Lost connection to chat list.', 'error');
         });
         };
@@ -2517,7 +2822,15 @@ export function setupChat() {
         // keeps running after sign-out and their unread badge remains visible.
         onAuthStateChanged(auth, firebaseUser => {
             if (!firebaseUser) {
-                // User signed out — immediately tear down all listeners and reset state
+                // User signed out — immediately tear down all listeners and reset state.
+                // FIX: also stop the presence heartbeat so we don't write to Firestore
+                // as a null user after sign-out.
+                if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
+                // FIX: clear any in-flight typing write
+                if (isCurrentlyTyping && activeRoomId) {
+                    writeTypingState(activeRoomId, false);
+                    isCurrentlyTyping = false;
+                }
                 unsubscribeRoomListeners();
                 unsubscribeRecent();
                 _recentSubOwner   = null; // FIX BUG 2: clear owner so next sign-in re-subscribes
@@ -2525,6 +2838,7 @@ export function setupChat() {
                 _pendingReadRooms.clear();
                 _roomUnreadMap.clear();
                 lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
+                _seenBySubmitted.clear(); // FIX: prevent cross-session read-receipt leakage
                 activeRoomId      = null;
                 activeRoomDetails = null;
                 cachedUsersHTML   = null;
@@ -2643,7 +2957,8 @@ export function setupChat() {
             });
             document.getElementById('group-member-list').innerHTML =
                 html || '<p class="text-gray-400 text-sm text-center py-4">No contacts available.</p>';
-        } catch {
+        } catch (err) {
+            console.error('[Chat] load-group-contacts error:', err);
             document.getElementById('group-member-list').innerHTML =
                 '<p class="text-red-400 text-sm text-center py-4">Failed to load contacts.</p>';
         }
@@ -2685,7 +3000,8 @@ export function setupChat() {
                 // FIX: removed redundant loadRecentChats() — the onSnapshot listener already picks
                 // up the new group doc automatically. Extra call creates a second listener.
                 document.getElementById('btn-show-recent')?.click();
-            } catch {
+            } catch (err) {
+                console.error('[Chat] create-group error:', err);
                 showToast('Failed to create group.', 'error');
                 btn.textContent = 'Create Group';
                 btn.disabled    = false;
@@ -2869,6 +3185,13 @@ export function setupChat() {
 
     // ── Open chat room ───────────────────────────
     const openChatRoom = async (targetEmail, targetName, chatType) => {
+        // FIX AUTH-GUARD: bail immediately if called without a signed-in user.
+        // This can happen during the brief window after sign-out fires but before
+        // the auth state observer has cleared the chat panel from the UI.
+        if (!currentUser?.email) {
+            console.warn('[Chat] openChatRoom called without authenticated user — ignoring.');
+            return;
+        }
         // FIX #5: use module-scope _cleanupDropdown instead of DOM property
         if (_cleanupDropdown) {
             document.removeEventListener('click', _cleanupDropdown);
@@ -2904,7 +3227,8 @@ export function setupChat() {
                     type: 'private', members: [currentUser.email, targetEmail],
                     memberNames: [currentUser.name, targetName], lastUpdated: serverTimestamp()
                 }, { merge: true });
-            } catch {
+            } catch (err) {
+                console.error('[Chat] open-chat error:', err);
                 showToast('Could not open chat.', 'error');
                 return;
             }
@@ -3103,64 +3427,352 @@ export function setupChat() {
     handleSidebarClick(usersListContent);
     window.startDirectChat = (email, name) => openChatRoom(email, name, 'private');
 
-    // ── Helper: close all message dropdowns and clear fixed positioning ──
-    function closeAllDropdowns() {
-        document.querySelectorAll('.wa-msg-dropdown').forEach(d => {
-            d.classList.add('hidden');
-            d.style.removeProperty('position');
-            d.style.removeProperty('top');
-            d.style.removeProperty('left');
-            d.style.removeProperty('right');
-        });
-    }
+    // ══════════════════════════════════════════════════════════════════
+    // MESSAGE MENU CONTROLLER
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // Architecture:
+    //   1. Each message renders a .wa-msg-menu trigger + .wa-msg-dropdown template
+    //      inside the bubble's DOM tree (so hover detection works naturally).
+    //   2. When the menu is opened, the DROPDOWN IS PORTALED to <body> with
+    //      position:fixed so it can never be clipped by:
+    //        • overflow:hidden / overflow:clip on #page-chat wrapper
+    //        • overflow-y:auto on #chat-messages scroll container
+    //        • CSS transforms on ancestor elements (transform creates a new
+    //          containing block for fixed descendants — we break out entirely)
+    //   3. Viewport-aware placement: tries below-right first, then below-left,
+    //      then above-right, then above-left, choosing whichever fits.
+    //   4. On resize / scroll, live repositions the open dropdown.
+    //   5. Keyboard navigation: ArrowDown/Up move focus, Enter/Space activate,
+    //      Escape/Tab close.  Home/End jump to first/last item.
+    //   6. Touch: standard click/touchend (300 ms delay avoided via touch-action).
+    //   7. Click-outside: one document pointerdown listener, removed on close.
+    //   8. Escape key: global keydown listener, removed on close.
+    //
+    const MessageMenuController = (() => {
+        let _portalEl   = null;  // the currently-open dropdown (on <body>)
+        let _triggerBtn = null;  // the button that opened it
+        let _templateEl = null;  // the original dropdown template in the bubble DOM
+        let _focusIdx   = -1;    // current keyboard focus index (-1 = none)
+        let _items      = [];    // focusable items inside the open dropdown
+        let _rafId      = null;  // requestAnimationFrame for repositioning
 
-    // ── Message click delegation ─────────────────
-    chatContainer?.addEventListener('click', async e => {
-        if (!e.target.closest('.wa-msg-menu')) {
-            closeAllDropdowns();
+        // ── Measure & position ───────────────────────────────────────────
+        function positionDropdown(btn, portal) {
+            const MARGIN  = 10;  // min gap from viewport edge (px)
+            const GAP     = 8;   // gap between button and dropdown (px)
+            const btnRect = btn.getBoundingClientRect();
+            const vpW     = window.innerWidth;
+            const vpH     = window.innerHeight;
+
+            // Use real measured dimensions; portal is already in DOM (opacity:0)
+            // so offsetWidth/Height are accurate. Fall back to CSS min-width only.
+            const dropW = Math.min(
+                Math.max(portal.offsetWidth, 230),
+                vpW - MARGIN * 2
+            );
+            // Measure the scroll content's natural height, not the constrained height
+            const scrollEl = portal.querySelector('.wa-msg-dropdown__scroll');
+            const innerH = scrollEl
+                ? portal.querySelector('.wa-emoji-bar')?.offsetHeight + scrollEl.scrollHeight
+                : portal.scrollHeight;
+            const dropH = Math.max(innerH || 0, 60); // at least 60px to avoid flicker
+
+            // ── Vertical placement ──
+            const spaceBelow = vpH - btnRect.bottom - GAP - MARGIN;
+            const spaceAbove = btnRect.top - GAP - MARGIN;
+            const canFitBelow = dropH <= spaceBelow;
+            const canFitAbove = dropH <= spaceAbove;
+
+            let top, openAbove;
+            if (canFitBelow) {
+                top = btnRect.bottom + GAP;
+                openAbove = false;
+            } else if (canFitAbove) {
+                top = btnRect.top - GAP - dropH;
+                openAbove = true;
+            } else {
+                // Neither fits — open toward the side with more room, constrain height
+                if (spaceBelow >= spaceAbove) {
+                    top = btnRect.bottom + GAP;
+                    openAbove = false;
+                } else {
+                    top = MARGIN;
+                    openAbove = true;
+                }
+            }
+
+            // Clamp vertically
+            top = Math.max(MARGIN, Math.min(top, vpH - MARGIN - dropH));
+
+            // ── Horizontal placement ──
+            // Prefer alignment direction based on which side of screen button is on
+            const btnMidX = btnRect.left + btnRect.width / 2;
+            const preferAlignRight = btnMidX > vpW / 2;
+            let left;
+            if (preferAlignRight) {
+                // Right-align dropdown to button's right edge
+                left = btnRect.right - dropW;
+            } else {
+                // Left-align dropdown to button's left edge
+                left = btnRect.left;
+            }
+            // Clamp horizontally
+            left = Math.max(MARGIN, Math.min(left, vpW - dropW - MARGIN));
+
+            // ── Apply direction classes ──
+            portal.classList.toggle('wa-msg-dropdown--above', openAbove);
+            portal.classList.toggle('wa-msg-dropdown--below', !openAbove);
+            portal.classList.toggle('wa-msg-dropdown--align-right', preferAlignRight);
+            portal.classList.toggle('wa-msg-dropdown--align-left', !preferAlignRight);
+
+            // ── Apply geometry ──
+            // Compute available height for the scrollable section
+            const emojiBarH = portal.querySelector('.wa-emoji-bar')?.offsetHeight ?? 56;
+            const maxDropH  = (openAbove ? spaceAbove : spaceBelow) + GAP;
+            const clampedH  = Math.min(dropH, Math.max(maxDropH, emojiBarH + 80), vpH - MARGIN * 2);
+
+            portal.style.top   = `${Math.round(top)}px`;
+            portal.style.left  = `${Math.round(left)}px`;
+            portal.style.width = `${Math.round(dropW)}px`;
+            // Let the scroll section handle overflow — remove any inline maxHeight/overflowY
+            // set by previous calls; CSS flex + scroll section handles it
+            portal.style.maxHeight = `${Math.round(clampedH)}px`;
+            // The panel uses overflow:hidden (border-radius clipping), the scroll
+            // section uses overflow-y:auto. Never set overflowY on the portal itself.
+            portal.style.removeProperty('overflow-y');
+            // Set max-height on the scroll section so items are scrollable when needed
+            if (scrollEl) {
+                scrollEl.style.maxHeight = `${Math.round(clampedH - emojiBarH)}px`;
+            }
         }
 
-        // Menu toggle
+        function _scheduleReposition() {
+            if (!_portalEl || !_triggerBtn) return;
+            if (_rafId) cancelAnimationFrame(_rafId);
+            _rafId = requestAnimationFrame(() => positionDropdown(_triggerBtn, _portalEl));
+        }
+
+        // ── Keyboard navigation ──────────────────────────────────────────
+        function _getItems() {
+            if (!_portalEl) return [];
+            // Query items in DOM order: emoji picks first, then action items in scroll section
+            return [..._portalEl.querySelectorAll(
+                '.wa-emoji-pick:not([disabled]), .wa-drop-item:not([disabled])'
+            )];
+        }
+
+        function _setFocus(idx) {
+            _items.forEach((el, i) => {
+                el.classList.toggle('wa-drop-item--focused', i === idx);
+                el.setAttribute('tabindex', i === idx ? '0' : '-1');
+            });
+            if (idx >= 0 && idx < _items.length) {
+                _items[idx].focus({ preventScroll: true });
+            }
+            _focusIdx = idx;
+        }
+
+        function _onKeydown(e) {
+            if (!_portalEl) return;
+            switch (e.key) {
+                case 'Escape':
+                case 'Tab':
+                    e.preventDefault();
+                    close(true); // return focus to trigger
+                    break;
+                case 'ArrowDown':
+                    e.preventDefault();
+                    _items = _getItems();
+                    _setFocus(Math.min(_focusIdx + 1, _items.length - 1));
+                    break;
+                case 'ArrowUp':
+                    e.preventDefault();
+                    _items = _getItems();
+                    _setFocus(Math.max(_focusIdx - 1, 0));
+                    break;
+                case 'Home':
+                    e.preventDefault();
+                    _items = _getItems();
+                    _setFocus(0);
+                    break;
+                case 'End':
+                    e.preventDefault();
+                    _items = _getItems();
+                    _setFocus(_items.length - 1);
+                    break;
+                case 'Enter':
+                case ' ':
+                    if (_focusIdx >= 0 && _items[_focusIdx]) {
+                        e.preventDefault();
+                        _items[_focusIdx].click();
+                    }
+                    break;
+            }
+        }
+
+        // ── Outside click / touch ────────────────────────────────────────
+        function _onOutsidePointer(e) {
+            if (!_portalEl) return;
+            if (_portalEl.contains(e.target)) return;
+            if (_triggerBtn && _triggerBtn.contains(e.target)) return;
+            close(false);
+        }
+
+        // ── Open ─────────────────────────────────────────────────────────
+        function open(btn) {
+            // Find the dropdown template in the same .wa-msg-menu container
+            const menuWrap = btn.closest('.wa-msg-menu');
+            if (!menuWrap) return;
+            const template = menuWrap.querySelector('.wa-msg-dropdown');
+            if (!template) return;
+
+            // If the same menu is already open, close it (toggle)
+            if (_portalEl && _triggerBtn === btn) { close(false); return; }
+
+            // Close any previously open menu first
+            if (_portalEl) close(false);
+
+            // Clone the dropdown and portal it to <body>
+            const portal = template.cloneNode(true);
+            portal.style.position = 'fixed';   // CRITICAL: fixed, not absolute
+            document.body.appendChild(portal);
+
+            _portalEl   = portal;
+            _triggerBtn = btn;
+            _templateEl = template;
+            _focusIdx   = -1;
+            _items      = [];
+
+            // Update trigger button ARIA state
+            btn.setAttribute('aria-expanded', 'true');
+            menuWrap.setAttribute('data-open', 'true');
+
+            // Measure & position BEFORE animation (avoid FOUC).
+            // Portal is in DOM with CSS opacity:0 (from base class), so layout
+            // is available but nothing is visible to the user yet.
+            // frame 1: force layout/measure → positionDropdown reads real dims
+            // frame 2: apply open class → CSS transition fires
+            requestAnimationFrame(() => {
+                positionDropdown(btn, portal);
+                // eslint-disable-next-line no-unused-expressions
+                portal.offsetHeight; // force reflow before transition
+                requestAnimationFrame(() => {
+                    portal.classList.add('wa-msg-dropdown--open');
+                });
+            });
+
+            // Attach global listeners
+            document.addEventListener('keydown',      _onKeydown,        { capture: true });
+            document.addEventListener('pointerdown',  _onOutsidePointer, { capture: true });
+            window.addEventListener('scroll',         _scheduleReposition, { passive: true, capture: true });
+            window.addEventListener('resize',         _scheduleReposition, { passive: true });
+        }
+
+        // ── Close ─────────────────────────────────────────────────────────
+        function close(returnFocus = false) {
+            if (!_portalEl) return;
+
+            // Animate out
+            const dying = _portalEl;
+            dying.classList.remove('wa-msg-dropdown--open');
+            // Remove from DOM after transition ends. Guard against double-fire
+            // (transitionend fires per-property; setTimeout is the safety net).
+            let cleaned = false;
+            const cleanup = () => {
+                if (cleaned) return;
+                cleaned = true;
+                dying.remove();
+            };
+            // Only listen for opacity transition to avoid multi-fire (one event per property)
+            dying.addEventListener('transitionend', (e) => {
+                if (e.propertyName === 'opacity') cleanup();
+            }, { once: true });
+            setTimeout(cleanup, 280); // fallback if transition never fires
+
+            // Reset trigger state
+            if (_triggerBtn) {
+                _triggerBtn.setAttribute('aria-expanded', 'false');
+                const menuWrap = _triggerBtn.closest('.wa-msg-menu');
+                if (menuWrap) menuWrap.setAttribute('data-open', 'false');
+                if (returnFocus) _triggerBtn.focus({ preventScroll: true });
+            }
+
+            // Remove global listeners
+            document.removeEventListener('keydown',      _onKeydown,        { capture: true });
+            document.removeEventListener('pointerdown',  _onOutsidePointer, { capture: true });
+            window.removeEventListener('scroll',         _scheduleReposition, { capture: true });
+            window.removeEventListener('resize',         _scheduleReposition);
+            if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+
+            _portalEl   = null;
+            _triggerBtn = null;
+            _templateEl = null;
+            _focusIdx   = -1;
+            _items      = [];
+        }
+
+        // ── Touch long-press support ─────────────────────────────────────
+        // On touch devices where hover is unavailable, a long-press (500 ms) on
+        // a message bubble opens its action menu without requiring a visible button.
+        // This supplements the always-visible trigger button on touch devices.
+        let _lpTimer  = null;
+        let _lpTarget = null;
+
+        function _onTouchStart(e) {
+            const wrap = e.target.closest('.wa-msg-wrap');
+            if (!wrap) return;
+            // Don't intercept taps on interactive elements inside the bubble
+            if (e.target.closest('button, a, input, textarea, .wa-msg-menu')) return;
+            const btn = wrap.querySelector('.wa-msg-menu-btn');
+            if (!btn) return;
+            _lpTarget = btn;
+            _lpTimer  = setTimeout(() => {
+                if (_lpTarget) {
+                    // Provide haptic feedback where available
+                    if (navigator.vibrate) navigator.vibrate(40);
+                    open(_lpTarget);
+                }
+                _lpTimer  = null;
+                _lpTarget = null;
+            }, 500);
+        }
+
+        function _onTouchEnd() {
+            if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = null; }
+            _lpTarget = null;
+        }
+
+        // ── Public API ───────────────────────────────────────────────────
+        return { open, close, isOpen: () => !!_portalEl, onTouchStart: _onTouchStart, onTouchEnd: _onTouchEnd };
+    })();
+
+    // Expose close as closeAllDropdowns so existing call-sites work unchanged
+    function closeAllDropdowns() { MessageMenuController.close(false); }
+
+    // ── Shared message action handler ─────────────────────────────────────────
+    // Used by BOTH chatContainer delegation AND the body-level portal delegation.
+    // Returns true if the event was handled (caller should return/stop), false otherwise.
+    async function handleMessageAction(e) {
+        // Menu trigger button — open/toggle the portal menu
         const menuBtn = e.target.closest('.msg-menu-btn');
         if (menuBtn) {
             e.stopPropagation();
-            const dropdown = menuBtn.nextElementSibling;
-            if (!dropdown) return;
-            const wasHidden = dropdown.classList.contains('hidden');
-            closeAllDropdowns();
-            if (wasHidden) {
-                dropdown.classList.remove('hidden');
-                // FIX: position as fixed so the dropdown escapes the overflow-y:auto
-                // clipping context of #chat-messages. Without this, the dropdown is
-                // invisible when it extends above/below the visible scroll area.
-                const btnRect = menuBtn.getBoundingClientRect();
-                const isMe    = !!menuBtn.closest('.wa-msg-row--me');
-                const vpW     = window.innerWidth;
-                const dropW   = 220;
-                dropdown.style.position = 'fixed';
-                dropdown.style.top      = `${btnRect.bottom + 4}px`;
-                if (isMe || btnRect.right + dropW > vpW) {
-                    dropdown.style.right = `${vpW - btnRect.right}px`;
-                    dropdown.style.left  = 'auto';
-                } else {
-                    dropdown.style.left  = `${btnRect.left}px`;
-                    dropdown.style.right = 'auto';
-                }
-            }
-            return;
+            MessageMenuController.open(menuBtn);
+            return true;
         }
 
         const reactPill = e.target.closest('.wa-reaction-pill');
-        if (reactPill) { await toggleReaction(reactPill.dataset.msgId, reactPill.dataset.emoji); return; }
+        if (reactPill) { await toggleReaction(reactPill.dataset.msgId, reactPill.dataset.emoji); return true; }
 
         const reactBtn = e.target.closest('.msg-react-btn');
         if (reactBtn) {
             closeAllDropdowns();
-            await toggleReaction(reactBtn.dataset.msgId, reactBtn.dataset.emoji); return;
+            await toggleReaction(reactBtn.dataset.msgId, reactBtn.dataset.emoji); return true;
         }
 
         const retryBtn = e.target.closest('.msg-retry-btn,.wa-retry-btn');
-        if (retryBtn && activeRoomId) { await retrySend(retryBtn.dataset.msgId); return; }
+        if (retryBtn && activeRoomId) { await retrySend(retryBtn.dataset.msgId); return true; }
 
         const replyBtn = e.target.closest('.msg-reply-btn');
         if (replyBtn) {
@@ -3169,7 +3781,6 @@ export function setupChat() {
             if (msg) {
                 showReplyPreview(msg, chatHeader, input);
             } else {
-                // FIX #12: re-validate URLs read back from data-* attributes
                 showReplyPreview({
                     id: replyBtn.dataset.msgId,
                     text: replyBtn.dataset.text || '',
@@ -3181,16 +3792,14 @@ export function setupChat() {
                     fileName: replyBtn.dataset.filename || ''
                 }, chatHeader, input);
             }
-            return;
+            return true;
         }
 
-        // EXT: handle edit button
         const editBtn = e.target.closest('.msg-edit-btn');
         if (editBtn) {
             closeAllDropdowns();
             const msgId   = editBtn.dataset.msgId;
             const msgText = editBtn.dataset.text || '';
-            // Show an "Editing" bar the same way showReplyPreview shows a reply bar
             document.getElementById('wa-reply-preview')?.remove();
             const bar = document.createElement('div');
             bar.id = 'wa-reply-preview';
@@ -3216,97 +3825,422 @@ export function setupChat() {
             input.style.height = 'auto';
             input.style.height = Math.min(input.scrollHeight, 120) + 'px';
             input.focus();
-            return;
+            return true;
         }
 
         const fwdBtn = e.target.closest('.msg-forward-btn');
         if (fwdBtn) {
             closeAllDropdowns();
-            await openForwardModal(fwdBtn.dataset.msgId); return;
+            if (!requireAuth()) return true;
+            await openForwardModal(fwdBtn.dataset.msgId); return true;
+        }
+
+        // FIX: Replace media — allows a message owner to swap the attached image,
+        // video, or file for a new one. The Firestore doc is updated atomically;
+        // the old Cloudinary asset URL is written to _deletedMediaUrls so a Cloud
+        // Function can clean it up. Voice notes are intentionally excluded (audio
+        // replacement produces confusing UX; users should delete and re-record).
+        const replaceMediaBtn = e.target.closest('.msg-replace-media-btn');
+        if (replaceMediaBtn) {
+            closeAllDropdowns();
+            if (!requireAuth()) return true;
+            const replaceMsgId = replaceMediaBtn.dataset.msgId;
+            const msgToReplace = lastMessagesSnapshot.find(m => m.id === replaceMsgId);
+            if (!msgToReplace || msgToReplace.senderEmail !== currentUser.email) {
+                showToast('You can only replace your own media.', 'error');
+                return true;
+            }
+            // Derive the accept filter from the existing attachment type so the OS
+            // file picker shows only compatible formats.
+            const hasImage   = replaceMediaBtn.dataset.hasImage === 'true';
+            const oldMime    = replaceMediaBtn.dataset.fileMime || '';
+            const acceptType = hasImage ? 'image/*'
+                             : oldMime.startsWith('video/') ? 'video/*'
+                             : '*/*';
+
+            const replaceInput = getAttachInput(acceptType, 'chat-replace-media-input');
+            replaceInput.value = '';
+
+            // Use a one-shot change handler to avoid stacking listeners
+            const onReplaceChange = async (evt) => {
+                replaceInput.removeEventListener('change', onReplaceChange);
+                const newFile = evt.target.files?.[0];
+                replaceInput.value = '';
+                if (!newFile || !activeRoomId) return;
+                if (newFile.size > MAX_UPLOAD_BYTES) {
+                    showToast(`File too large (max 50 MB).`, 'error');
+                    return;
+                }
+                // Disable UI during upload
+                const savedPH = input.placeholder;
+                input.placeholder = 'Uploading replacement…';
+                input.disabled    = true;
+                sendBtn.disabled  = true;
+                if (attachBtn) attachBtn.disabled = true;
+                try {
+                    const fileToSend = newFile.type?.startsWith('image/')
+                        ? await compressImageFile(newFile)
+                        : newFile;
+                    const newUrl = await uploadBytesWithRetry(
+                        fileToSend, 'chats', null,
+                        fileToSend.name || `replace_${Date.now()}`
+                    );
+                    // Build update: null out the old field, set the new one, mark as edited
+                    const replaceUpdate = { edited: true, editedAt: serverTimestamp() };
+                    // Collect old URL for orphan cleanup
+                    const oldUrl = msgToReplace.imageUrl || msgToReplace.fileUrl;
+                    if (oldUrl) replaceUpdate._deletedMediaUrls = [oldUrl];
+
+                    if (hasImage) {
+                        replaceUpdate.imageUrl = newUrl;
+                    } else {
+                        replaceUpdate.fileUrl  = newUrl;
+                        replaceUpdate.fileName = newFile.name;
+                        replaceUpdate.fileMime = newFile.type;
+                        replaceUpdate.fileSize = newFile.size;
+                    }
+                    await updateDoc(
+                        doc(db, `chats/${activeRoomId}/messages`, replaceMsgId),
+                        replaceUpdate
+                    );
+                    showToast('Media replaced successfully!', 'success');
+                } catch (err) {
+                    console.error('[Chat] replace-media error:', err);
+                    showToast('Failed to replace media.', 'error');
+                } finally {
+                    input.placeholder = savedPH;
+                    input.disabled    = false;
+                    sendBtn.disabled  = false;
+                    if (attachBtn) attachBtn.disabled = false;
+                }
+            };
+            replaceInput.addEventListener('change', onReplaceChange);
+            replaceInput.click();
+            return true;
         }
 
         const starBtn = e.target.closest('.msg-star-btn');
         if (starBtn) {
             closeAllDropdowns();
+            if (!requireAuth()) return true;
             const msgId = starBtn.dataset.msgId;
             if (starredMessages.has(msgId)) { starredMessages.delete(msgId); showToast('Unstarred.'); }
             else { starredMessages.add(msgId); showToast('Message starred. ⭐'); }
-            // FIXED: persist starred messages in Firestore, not localStorage
             if (activeRoomId) {
                 setDoc(doc(db, `chats/${activeRoomId}/starred`, currentUser.email), {
                     ids: [...starredMessages], updatedAt: serverTimestamp()
                 }, { merge: true }).catch(() => {});
             }
-            renderMessages(); return;
+            renderMessages(); return true;
         }
 
         const pinBtn = e.target.closest('.msg-pin-btn');
         if (pinBtn) {
             closeAllDropdowns();
+            if (!requireAuth()) return true;
             const msgId = pinBtn.dataset.msgId;
-            // FIX: mutate in place
             const newPinned = [msgId, ...pinnedMessages.filter(id => id !== msgId)].slice(0, 3);
             pinnedMessages.splice(0, pinnedMessages.length, ...newPinned);
             renderPinnedBar(chatHeader);
-            try { await updateDoc(doc(db, 'chats', activeRoomId), { pinnedMessages }); } catch {}
-            showToast('Message pinned. 📌', 'success'); return;
+            try { await updateDoc(doc(db, 'chats', activeRoomId), { pinnedMessages }); } catch (err) { console.warn('[Chat] pin-sync error:', err); }
+            showToast('Message pinned. 📌', 'success'); return true;
+        }
+
+        // FIX UI: Unpin button — removes the message from the pinned list
+        const unpinBtn = e.target.closest('.msg-unpin-btn');
+        if (unpinBtn) {
+            closeAllDropdowns();
+            if (!requireAuth()) return true;
+            const msgId = unpinBtn.dataset.msgId;
+            const newPinned = pinnedMessages.filter(id => id !== msgId);
+            pinnedMessages.splice(0, pinnedMessages.length, ...newPinned);
+            renderPinnedBar(chatHeader);
+            try { await updateDoc(doc(db, 'chats', activeRoomId), { pinnedMessages }); } catch (err) { console.warn('[Chat] pin-sync error:', err); }
+            showToast('Message unpinned.', 'info'); return true;
         }
 
         const copyBtn = e.target.closest('.msg-copy-btn');
         if (copyBtn) {
             closeAllDropdowns();
-            try { await navigator.clipboard.writeText(copyBtn.dataset.text); showToast('Copied.', 'success'); }
-            catch { showToast('Copy failed.', 'error'); }
-            return;
+            // FIX: data-text is HTML-escaped for safe insertion — unescape back to raw text
+            // for clipboard so the user gets plain text, not &amp;, &#39; etc.
+            const rawText = copyBtn.dataset.text
+                .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+                .replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+            // FIX: use the raw message text from the snapshot when available — more reliable
+            // than the data attribute which may truncate very long messages.
+            const msgId  = copyBtn.dataset.msgId;
+            const snapMsg = lastMessagesSnapshot.find(m => m.id === msgId);
+            const textToCopy = snapMsg?.text ?? rawText;
+            try {
+                // navigator.clipboard requires HTTPS or localhost; fall back to execCommand on HTTP
+                if (navigator.clipboard?.writeText) {
+                    await navigator.clipboard.writeText(textToCopy);
+                } else {
+                    const ta = document.createElement('textarea');
+                    ta.value = textToCopy;
+                    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    ta.remove();
+                }
+                showToast('Copied.', 'success');
+            } catch (err) { console.error('[Chat] copy error:', err); showToast('Copy failed.', 'error'); }
+            return true;
+        }
+
+        // FIX UI: Download button — saves image/file/voice attachment to device
+        const downloadBtn = e.target.closest('.msg-download-btn');
+        if (downloadBtn) {
+            closeAllDropdowns();
+            // FIX SECURITY: validate URL through safeUrl() before fetching.
+            // dataset.url is a sanitized https:// value set at render time, but
+            // safeUrl() provides a final defence-in-depth check.
+            const rawUrl = downloadBtn.dataset.url;
+            const url    = safeUrl(rawUrl);
+            const filename = downloadBtn.dataset.filename || 'download';
+            if (!url) { showToast('No valid file to download.', 'error'); return true; }
+            try {
+                // Fetch as blob so the browser triggers a Save dialog rather than navigating
+                showToast('Preparing download…', 'info');
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error('fetch failed');
+                const blob = await resp.blob();
+                const objUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = objUrl; a.download = filename;
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+                showToast('Download started.', 'success');
+            } catch (err) {
+                console.warn('[Chat] download-blob error (falling back to new tab):', err);
+                // Fallback: open in a new tab if fetch/blob fails (cross-origin restriction)
+                window.open(url, '_blank', 'noopener,noreferrer');
+            }
+            return true;
+        }
+
+        const reportBtn = e.target.closest('.msg-report-btn');
+        if (reportBtn) {
+            closeAllDropdowns();
+            if (!requireAuth()) return true;
+            const msgId = reportBtn.dataset.msgId;
+            const ok = await showConfirm({
+                title: 'Report this message?',
+                body: 'This message will be flagged for review. The sender will not be notified.',
+                confirmLabel: 'Report', tone: 'danger'
+            });
+            if (ok && activeRoomId) {
+                try {
+                    // FIX SCHEMA: Firestore rule checks request.resource.data.reporterEmail
+                    // and status == 'pending'. The old payload used 'reportedBy' (no status)
+                    // → permission-denied on every report submit. Align with the rule schema.
+                    await addDoc(collection(db, 'reports'), {
+                        msgId,
+                        roomId:        activeRoomId,
+                        reporterEmail: currentUser.email,  // field the rule checks
+                        reportedAt:    serverTimestamp(),
+                        status:        'pending'           // required by create rule
+                    });
+                    showToast('Message reported.', 'success');
+                } catch (err) { console.error('[Chat] report error:', err); showToast('Report failed.', 'error'); }
+            }
+            return true;
         }
 
         const delMeBtn = e.target.closest('.msg-delete-me-btn');
         if (delMeBtn && activeRoomId) {
+            // FIX #2: Capture msgId and roomId BEFORE closeAllDropdowns() removes
+            // the portal element from the DOM. The element reference stays valid in
+            // memory but reading from a detached node is fragile — capture early.
+            const _delMeMsgId  = delMeBtn.dataset.msgId;
+            const _delMeRoomId = activeRoomId;
             closeAllDropdowns();
+            // FIX AUTH-GUARD: verify authentication before writing
+            if (!requireAuth()) return true;
+            // FIX #2: Confirm before deleting so users don't lose messages accidentally.
+            // "Delete for me" is irreversible from their perspective even though the data
+            // remains visible to others — a confirmation prevents accidental taps.
+            const ok = await showConfirm({
+                title: 'Delete for me?',
+                body: 'This message will be removed from your view. Other participants will still see it.',
+                confirmLabel: 'Delete',
+                tone: 'danger'
+            });
+            if (!ok) return true;
             try {
-                await updateDoc(doc(db, `chats/${activeRoomId}/messages`, delMeBtn.dataset.msgId), {
+                await updateDoc(doc(db, `chats/${_delMeRoomId}/messages`, _delMeMsgId), {
                     deletedFor: arrayUnion(currentUser.email)
                 });
-            } catch { showToast('Failed to delete.', 'error'); }
-            return;
+            } catch (err) {
+                // FIX #6: Log actual error so permission-denied / network issues are visible in devtools.
+                console.error('[Chat] delete-for-me error:', err);
+                showToast('Failed to delete.', 'error');
+            }
+            return true;
         }
 
         const delEveryoneBtn = e.target.closest('.msg-delete-everyone-btn');
         if (delEveryoneBtn && activeRoomId) {
+            // FIX #3: Capture all required data BEFORE closeAllDropdowns() removes the
+            // portal from the DOM. The dataset is still readable on detached nodes, but
+            // capturing early is safer and makes the intent explicit.
+            const msgId          = delEveryoneBtn.dataset.msgId;
+            const capturedRoomId = activeRoomId;    // snapshot before any async
+            const roomDetails    = activeRoomDetails; // snapshot before any async
+
             closeAllDropdowns();
+
+            // FIX AUTH-GUARD + OWNERSHIP: verify auth and that this message belongs to
+            // the current user. The button is rendered only for isMe messages, but a
+            // direct DOM manipulation or race could trigger this handler for another
+            // user's message. The Firestore rule also enforces this, but client-side
+            // verification provides defense-in-depth and a better UX error message.
+            if (!requireAuth()) return true;
+
+            const msgToDelete = lastMessagesSnapshot.find(m => m.id === msgId);
+            if (!msgToDelete || msgToDelete.senderEmail !== currentUser.email) {
+                showToast('You can only delete your own messages.', 'error');
+                return true;
+            }
+
+            // FIX #4: Re-validate the 60-minute window at handler time, not just at
+            // render time. The dropdown template bakes the IIFE result in at render
+            // time, so a message rendered while inside the window still shows an
+            // enabled button even after 60 minutes have elapsed without re-render.
+            // This handler-level check is the authoritative gate.
+            const sentMs = msgToDelete.createdAt?.toDate?.()?.getTime?.() || Date.now();
+            if (Date.now() - sentMs >= 60 * 60 * 1000) {
+                showToast('You can only delete for everyone within 60 minutes of sending.', 'error');
+                return true;
+            }
+
             const ok = await showConfirm({
                 title: 'Delete for everyone?',
-                body: 'This message will be removed for all participants.',
+                body: 'This message will be removed for all participants and cannot be undone.',
                 confirmLabel: 'Delete', tone: 'danger'
             });
-            if (!ok) return;
-            try {
-                await updateDoc(doc(db, `chats/${activeRoomId}/messages`, delEveryoneBtn.dataset.msgId), {
-                    isDeletedForEveryone: true, text: null, imageUrl: null, voiceUrl: null, fileUrl: null
-                });
-                // AFTER — bump all members EXCEPT the sender
-                const roomDetails = activeRoomDetails;
-                const roomMembers = roomDetails?.type === 'group'
-                    ? [] // groups: let recipients track via lastRead diff (server-side rules or Cloud Functions handle per-member counters)
-                    : [roomDetails?.targetEmail].filter(Boolean);
+            if (!ok) return true;
 
-                // FIX: `roomId` was undefined here — use `activeRoomId`
-                const _delRoomId = activeRoomId;
+            try {
+                // FIX ORPHANED-ASSETS: collect media URLs before nulling so a future
+                // Cloud Function (triggered on _deletedMediaUrls writes) can clean them
+                // from Cloudinary. Client-side deletion is impossible — Cloudinary's
+                // destroy API requires a signed request using the API secret which must
+                // never be exposed in browser code.
+                const orphanedUrls = [
+                    msgToDelete.imageUrl,
+                    msgToDelete.voiceUrl,
+                    msgToDelete.fileUrl
+                ].filter(Boolean);
+
+                const deleteUpdate = {
+                    isDeletedForEveryone: true,
+                    text: null, imageUrl: null, voiceUrl: null, fileUrl: null,
+                    fileName: null, fileMime: null, fileSize: null
+                };
+                // Store orphaned URLs on the document for server-side cleanup.
+                // A Cloud Function watching for _deletedMediaUrls can call
+                // Cloudinary's authenticated destroy endpoint to free the storage.
+                if (orphanedUrls.length) {
+                    deleteUpdate._deletedMediaUrls = orphanedUrls;
+                }
+
+                // FIX #5: Use writeBatch so the message update and the room metadata
+                // update are committed atomically. Previously two sequential `await`
+                // calls meant: if the first succeeded but the second failed, the message
+                // was marked deleted but the room sidebar showed stale last-message text,
+                // and the catch block fired "Failed to delete." even though the message
+                // WAS actually deleted — a misleading error that confused users into
+                // thinking deletion had failed entirely.
+                const batch = writeBatch(db);
+
+                batch.update(
+                    doc(db, `chats/${capturedRoomId}/messages`, msgId),
+                    deleteUpdate
+                );
+
+                // Bump unread for recipients so they see the deletion event
+                const roomMembers = roomDetails?.type === 'group'
+                    ? []   // group: skip unread bump on deletion (avoid noise)
+                    : [roomDetails?.targetEmail].filter(Boolean);
                 const unreadBump = {};
-                for (const e of roomMembers) {
-                    if (e && e !== currentUser.email) {
-                        unreadBump[`unreadCount.${e}`] = increment(1);
+                for (const em of roomMembers) {
+                    if (em && em !== currentUser.email) {
+                        unreadBump[`unreadCount.${em}`] = increment(1);
                     }
                 }
-                await setDoc(doc(db, 'chats', _delRoomId), {
+                batch.set(doc(db, 'chats', capturedRoomId), {
                     lastMessage: '', lastSenderEmail: currentUser.email,
                     lastUpdated: serverTimestamp(),
                     [`unreadCount.${currentUser.email}`]: 0,
                     ...unreadBump
                 }, { merge: true });
-            } catch { showToast('Failed to delete.', 'error'); }
-            return;
+
+                await batch.commit();
+            } catch (err) {
+                // FIX #6: Log actual error so permission-denied / network issues are
+                // visible in devtools. The original `catch {}` silently swallowed
+                // everything, making it impossible to diagnose why deletion failed.
+                console.error('[Chat] delete-for-everyone error:', err);
+                showToast('Failed to delete.', 'error');
+            }
+            return true;
         }
+
+        return false; // event not handled
+    }
+
+    // FIX DUPLICATE-LISTENER: point the module-level reference at THIS session's
+    // handleMessageAction so the once-registered body listener always dispatches
+    // through the correct closure (e.g. the right activeRoomId, currentUser, etc.).
+    _globalPortalClickHandler = handleMessageAction;
+
+    // ── Touch long-press for message menus ───────────────────────────────────
+    // Attach to chatContainer so it only fires inside the message list.
+    chatContainer?.addEventListener('touchstart', MessageMenuController.onTouchStart, { passive: true });
+    chatContainer?.addEventListener('touchend',   MessageMenuController.onTouchEnd,   { passive: true });
+    chatContainer?.addEventListener('touchmove',  MessageMenuController.onTouchEnd,   { passive: true });
+    chatContainer?.addEventListener('touchcancel',MessageMenuController.onTouchEnd,   { passive: true });
+
+    // ── Body-level delegation for PORTALED dropdown items ─────────────────────
+    // When MessageMenuController portals a dropdown to <body>, its items are no
+    // longer inside #chat-messages, so chatContainer's click listener never fires.
+    // This body listener catches those clicks.
+    //
+    // FIX PORTAL-LISTENER: Previously guarded by _globalListenersSetup, which is
+    // set to true EARLIER in the same setupChat() call (for the auth observers).
+    // By the time we reached this block, the flag was already true → the body
+    // listener was NEVER registered and all portaled dropdown actions (delete,
+    // star, pin, forward, etc.) silently did nothing.
+    // Now uses _portalListenerSetup which is only flipped here, ensuring the
+    // handler is registered exactly once across all setupChat() calls.
+    if (!_portalListenerSetup) {
+        _portalListenerSetup = true;
+        document.body.addEventListener('click', async e => {
+            // Only handle clicks that came from inside a portaled .wa-msg-dropdown
+            if (!e.target.closest('.wa-msg-dropdown')) return;
+            // Route through the module-level handler reference so the correct
+            // setupChat() closure (for the current session) always handles the event.
+            if (typeof _globalPortalClickHandler === 'function') {
+                await _globalPortalClickHandler(e);
+            }
+        });
+    }
+
+    // ── Message click delegation (inside #chat-messages) ──────────────────────
+    // NOTE: Portal (body-level) item clicks are handled by the body listener above.
+    chatContainer?.addEventListener('click', async e => {
+        // Any click outside a menu trigger/portal closes the menu
+        if (!e.target.closest('.wa-msg-menu') && !e.target.closest('.wa-msg-dropdown')) {
+            closeAllDropdowns();
+        }
+
+        // Delegate to shared handler — returns true if handled
+        if (await handleMessageAction(e)) return;
+
+        // ── Non-menu interactions that only exist in the chat scroll area ──
 
         const imgEl = e.target.closest('.msg-image, .wa-msg-image');
         if (imgEl) { openLightbox(imgEl.dataset.full || imgEl.src); return; }
@@ -3423,7 +4357,7 @@ export function setupChat() {
                 resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn);
                 showToast('You left the group.', 'success');
                 document.getElementById('btn-show-recent')?.click();
-            } catch { showToast('Failed to leave.', 'error'); }
+            } catch (err) { console.error('[Chat] leave-group error:', err); showToast('Failed to leave.', 'error'); }
             return;
         }
 
@@ -3438,6 +4372,7 @@ export function setupChat() {
         if (e.target.id === 'chat-action-clear') {
             document.getElementById('chat-header-dropdown') &&
                 (document.getElementById('chat-header-dropdown').style.display = 'none');
+            if (!requireAuth()) return;
             const ok = await showConfirm({
                 title: 'Clear chat?',
                 body: 'All messages will be cleared for you only.',
@@ -3460,13 +4395,14 @@ export function setupChat() {
                 lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
                 renderMessages();
                 showToast('Chat cleared.', 'success');
-            } catch { showToast('Failed to clear chat.', 'error'); }
+            } catch (err) { console.error('[Chat] clear-chat error:', err); showToast('Failed to clear chat.', 'error'); }
             return;
         }
 
         if (e.target.id === 'chat-action-delete') {
             document.getElementById('chat-header-dropdown') &&
                 (document.getElementById('chat-header-dropdown').style.display = 'none');
+            if (!requireAuth()) return;
             const ok = await showConfirm({
                 title: 'Delete chat?',
                 body: 'All messages will be permanently removed. This cannot be undone.',
@@ -3487,7 +4423,7 @@ export function setupChat() {
                 await deleteDoc(doc(db, 'chats', roomIdToDelete));
                 resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn);
                 showToast('Chat deleted.', 'success');
-            } catch { showToast('Failed to delete chat.', 'error'); }
+            } catch (err) { console.error('[Chat] delete-chat error:', err); showToast('Failed to delete chat.', 'error'); }
             return;
         }
 
@@ -3508,7 +4444,7 @@ export function setupChat() {
                     blockedBy: isUnblocking ? arrayRemove(currentUser.email) : arrayUnion(currentUser.email)
                 });
                 showToast(isUnblocking ? 'User unblocked.' : 'User blocked.', 'success');
-            } catch { showToast('Failed to update block status.', 'error'); }
+            } catch (err) { console.error('[Chat] block-status error:', err); showToast('Failed to update block status.', 'error'); }
             return;
         }
 
@@ -3574,7 +4510,7 @@ export function setupChat() {
     let optimisticCounter = 0;
 
     async function sendTextMessage(text) {
-        if (!text || !activeRoomId || !activeRoomDetails) return;
+        if (!text || !activeRoomId || !activeRoomDetails || !currentUser?.email) return;
         const roomId      = activeRoomId;
         // FIX: snapshot all room context before the first await — if the user switches
         // rooms mid-send, activeRoomId/activeRoomDetails will have changed by the time
@@ -3650,6 +4586,8 @@ export function setupChat() {
     }
 
     async function retrySend(tempId) {
+        // FIX AUTH-GUARD: user may have signed out while message was in failed state
+        if (!requireAuth()) return;
         const t = lastMessagesSnapshot.find(m => m.id === tempId);
         if (!t) return;
         // FIX #1: mutate in-place
@@ -3667,6 +4605,24 @@ export function setupChat() {
         // EXT: if in edit mode, update the existing message instead of sending new
         if (editingMsgId) {
             const idToEdit = editingMsgId;
+            // FIX AUTH-GUARD + OWNERSHIP: verify auth and message ownership before sending
+            // the edit. editingMsgId is set via the dropdown button which checks isMe at
+            // render time, but a room-switch or re-render between click and commit could
+            // leave a stale editingMsgId pointing at a different user's message.
+            if (!requireAuth()) {
+                editingMsgId = null;
+                document.getElementById('wa-reply-preview')?.remove();
+                input.value = ''; input.style.height = 'auto';
+                return;
+            }
+            const msgToEdit = lastMessagesSnapshot.find(m => m.id === idToEdit);
+            if (!msgToEdit || msgToEdit.senderEmail !== currentUser.email) {
+                showToast('You can only edit your own messages.', 'error');
+                editingMsgId = null;
+                document.getElementById('wa-reply-preview')?.remove();
+                input.value = ''; input.style.height = 'auto';
+                return;
+            }
             editingMsgId   = null;
             document.getElementById('wa-reply-preview')?.remove();
             input.value        = '';
@@ -3679,7 +4635,7 @@ export function setupChat() {
                     text, edited: true, editedAt: serverTimestamp()
                 });
                 showToast('Message edited.', 'success');
-            } catch { showToast('Failed to edit message.', 'error'); }
+            } catch (err) { console.error('[Chat] edit-message error:', err); showToast('Failed to edit message.', 'error'); }
             return;
         }
         if (!activeRoomId) return;
@@ -3758,7 +4714,9 @@ export function setupChat() {
     // FIXED: sendMediaFile is intentionally single-file; multi-file callers use sendFilesSequentially.
     // Progress bar is re-created per file so sequential uploads each show their own progress.
     async function sendMediaFile(file) {
-        if (!file || !activeRoomId) return;
+        // FIX AUTH-GUARD: re-verify auth at send time — token may have expired since the
+        // attach button was clicked (e.g. long compression step on a large image).
+        if (!file || !activeRoomId || !requireAuth()) return;
         if (file.size > MAX_UPLOAD_BYTES) {
             showToast(`"${file.name}" is too large (max 50 MB).`, 'error');
             return;
@@ -3923,6 +4881,8 @@ export function setupChat() {
 
     // ── Voice recording ──────────────────────────
     async function startVoiceRecording() {
+        // FIX AUTH-GUARD: bail early if no authenticated user
+        if (!requireAuth()) return;
         if (isRecording) { stopAndSendRecording(); return; }
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -4106,14 +5066,14 @@ export function setupChat() {
     }
 
     document.getElementById('wa-mic-btn')?.addEventListener('click', () => {
-        if (!activeRoomId) return;
+        if (!activeRoomId || !requireAuth()) return;
         if (isRecording) stopAndSendRecording();
         else startVoiceRecording();
     });
 
     // ── Reactions ────────────────────────────────
     async function toggleReaction(msgId, emoji) {
-        if (!activeRoomId) return;
+        if (!activeRoomId || !requireAuth()) return;
         const ref = doc(db, `chats/${activeRoomId}/messages`, msgId);
         try {
             const snap = await getDoc(ref);
@@ -4125,7 +5085,7 @@ export function setupChat() {
                     ? arrayRemove(currentUser.email)
                     : arrayUnion(currentUser.email)
             });
-        } catch { showToast('Failed to react.', 'error'); }
+        } catch (err) { console.error('[Chat] react error:', err); showToast('Failed to react.', 'error'); }
     }
 
     // ── Members panel (multi-admin, add member, pending requests, invite link) ──
@@ -4286,10 +5246,10 @@ export function setupChat() {
                                 showToast(`${newName} added to group!`, 'success');
                                 closeAdd();
                                 close2();
-                            } catch { showToast('Failed to add member.', 'error'); }
+                            } catch (err) { console.error('[Chat] add-member error:', err); showToast('Failed to add member.', 'error'); }
                         });
                     });
-                } catch { showToast('Failed to load users.', 'error'); }
+                } catch (err) { console.error('[Chat] load-users error:', err); showToast('Failed to load users.', 'error'); }
             });
 
             // Admin toggle buttons
@@ -4312,7 +5272,7 @@ export function setupChat() {
                         showToast(wasAdmin ? 'Admin removed.' : 'Admin added!', 'success');
                         close2();
                         setTimeout(() => openMembersPanel(), 150);
-                    } catch { showToast('Failed to update admin.', 'error'); }
+                    } catch (err) { console.error('[Chat] update-admin error:', err); showToast('Failed to update admin.', 'error'); }
                 });
             });
 
@@ -4340,7 +5300,7 @@ export function setupChat() {
                         });
                         showToast('Member removed.', 'success');
                         close2();
-                    } catch { showToast('Failed to remove member.', 'error'); }
+                    } catch (err) { console.error('[Chat] remove-member error:', err); showToast('Failed to remove member.', 'error'); }
                 });
             });
 
@@ -4413,7 +5373,7 @@ export function setupChat() {
                             });
                             showToast(`${rawName} approved!`, 'success');
                             close2();
-                        } catch { showToast('Failed to approve.', 'error'); }
+                        } catch (err) { console.error('[Chat] approve-request error:', err); showToast('Failed to approve.', 'error'); }
                     });
                 });
 
@@ -4442,7 +5402,7 @@ export function setupChat() {
                             });
                             showToast('Request dismissed for 24 hours.', 'info');
                             close2();
-                        } catch { showToast('Failed to dismiss.', 'error'); }
+                        } catch (err) { console.error('[Chat] dismiss-request error:', err); showToast('Failed to dismiss.', 'error'); }
                     });
                 });
 
@@ -4462,7 +5422,7 @@ export function setupChat() {
                             });
                             showToast('Request denied.', 'info');
                             close2();
-                        } catch { showToast('Failed to deny.', 'error'); }
+                        } catch (err) { console.error('[Chat] deny-request error:', err); showToast('Failed to deny.', 'error'); }
                     });
                 });
             }
@@ -4496,11 +5456,11 @@ export function setupChat() {
 
             document.getElementById('copy-invite-code')?.addEventListener('click', async () => {
                 try { await navigator.clipboard.writeText(inviteCode); showToast('Code copied!', 'success'); }
-                catch { showToast('Copy failed.', 'error'); }
+                catch (err) { console.error('[Chat] copy error:', err); showToast('Copy failed.', 'error'); }
             });
             document.getElementById('copy-invite-link')?.addEventListener('click', async () => {
                 try { await navigator.clipboard.writeText(inviteLink); showToast('Link copied!', 'success'); }
-                catch { showToast('Copy failed.', 'error'); }
+                catch (err) { console.error('[Chat] copy-invite-link error:', err); showToast('Copy failed.', 'error'); }
             });
             document.getElementById('regen-invite-code')?.addEventListener('click', async () => {
                 const ok = await showConfirm({
@@ -4519,7 +5479,7 @@ export function setupChat() {
                     showToast('New invite code generated!', 'success');
                     close2();
                     setTimeout(() => openMembersPanel(), 150);
-                } catch { showToast('Failed to regenerate code.', 'error'); }
+                } catch (err) { console.error('[Chat] regen-code error:', err); showToast('Failed to regenerate code.', 'error'); }
             });
             }, err => {
                 console.error('[Chat] members panel:', err);
