@@ -1086,32 +1086,9 @@ function ensureChatStyles() {
             border-radius: 20px;
             border: 1px solid var(--wa-border);
             box-shadow: var(--wa-shadow-lg);
-            overflow: clip;
+            overflow: clip; /* FIX Bug 1: was overflow:hidden which clipped absolutely-positioned dropdowns (forward/delete/pin). overflow:clip preserves the border-radius crop on layout content without creating a new clipping rect for absolute descendants. */
             height: 100%;
             display: flex;
-        }
-
-        /* ═══ Mobile layout — full-screen panels ═══ */
-        @media (max-width: 639px) {
-            #page-chat { padding: 0 !important; }
-            #page-chat .max-w-6xl { height: 100dvh; min-height: 0; }
-            #page-chat > div > div {
-                border-radius: 0;
-                border: none;
-                box-shadow: none;
-            }
-            /* Sidebar fills full width on mobile */
-            #chat-sidebar {
-                width: 100% !important;
-                flex-shrink: 0;
-            }
-            /* Chat window fills full width when visible on mobile */
-            #chat-window {
-                width: 100% !important;
-                flex-shrink: 0;
-            }
-            /* Back button visible on mobile only */
-            #chat-back-btn { display: flex !important; }
         }
 
         /* ═══ Sidebar ═══ */
@@ -2511,40 +2488,6 @@ function renderMessages() {
 export function setupChat() {
     ensureChatStyles();
 
-    // ── Mobile panel switching ───────────────────
-    // On mobile, sidebar and chat window are full-screen panels that slide between.
-    // On sm+ (≥640px) both are visible side-by-side (standard desktop layout).
-    function showChatPanel() {
-        const sidebar   = document.getElementById('chat-sidebar');
-        const chatWin   = document.getElementById('chat-window');
-        if (!sidebar || !chatWin) return;
-        const isMobile  = window.innerWidth < 640;
-        if (isMobile) {
-            sidebar.classList.add('hidden');
-            chatWin.classList.remove('hidden');
-            chatWin.classList.add('flex');
-        }
-    }
-    function showSidebarPanel() {
-        const sidebar   = document.getElementById('chat-sidebar');
-        const chatWin   = document.getElementById('chat-window');
-        if (!sidebar || !chatWin) return;
-        const isMobile  = window.innerWidth < 640;
-        if (isMobile) {
-            chatWin.classList.add('hidden');
-            chatWin.classList.remove('flex');
-            sidebar.classList.remove('hidden');
-        }
-    }
-
-    // Back button — always present in DOM, visible only on mobile via sm:hidden
-    document.getElementById('chat-back-btn')?.addEventListener('click', () => {
-        showSidebarPanel();
-        // Deselect active sidebar item
-        document.querySelectorAll('.wa-sidebar-item--active').forEach(el =>
-            el.classList.remove('wa-sidebar-item--active'));
-    });
-
     const recentList         = document.getElementById('chat-recent-list');
     const usersListContainer = document.getElementById('chat-users-list');
     const usersListContent   = document.getElementById('chat-users-list-content');
@@ -3290,9 +3233,6 @@ export function setupChat() {
                 return;
             }
         }
-
-        // Switch to chat panel on mobile (hides sidebar, shows message window)
-        showChatPanel();
 
         markRoomRead(activeRoomId); // FIX: markRoomRead already calls _recomputeNavBadge — removed duplicate call
         subscribeTypingIndicator(activeRoomId, chatType);
