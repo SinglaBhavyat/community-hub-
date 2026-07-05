@@ -375,6 +375,15 @@ export function teardownChat() {
     delete window.startDirectChat;
     const chatContainer = document.getElementById('chat-messages');
     if (chatContainer) delete chatContainer.dataset.chatWired;
+
+    // MOBILE: reset to list view and remove injected back button
+    _mobileShowList();
+    document.getElementById('chat-mobile-back-btn')?.remove();
+    // Clear any dangling conversation history state so back button
+    // doesn't re-enter a closed conversation.
+    if (history.state?.chatView === 'conversation') {
+        history.replaceState(null, '');
+    }
 }
 
 function formatRelativeTime(ts) {
@@ -472,6 +481,11 @@ function resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn) {
     input.placeholder = 'Select a chat to start messaging';
     sendBtn.disabled  = true;
     if (attachBtn) attachBtn.disabled = true;
+
+    // MOBILE: return to list view whenever the chat panel is reset
+    // (e.g. leave group, delete chat). _mobileShowList is a no-op on desktop.
+    _mobileShowList();
+    document.getElementById('chat-mobile-back-btn')?.remove();
 }
 
 // ─────────────────────────────────────────────
@@ -1937,7 +1951,362 @@ function ensureChatStyles() {
             .wa-msg-row, .wa-typing-dots span, #wa-mic-btn.recording { animation: none !important; }
         }
     `;
+    // ═══ MOBILE-FIRST RESPONSIVE CHAT ═══════════════════════════════
+    // On narrow viewports the sidebar and conversation panel stack as
+    // two exclusive "views" that slide in/out. The CSS uses a
+    // data-mobile-view attribute on the #page-chat wrapper to control
+    // which panel is visible. JS drives the attribute; CSS is purely
+    // presentational. This keeps all logic in one place and avoids
+    // fighting Tailwind's sm: breakpoints.
+    //
+    // Breakpoint: < 640px (sm) — matches Tailwind's "sm" prefix.
+    // Above 640px: classic side-by-side layout restored.
+    const mobileCss = document.createElement('style');
+    mobileCss.id = 'chat-mobile-styles';
+    mobileCss.textContent = `
+        /* ─── Mobile layout foundation ─── */
+        @media (max-width: 639px) {
+            /* Override page padding so chat fills screen edge-to-edge */
+            #page-chat {
+                padding-top: 8px !important;
+                padding-bottom: 8px !important;
+                padding-left: 0 !important;
+                padding-right: 0 !important;
+            }
+            #page-chat .max-w-6xl {
+                height: calc(100dvh - 120px);
+                min-height: 0;
+                padding: 0;
+            }
+            /* The outer card: remove rounded corners and shadow on mobile so
+               it feels like a native full-screen shell */
+            #page-chat > div > div {
+                border-radius: 12px !important;
+                box-shadow: var(--wa-shadow) !important;
+                overflow: hidden !important;
+                /* Switch from flex-row to a stacked single-panel layout */
+                display: block !important;
+                position: relative;
+            }
+
+            /* ─── Sidebar panel ─── */
+            #page-chat .sm\\:w-80 {
+                position: absolute !important;
+                inset: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 10;
+                /* Slide-in/out via translateX */
+                transform: translateX(0);
+                transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1),
+                            visibility 0ms linear 0ms;
+                visibility: visible;
+                will-change: transform;
+                /* Contain inner scroll */
+                overflow: hidden;
+                display: flex !important;
+                flex-direction: column !important;
+            }
+
+            /* When conversation is active, slide sidebar out to the left */
+            #page-chat[data-mobile-view="conversation"] .sm\\:w-80 {
+                transform: translateX(-100%);
+                visibility: hidden;
+                transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1),
+                            visibility 0ms linear 280ms;
+                pointer-events: none;
+            }
+
+            /* ─── Chat window panel ─── */
+            #chat-window {
+                position: absolute !important;
+                inset: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 20;
+                display: flex !important;
+                flex-direction: column !important;
+                /* Start off-screen to the right */
+                transform: translateX(100%);
+                transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1),
+                            visibility 0ms linear 0ms;
+                visibility: hidden;
+                will-change: transform;
+                pointer-events: none;
+            }
+
+            /* When conversation is active, slide chat window in from the right */
+            #page-chat[data-mobile-view="conversation"] #chat-window {
+                transform: translateX(0);
+                visibility: visible;
+                pointer-events: auto;
+                transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1),
+                            visibility 0ms linear 0ms;
+            }
+
+            /* ─── Back button (mobile only) ─── */
+            #chat-mobile-back-btn {
+                display: flex !important;
+                align-items: center;
+                justify-content: center;
+                width: 36px; height: 36px;
+                border-radius: 10px;
+                border: none;
+                background: transparent;
+                color: var(--wa-sub);
+                cursor: pointer;
+                flex-shrink: 0;
+                transition: background 0.15s, color 0.15s;
+                -webkit-tap-highlight-color: transparent;
+                touch-action: manipulation;
+                margin-right: 4px;
+            }
+            #chat-mobile-back-btn:active {
+                background: var(--wa-input-bg);
+                color: var(--wa-text);
+            }
+
+            /* ─── Message area fills available height on mobile ─── */
+            #chat-messages {
+                padding: 12px 12px 8px !important;
+                /* Use dynamic viewport height to account for iOS keyboard */
+                flex: 1 1 0% !important;
+                min-height: 0 !important;
+            }
+
+            /* ─── Input bar: prevent zoom on iOS by ensuring font ≥ 16px ─── */
+            #chat-message-input {
+                font-size: 16px !important;
+            }
+
+            /* ─── Reduce message bubble width on narrow screens ─── */
+            .wa-msg-row {
+                max-width: 88% !important;
+            }
+
+            /* ─── Sidebar items: slightly more touch-friendly ─── */
+            .wa-sidebar-item {
+                padding: 13px 14px !important;
+            }
+
+            /* ─── Attach menu: anchor to bottom of viewport on mobile ─── */
+            #wa-attach-menu {
+                position: fixed !important;
+                bottom: 80px !important;
+                left: 12px !important;
+                right: 12px !important;
+                min-width: 0 !important;
+            }
+
+            /* ─── Emoji picker: full-width on mobile ─── */
+            #wa-emoji-picker {
+                position: fixed !important;
+                bottom: 80px !important;
+                left: 8px !important;
+                right: 8px !important;
+                grid-template-columns: repeat(8, 1fr) !important;
+                max-height: 180px !important;
+                overflow-y: auto !important;
+            }
+
+            /* ─── Message context menu: max-width on very narrow screens ─── */
+            .wa-msg-dropdown {
+                max-width: min(96vw, 288px) !important;
+            }
+
+            /* ─── Upload progress: fixed on mobile ─── */
+            #wa-attach-progress {
+                position: fixed !important;
+                bottom: 80px !important;
+                left: 12px !important;
+                right: 12px !important;
+                transform: none !important;
+            }
+
+            /* ─── Recording bar: make it larger for touch ─── */
+            #wa-recording-bar {
+                padding: 12px 14px !important;
+            }
+
+            /* ─── Modals: full screen on very small devices ─── */
+            #advanced-group-modal > div,
+            #chat-members-modal > div,
+            #wa-forward-modal > div,
+            #wa-starred-modal > div {
+                max-width: 100% !important;
+                max-height: 92dvh !important;
+                border-radius: 16px 16px 0 0 !important;
+                position: fixed !important;
+                bottom: 0 !important;
+                left: 0 !important;
+                right: 0 !important;
+                top: auto !important;
+            }
+            #advanced-group-modal,
+            #chat-members-modal,
+            #wa-forward-modal,
+            #wa-starred-modal {
+                align-items: flex-end !important;
+            }
+
+            /* ─── Message menu trigger: slightly bigger touch target ─── */
+            .wa-msg-menu-btn {
+                width: 36px !important;
+                height: 36px !important;
+            }
+
+            /* Ensure active sidebar item unread badges don't overflow */
+            .wa-badge { font-size: 10px !important; min-width: 18px !important; height: 18px !important; }
+        }
+
+        /* ─── Tablet: 640-767px — side-by-side but narrower sidebar ─── */
+        @media (min-width: 640px) and (max-width: 767px) {
+            #page-chat .sm\\:w-80 {
+                width: 260px !important;
+                min-width: 200px;
+            }
+            #page-chat > div > div { border-radius: 14px !important; }
+
+            /* Hide mobile back button on tablet+ */
+            #chat-mobile-back-btn { display: none !important; }
+        }
+
+        /* ─── Desktop: 768px+ — back button never shown ─── */
+        @media (min-width: 768px) {
+            #chat-mobile-back-btn { display: none !important; }
+
+            /* Restore full side-by-side layout */
+            #page-chat .sm\\:w-80 {
+                position: relative !important;
+                transform: none !important;
+                visibility: visible !important;
+                pointer-events: auto !important;
+                width: 320px !important;
+            }
+            #chat-window {
+                position: relative !important;
+                transform: none !important;
+                visibility: visible !important;
+                pointer-events: auto !important;
+            }
+        }
+
+        /* ─── Safe area insets for PWA / iOS notch ─── */
+        @supports (padding-bottom: env(safe-area-inset-bottom)) {
+            @media (max-width: 639px) {
+                #chat-message-form {
+                    padding-bottom: calc(10px + env(safe-area-inset-bottom)) !important;
+                }
+            }
+        }
+
+        /* ─── Orientation change: recalculate heights instantly ─── */
+        @media (orientation: landscape) and (max-width: 900px) {
+            #page-chat .max-w-6xl {
+                height: calc(100dvh - 80px) !important;
+            }
+            #chat-messages {
+                padding: 8px 12px 4px !important;
+            }
+        }
+
+        /* ─── Reduced motion: skip slide animation, fade instead ─── */
+        @media (prefers-reduced-motion: reduce) {
+            #page-chat .sm\\:w-80,
+            #chat-window {
+                transition: opacity 0.15s linear, visibility 0ms linear 0ms !important;
+                transform: none !important;
+            }
+            #page-chat[data-mobile-view="conversation"] .sm\\:w-80 {
+                opacity: 0 !important;
+                transition: opacity 0.15s linear, visibility 0ms linear 0.15s !important;
+            }
+            #page-chat[data-mobile-view="conversation"] #chat-window {
+                opacity: 1 !important;
+            }
+        }
+    `;
+    // Only inject once
+    if (!document.getElementById('chat-mobile-styles')) {
+        document.head.appendChild(mobileCss);
+    }
+
     document.head.appendChild(s);
+}
+
+// ─────────────────────────────────────────────
+// MOBILE NAV STATE HELPERS
+// ─────────────────────────────────────────────
+
+// Returns true when the viewport is in "mobile single-panel" mode (< 640 px)
+function _isMobileLayout() {
+    return window.innerWidth < 640;
+}
+
+// The chat container wrapper that carries data-mobile-view
+function _getChatWrapper() {
+    // The container is: #page-chat > .max-w-6xl > div (the flex card)
+    const pageChat = document.getElementById('page-chat');
+    if (!pageChat) return null;
+    return pageChat.querySelector('.max-w-6xl > div') || null;
+}
+
+// Show the conversation panel on mobile, pushing history so Back works
+function _mobileShowConversation() {
+    const wrapper = _getChatWrapper();
+    if (!wrapper) return;
+    wrapper.setAttribute('data-mobile-view', 'conversation');
+    // Push a history entry so the browser Back button returns to the list.
+    // Use replaceState if we're already in conversation state (e.g. switching rooms)
+    // to avoid stacking duplicate entries.
+    if (history.state?.chatView !== 'conversation') {
+        history.pushState({ chatView: 'conversation' }, '');
+    }
+    // Scroll the message list to the bottom (newest message) after paint
+    requestAnimationFrame(() => {
+        const msgs = document.getElementById('chat-messages');
+        if (msgs) msgs.scrollTop = 0; // column-reverse: 0 = bottom
+    });
+}
+
+// Show the sidebar list on mobile (go "back" to the list)
+function _mobileShowList() {
+    const wrapper = _getChatWrapper();
+    if (!wrapper) return;
+    wrapper.removeAttribute('data-mobile-view');
+    // Restore focus to the sidebar so keyboard users land somewhere sensible
+    const sidebar = document.querySelector('#page-chat .sm\\:w-80');
+    if (sidebar) {
+        const firstItem = sidebar.querySelector('.wa-sidebar-item, .chat-contact');
+        firstItem?.focus({ preventScroll: true });
+    }
+}
+
+// Inject the mobile back button into the chat header (called once per openChatRoom)
+function _ensureMobileBackButton(chatHeader, onBack) {
+    // Remove any stale back button from a previous room open
+    document.getElementById('chat-mobile-back-btn')?.remove();
+    if (!_isMobileLayout()) return; // no-op on desktop
+
+    const btn = document.createElement('button');
+    btn.id = 'chat-mobile-back-btn';
+    btn.type = 'button';
+    btn.setAttribute('aria-label', 'Back to chat list');
+    btn.setAttribute('title', 'Back');
+    btn.innerHTML = `<svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M15 19l-7-7 7-7"/>
+    </svg>`;
+    // Insert as the very first child of the .ch-inner div inside the header
+    const chInner = chatHeader.querySelector('.ch-inner');
+    if (chInner) {
+        chInner.insertBefore(btn, chInner.firstChild);
+    } else {
+        chatHeader.insertBefore(btn, chatHeader.firstChild);
+    }
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onBack();
+    }, { passive: false });
 }
 
 // ─────────────────────────────────────────────
@@ -2870,7 +3239,92 @@ export function setupChat() {
             if (!currentUser) return;
             // Always re-subscribe to guarantee the list is fresh for this user.
             loadRecentChats();
+
+            // MOBILE: when navigating to the chat page always start in list view
+            // so the user sees their conversations, not a blank conversation panel.
+            if (_isMobileLayout()) {
+                const wrapper = _getChatWrapper();
+                if (wrapper) {
+                    // If there's no active room, always show list.
+                    // If there IS an active room, keep conversation view so returning
+                    // to the page after briefly switching tabs doesn't reset the chat.
+                    if (!activeRoomId) {
+                        wrapper.removeAttribute('data-mobile-view');
+                    }
+                }
+            }
         });
+
+        // ── MOBILE: popstate — handle browser/gesture Back ──────────────
+        // When the user taps Back on mobile (or swipes on iOS), the browser
+        // fires popstate. We intercept it to go from conversation → list
+        // instead of leaving the page entirely.
+        // Guard: only register once (alongside other global listeners).
+        window.addEventListener('popstate', (e) => {
+            // Only intercept if chat page is currently visible
+            const pageChat = document.getElementById('page-chat');
+            if (!pageChat || pageChat.classList.contains('hidden')) return;
+
+            if (!_isMobileLayout()) return; // desktop: let default behaviour run
+
+            const wrapper = _getChatWrapper();
+            if (!wrapper) return;
+
+            if (wrapper.getAttribute('data-mobile-view') === 'conversation') {
+                // User pressed Back while in conversation view — go to list.
+                // Prevent the page itself from navigating backwards.
+                e.preventDefault?.();
+                _mobileShowList();
+                // Push a neutral state so the next Back press doesn't loop
+                // back into conversation view.
+                history.pushState(null, '');
+            }
+        });
+
+        // ── MOBILE: orientation/resize — re-evaluate layout state ───────
+        // When the device rotates, viewport width can cross the 640 px
+        // breakpoint. We need to:
+        //   • On crossing into desktop: remove data-mobile-view so the
+        //     side-by-side layout is restored (CSS handles the rest).
+        //   • On crossing into mobile: if a room is active, re-enter
+        //     conversation view so the message panel is visible.
+        let _prevWasDesktop = !_isMobileLayout();
+        const _onViewportChange = () => {
+            const nowDesktop = !_isMobileLayout();
+            if (nowDesktop === _prevWasDesktop) return; // no breakpoint crossed
+            _prevWasDesktop = nowDesktop;
+
+            const wrapper = _getChatWrapper();
+            if (!wrapper) return;
+
+            if (nowDesktop) {
+                // Switched to desktop: remove mobile-view so both panels show
+                wrapper.removeAttribute('data-mobile-view');
+                // Also clean up any conversation-state history entry to avoid
+                // spurious popstate fires later.
+                if (history.state?.chatView === 'conversation') {
+                    history.replaceState(null, '');
+                }
+            } else {
+                // Switched to mobile: if a room is open, show conversation view
+                if (activeRoomId) {
+                    _mobileShowConversation();
+                }
+            }
+        };
+
+        // ResizeObserver is more reliable than 'resize' on iOS Safari
+        if (typeof ResizeObserver !== 'undefined') {
+            const _chatResizeObs = new ResizeObserver(_onViewportChange);
+            const _chatRoot = document.getElementById('page-chat') || document.body;
+            _chatResizeObs.observe(_chatRoot);
+        } else {
+            window.addEventListener('resize', _onViewportChange, { passive: true });
+        }
+        // Also catch orientation changes on Android WebView
+        screen.orientation?.addEventListener?.('change', _onViewportChange);
+        window.addEventListener('orientationchange', _onViewportChange, { passive: true });
+
     } // end _globalListenersSetup guard
 
     // ── Handle ?joinGroup= deep-link ────────────
@@ -3313,6 +3767,32 @@ export function setupChat() {
         document.addEventListener('click', closeDropdown);
         // FIX #5: store at module scope so it survives header innerHTML rewrites
         _cleanupDropdown = closeDropdown;
+
+        // ── MOBILE: inject back button + slide to conversation view ──────
+        // _ensureMobileBackButton is a no-op on desktop (>= 640 px).
+        // The callback navigates back to the list and handles history state.
+        _ensureMobileBackButton(chatHeader, () => {
+            // If history has a conversation state on top, go back naturally so
+            // the popstate handler fires (keeps history clean). Otherwise just
+            // toggle the view directly.
+            if (history.state?.chatView === 'conversation') {
+                history.back();
+            } else {
+                _mobileShowList();
+            }
+        });
+
+        // Transition to conversation view on mobile.  On desktop this is a
+        // no-op because the sidebar and window are always visible side-by-side.
+        if (_isMobileLayout()) {
+            _mobileShowConversation();
+        }
+
+        // Scroll to newest message immediately after transition
+        requestAnimationFrame(() => {
+            const msgs = document.getElementById('chat-messages');
+            if (msgs) msgs.scrollTop = 0; // column-reverse: 0 = bottom
+        });
 
         // Root listener
         rootChatSub = onSnapshot(doc(db, 'chats', activeRoomId), docSnap => {
