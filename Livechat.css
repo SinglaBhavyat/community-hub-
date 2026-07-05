@@ -1527,9 +1527,7 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   margin-bottom: 6px;
   user-select: none;
 }
-.lc-media-gallery--single {
-  /* single item — no nav chrome needed */
-}
+/* .lc-media-gallery--single — single item, no nav chrome needed */
 .lc-gallery-track {
   display: flex;
   transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1775,7 +1773,7 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 .lc-fv-btn:hover { background: rgba(255,255,255,0.25); }
 .lc-fv-btn svg { width: 18px; height: 18px; }
 .lc-fv-close-btn { margin-left: auto; }
-.lc-fv-dl-btn {}
+/* .lc-fv-dl-btn — placeholder for future download button styles */
 
 .lc-fv-stage {
   position: relative;
