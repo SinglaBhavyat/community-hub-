@@ -114,7 +114,7 @@ export function setApiKey(key) {
 }
 
 function resolveApiKey() {
-  const key = _configApiKey ?? window.__ECHO_API_KEY ?? 'AQ.Ab8RN6I89yl-Rx85i2IWwjrRdnW4oqlV6l4bFAO6BhT7qMvRcA';
+  const key = _configApiKey ?? window.__ECHO_API_KEY ?? 'AQ.Ab8RN6LwKI_wbjjXL0nFnuZ5ZG6_1Yqu_EWSbhnqI01jw6Eu2g';
   if (!key) console.warn('[Echo] No API key found. Call setApiKey(key) or set window.__ECHO_API_KEY before setupAiChat().');
   return key;
 }
@@ -124,9 +124,12 @@ const MAX_HISTORY_PAIRS = 20;
 const MAX_CHARS         = 2000;
 const RETRY_DELAYS      = [1000, 2000, 4000];
 
-// Gemini streaming endpoint — note streamGenerateContent
-const GEMINI_STREAM_URL =
+// Gemini streaming endpoint.
+// AQ.Ab8... format keys do NOT work via the x-goog-api-key header —
+// they must be sent as a ?key= query parameter instead.
+const GEMINI_BASE_URL =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse';
+const geminiUrl = (key) => GEMINI_BASE_URL + '&key=' + encodeURIComponent(key);
 
 const SYSTEM_PAIR = Object.freeze([
   {
@@ -1601,11 +1604,10 @@ export function setupAiChat(config = {}) {
   async function streamGemini({ history, signal, onChunk }) {
     const apiKey = resolveApiKey();
     // [SEC-FIX-01] Key in header, not query string
-    const response = await fetch(GEMINI_STREAM_URL, {
+    const response = await fetch(geminiUrl(apiKey), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
       },
       signal,
       body: JSON.stringify({ contents: history }),

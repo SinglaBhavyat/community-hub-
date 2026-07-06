@@ -24,8 +24,11 @@ service cloud.firestore {
     // from admin.js. A single get() returns null if the doc is missing, and
     // null != 'admin', so the exists() guard is not needed.
     function isAdmin() {
-      return isSignedIn() &&
-        get(/databases/$(database)/documents/users/$(callerEmail())).data.role == 'admin';
+      // BUG FIX: get() on a missing document returns a resource with null data,
+      // which causes .data.role to throw a NullPointerException in Rules, producing
+      // permission-denied instead of false. Guard with an explicit null check first.
+      let _doc = get(/databases/$(database)/documents/users/$(callerEmail()));
+      return isSignedIn() && _doc != null && _doc.data.role == 'admin';
     }
 
     function isOwner(data) {
@@ -194,16 +197,34 @@ service cloud.firestore {
     }
 
     // ── Posts ─────────────────────────────────────────────────────────────
+    // Broadcast posts (isBroadcast == true) are admin-only writes.
+    // Regular users must not set isBroadcast, broadcastCategory,
+    // broadcastTitle, pinned, or status — those fields are reserved for the
+    // admin broadcast system. Non-owner reactions/votes may update upvotedBy
+    // and upvoteCount but cannot touch any broadcast or authorship fields.
     match /posts/{postId} {
       allow read: if isSignedIn();
 
-      allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == callerEmail();
+      allow create: if isSignedIn() && (
+        // Admin path: can create any post including broadcasts (isBroadcast:true).
+        // authorEmail must still match the caller so broadcasts are attributable.
+        (isAdmin() && request.resource.data.authorEmail == callerEmail()) ||
+        // Regular user path: must own the post and must NOT set any
+        // broadcast-reserved fields that could spoof a system announcement.
+        (request.resource.data.authorEmail == callerEmail() &&
+         !request.resource.data.keys().hasAny(
+           ['isBroadcast', 'broadcastCategory', 'broadcastTitle']))
+      );
 
       allow update: if isOwner(resource.data) || isAdmin() ||
+        // Non-owner signed-in users (e.g. voting, bookmarking) may update
+        // reaction/engagement fields but are blocked from touching content,
+        // authorship, or any broadcast control field.
         (isSignedIn() &&
           !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
+            .hasAny(['authorEmail', 'authorUid', 'content', 'title',
+                     'isBroadcast', 'broadcastCategory', 'broadcastTitle',
+                     'pinned', 'status']));
 
       allow delete: if isOwner(resource.data) || isAdmin();
 
@@ -253,6 +274,8 @@ service cloud.firestore {
         request.resource.data.members.hasAny([callerEmail()]);
 
       allow update: if isSignedIn() && (
+        // Admins: unrestricted.
+        isAdmin() ||
         // Members may update anything except admin-controlled fields.
         (resource.data.members.hasAny([callerEmail()]) &&
           !request.resource.data.diff(resource.data).affectedKeys()
@@ -264,8 +287,10 @@ service cloud.firestore {
       );
 
       allow delete: if isSignedIn() && (
+        // BUG FIX: private chat delete was restricted to members only — admins
+        // could not remove a private chat that violated policy. Added isAdmin().
         resource.data.type == 'private'
-          ? resource.data.members.hasAny([callerEmail()])
+          ? (resource.data.members.hasAny([callerEmail()]) || isAdmin())
           : (resource.data.createdBy == callerEmail() || isAdmin())
       );
 
@@ -298,25 +323,32 @@ service cloud.firestore {
           // Immutable fields (senderEmail, senderName, createdAt, replyTo,
           // forwarded) are blocked so an owner cannot impersonate another
           // sender or rewrite the message history.
+          // seenBy and deletedFor are member-controlled fields — the owner
+          // must not be able to forge read receipts or hide messages from
+          // specific members.
           (resource.data.senderEmail == callerEmail() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['senderEmail', 'senderName', 'createdAt',
-                       'replyTo', 'forwarded'])) ||
+                       'replyTo', 'forwarded', 'seenBy', 'deletedFor'])) ||
 
           // ── Any chat member: may update only seenBy, deletedFor, reactions.
           // Content-bearing and metadata fields remain locked so members
           // cannot edit or delete each other's messages through this path.
           // FIX #7: _deletedMediaUrls added to the blocked list — only the
           // message owner (handled by the owner path above) may write this
-          // field.  Without this guard any member could write arbitrary
+          // field. Without this guard any member could write arbitrary
           // Cloudinary URLs to trigger server-side cleanup of assets they
           // don't own, potentially deleting another user's media.
+          // Per-attachment actions (replace/delete) write to 'attachments'.
+          // Only the message owner may modify that field (owner path above).
+          // Lock it here so other members cannot remove or swap someone else's files.
           (isChatMember() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['text', 'imageUrl', 'voiceUrl', 'fileUrl',
                        'isDeletedForEveryone', 'senderEmail', 'senderName',
                        'edited', 'editedAt', 'replyTo', 'forwarded',
-                       'fileName', 'fileMime', 'fileSize', '_deletedMediaUrls']))
+                       'fileName', 'fileMime', 'fileSize', '_deletedMediaUrls',
+                       'attachments']))
         );
 
         allow delete: if isSignedIn() && (

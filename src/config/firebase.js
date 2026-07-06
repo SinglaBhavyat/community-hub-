@@ -3,8 +3,12 @@ import { getAuth, GoogleAuthProvider } from "https://www.gstatic.com/firebasejs/
 import { getFirestore } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 import { getStorage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
+// ─── Firebase Configuration ────────────────────────────────────────────────
+// Replace all values below with your own Firebase project credentials.
+// Find them in: Firebase Console → Project Settings → Your Apps → SDK setup.
+// NEVER commit real credentials to version control.
 const firebaseConfig = {
-  apiKey: "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA",
+   apiKey: "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA",
   authDomain: "community-45e72.firebaseapp.com",
   projectId: "community-45e72",
   storageBucket: "community-45e72.appspot.com",

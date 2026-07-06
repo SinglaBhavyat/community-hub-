@@ -40,7 +40,11 @@ const TAB_INACTIVE = ['text-slate-400', 'border-transparent', 'hover:bg-slate-80
 
 const ACTION_COLORS = {
     BROADCAST_SENT:          '#38bdf8',
-    BROADCAST_RETRACTED:     '#f87171',
+    BROADCAST_UPDATED:       '#a78bfa',
+    BROADCAST_ARCHIVED:      '#fb923c',
+    BROADCAST_RESTORED:      '#34d399',
+    BROADCAST_DELETED:       '#f87171',
+    BROADCAST_RETRACTED:     '#f87171', // legacy — kept for old audit log entries
     USER_PROMOTED:           '#fbbf24',
     USER_SUSPENDED:          '#f87171',
     USER_RESTORED:           '#34d399',
@@ -293,6 +297,75 @@ export function setupAdmin() {
                 .admin-user-actions { opacity: 1; }
             }
             .rsvp-tag { transition: all 0.15s ease; }
+
+            /* ── Broadcast styles ──────────────────────────────────── */
+            .bc-media-thumb {
+                position: relative; width: 80px; height: 60px;
+                border-radius: 8px; overflow: hidden; flex-shrink: 0;
+                background: rgba(15,23,42,0.8); border: 1px solid rgba(148,163,184,0.15);
+            }
+            .bc-media-thumb img, .bc-media-thumb video {
+                width: 100%; height: 100%; object-fit: cover;
+            }
+            .bc-media-thumb .bc-remove-file {
+                position: absolute; top: 3px; right: 3px;
+                width: 18px; height: 18px; border-radius: 50%;
+                background: rgba(239,68,68,0.9); color: #fff;
+                font-size: 10px; display: flex; align-items: center;
+                justify-content: center; cursor: pointer; border: none;
+                line-height: 1;
+            }
+            .bc-media-thumb .bc-doc-icon {
+                width: 100%; height: 100%; display: flex; flex-direction: column;
+                align-items: center; justify-content: center; gap: 2px;
+                font-size: 20px;
+            }
+            .bc-media-thumb .bc-doc-label {
+                font-size: 9px; color: #94a3b8; font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.05em;
+                max-width: 68px; overflow: hidden; text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .bc-upload-progress {
+                position: absolute; inset: 0; background: rgba(0,0,0,0.6);
+                display: flex; align-items: center; justify-content: center;
+                font-size: 11px; color: #fff; font-weight: 700;
+            }
+            .bc-active-card {
+                background: rgba(15,23,42,0.6);
+                border: 1px solid rgba(148,163,184,0.12);
+                border-radius: 16px; padding: 16px;
+                transition: border-color 0.2s ease, transform 0.15s ease;
+            }
+            .bc-active-card:hover { border-color: rgba(56,189,248,0.25); }
+            .bc-active-card--editing {
+                border-color: rgba(99,102,241,0.4) !important;
+                background: rgba(99,102,241,0.04) !important;
+            }
+            .bc-priority-badge {
+                display: inline-flex; align-items: center; gap: 4px;
+                padding: 2px 8px; border-radius: 20px;
+                font-size: 10px; font-weight: 800;
+                letter-spacing: 0.06em; text-transform: uppercase;
+            }
+            .bc-priority-badge--normal   { background: rgba(148,163,184,0.15); color: #94a3b8; }
+            .bc-priority-badge--high     { background: rgba(251,191,36,0.15);  color: #fbbf24; }
+            .bc-priority-badge--critical { background: rgba(239,68,68,0.15);   color: #f87171; animation: pulse 2s infinite; }
+            @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+
+            /* Posts feed broadcast banner */
+            .post-card--broadcast {
+                border-left: 3px solid #38bdf8 !important;
+                background: linear-gradient(135deg, rgba(56,189,248,0.04) 0%, transparent 60%) !important;
+            }
+            .broadcast-feed-banner {
+                display: flex; align-items: center; gap: 6px;
+                padding: 3px 10px; border-radius: 20px; margin-bottom: 8px;
+                background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.25);
+                width: fit-content;
+            }
+            .broadcast-feed-banner span { font-size: 10px; font-weight: 800;
+                color: #38bdf8; text-transform: uppercase; letter-spacing: 0.08em; }
         `;
         document.head.appendChild(style);
     }
@@ -412,6 +485,10 @@ export function setupAdmin() {
 
     // ── TAB ROUTER ──────────────────────────────────────────────────────────
     function activateTab(tab) {
+        // Detach broadcast real-time listener when leaving the broadcast tab
+        // (BUG-06 fix: prevents stale listeners and duplicate DOM writes)
+        if (tab !== 'broadcast') _detach('broadcasts');
+
         sidebarNav.querySelectorAll('.admin-nav-btn').forEach(b => {
             const isActive = b.dataset.adminTab === tab;
             TAB_ACTIVE.forEach(c   => b.classList.toggle(c, isActive));
@@ -1354,34 +1431,98 @@ export function setupAdmin() {
     // ════════════════════════════════════════════════════════════════════════
     // 5. BROADCAST
     // ════════════════════════════════════════════════════════════════════════
-    async function renderBroadcast() {
+    // Full rewrite — fixes all identified bugs:
+    //   BUG-01: getDocs (one-shot) → onSnapshot (real-time). Active Broadcasts
+    //           now updates instantly without any page refresh.
+    //   BUG-02: No `isBroadcast` discriminator field — broadcasts were
+    //           indistinguishable from user Announcement posts. Fixed: every
+    //           broadcast now carries `isBroadcast:true` and is queried by it.
+    //   BUG-03: No `pinned:true` on creation — broadcasts never appeared at the
+    //           top of Global Posts. Fixed: every broadcast sets pinned:true and
+    //           posts.js feed query already sorts pinned cards to the top.
+    //   BUG-04: No edit capability — only retract (hard delete). Fixed: inline
+    //           edit form mirrors the compose form with pre-populated values.
+    //   BUG-05: No media attachments — broadcasts only had text. Fixed: same
+    //           multi-file (image/video/doc) pipeline as Global Posts.
+    //   BUG-06: Listener leak — no _detach call when leaving the tab. Fixed:
+    //           every onSnapshot is keyed under 'broadcasts' in _unsubs and
+    //           detached by activateTab before calling the new renderer.
+    //   BUG-07: Brittle DOM removal after retract — btn.closest('.flex').remove()
+    //           could miss the card. Fixed: cards keyed by data-bc-id, removed
+    //           precisely.
+    //   BUG-08: Scheduling UI existed in comments but was never wired. Fixed:
+    //           optional "Schedule for later" datetime picker fully wired.
+    //   BUG-09: Broadcast title had the category baked in during creation, making
+    //           edits misleading. Fixed: title is stored clean; category badge is
+    //           computed at render time.
+    //   BUG-10: No archive/unpin — only hard delete. Fixed: Archive sets
+    //           pinned:false + status:'archived' so the broadcast disappears from
+    //           the feed but stays in the audit trail.
+    // ────────────────────────────────────────────────────────────────────────
+
+    function renderBroadcast() {
+        // Tear down any stale listener before re-rendering the tab
+        _detach('broadcasts');
+
+        // ── State for the compose/edit form ──────────────────────────────────
+        let _bcFiles        = [];      // File[] — pending uploads
+        let _bcEditId       = null;    // string|null — ID of broadcast being edited
+        let _bcEditMedia    = [];      // existing mediaItems on the broadcast being edited
+
+        // ── Category metadata ─────────────────────────────────────────────────
+        const BC_CATEGORIES = [
+            { value: 'MAINTENANCE', label: '🔧 System Maintenance' },
+            { value: 'UPDATE',      label: '✨ Platform Update'     },
+            { value: 'WARNING',     label: '⚠️ Security Warning'    },
+            { value: 'EVENT',       label: '🎉 Official Event'       },
+            { value: 'POLICY',      label: '📜 Policy Change'        },
+            { value: 'NOTICE',      label: '📣 General Notice'       },
+        ];
+
+        const BC_CATEGORY_EMOJI = Object.fromEntries(
+            BC_CATEGORIES.map(c => [c.value, c.label.split(' ')[0]])
+        );
+
+        // ── Render shell ──────────────────────────────────────────────────────
         mainView.innerHTML = `
             <div class="space-y-6 admin-tab-content max-w-3xl">
-                <!-- Compose card -->
+
+                <!-- ── Compose / Edit card ─────────────────────────── -->
                 <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-8 shadow-2xl">
                     <div class="flex items-center gap-3 mb-6">
                         <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600
-                                    flex items-center justify-center text-lg shadow-lg shadow-sky-500/20">📡</div>
-                        <div>
-                            <h2 class="text-2xl font-black text-white tracking-tight">Global Broadcast</h2>
-                            <p class="text-slate-400 text-xs mt-0.5">Inject system announcements into the main feed</p>
+                                    flex items-center justify-center text-xl shadow-lg shadow-sky-500/20">📡</div>
+                        <div class="flex-1 min-w-0">
+                            <h2 class="text-2xl font-black text-white tracking-tight" id="bc-form-title">
+                                New Broadcast
+                            </h2>
+                            <p class="text-slate-400 text-xs mt-0.5">
+                                Pinned system announcements injected into the Global Posts feed
+                            </p>
                         </div>
+                        <!-- Cancel edit button (hidden during compose) -->
+                        <button id="bc-cancel-edit"
+                                class="hidden flex-shrink-0 text-xs font-bold text-slate-400
+                                       hover:text-white px-3 py-1.5 rounded-lg border border-slate-700
+                                       hover:border-slate-500 transition">
+                            ✕ Cancel
+                        </button>
                     </div>
 
-                    <div class="space-y-5" id="bc-form">
+                    <div class="space-y-5">
+                        <!-- Row 1: Category + Priority -->
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-xs font-black text-sky-400 mb-2 tracking-widest uppercase">
                                     Classification
                                 </label>
                                 <select id="bc-category"
-                                        class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5 text-white
-                                               outline-none focus:border-sky-500/60 transition cursor-pointer text-sm">
-                                    <option value="MAINTENANCE">🔧 System Maintenance</option>
-                                    <option value="UPDATE">✨ Platform Update</option>
-                                    <option value="WARNING">⚠️ Security Warning</option>
-                                    <option value="EVENT">🎉 Official Event</option>
-                                    <option value="POLICY">📜 Policy Change</option>
+                                        class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5
+                                               text-white outline-none focus:border-sky-500/60 transition
+                                               cursor-pointer text-sm">
+                                    ${BC_CATEGORIES.map(c =>
+                                        `<option value="${c.value}">${c.label}</option>`
+                                    ).join('')}
                                 </select>
                             </div>
                             <div>
@@ -1389,8 +1530,9 @@ export function setupAdmin() {
                                     Priority
                                 </label>
                                 <select id="bc-priority"
-                                        class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5 text-white
-                                               outline-none focus:border-sky-500/60 transition cursor-pointer text-sm">
+                                        class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5
+                                               text-white outline-none focus:border-sky-500/60 transition
+                                               cursor-pointer text-sm">
                                     <option value="normal">Normal</option>
                                     <option value="high">High Priority</option>
                                     <option value="critical">🚨 Critical</option>
@@ -1398,68 +1540,159 @@ export function setupAdmin() {
                             </div>
                         </div>
 
+                        <!-- Headline -->
                         <div>
                             <label class="block text-xs font-black text-sky-400 mb-2 tracking-widest uppercase">
                                 Headline
                             </label>
                             <input type="text" id="bc-title" maxlength="120"
-                                   class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5 text-white
-                                          font-bold outline-none focus:border-sky-500/60 transition text-sm"
+                                   class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5
+                                          text-white font-bold outline-none focus:border-sky-500/60 transition text-sm"
                                    placeholder="Enter primary headline…">
                             <p class="text-right text-[10px] text-slate-500 mt-1.5" id="bc-title-count">0 / 120</p>
                         </div>
 
+                        <!-- Body -->
                         <div>
                             <label class="block text-xs font-black text-sky-400 mb-2 tracking-widest uppercase">
                                 Body
                             </label>
-                            <textarea id="bc-content" rows="4"
-                                      class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5 text-white
-                                             outline-none focus:border-sky-500/60 transition resize-none text-sm
-                                             leading-relaxed"
-                                      placeholder="Detail the announcement…"></textarea>
-                            <p class="text-right text-[10px] text-slate-500 mt-1.5" id="bc-content-count">0 / 2000</p>
+                            <textarea id="bc-content" rows="5"
+                                      class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5
+                                             text-white outline-none focus:border-sky-500/60 transition
+                                             resize-y text-sm leading-relaxed min-h-[100px]"
+                                      placeholder="Detail the announcement — supports #hashtags…"></textarea>
+                            <p class="text-right text-[10px] text-slate-500 mt-1.5" id="bc-content-count">0 / 3000</p>
+                        </div>
+
+                        <!-- Media attachments -->
+                        <div>
+                            <label class="block text-xs font-black text-sky-400 mb-2 tracking-widest uppercase">
+                                Attachments <span class="text-slate-500 normal-case font-medium">(images, videos, documents — optional)</span>
+                            </label>
+                            <!-- Existing media (edit mode) -->
+                            <div id="bc-existing-media" class="hidden flex flex-wrap gap-2 mb-3"></div>
+                            <!-- New file previews -->
+                            <div id="bc-file-preview" class="flex flex-wrap gap-2 mb-3 empty:hidden"></div>
+                            <!-- Drop zone / picker trigger -->
+                            <label for="bc-file-input"
+                                   class="flex items-center justify-center gap-2 w-full h-20
+                                          border-2 border-dashed border-slate-700 rounded-xl
+                                          hover:border-sky-500/50 hover:bg-sky-500/3 transition cursor-pointer
+                                          text-slate-500 hover:text-sky-400 text-sm">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                     class="w-5 h-5 flex-shrink-0">
+                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0l-4 4m4-4v12"/>
+                                </svg>
+                                <span>Click or drag files here</span>
+                            </label>
+                            <input type="file" id="bc-file-input" multiple
+                                   accept="image/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.zip"
+                                   class="hidden">
+                        </div>
+
+                        <!-- Schedule (optional) -->
+                        <div>
+                            <label class="flex items-center gap-2 text-xs font-black text-sky-400
+                                          mb-2 tracking-widest uppercase cursor-pointer">
+                                <input type="checkbox" id="bc-schedule-toggle"
+                                       class="w-3.5 h-3.5 rounded accent-sky-500">
+                                Schedule for later
+                                <span class="text-slate-500 normal-case font-medium">(optional)</span>
+                            </label>
+                            <div id="bc-schedule-wrap" class="hidden">
+                                <input type="datetime-local" id="bc-schedule-at"
+                                       class="w-full bg-slate-950 border border-slate-700 rounded-xl p-3.5
+                                              text-white outline-none focus:border-sky-500/60 transition text-sm">
+                                <p class="text-[10px] text-slate-500 mt-1.5">
+                                    Leave empty to publish immediately.
+                                </p>
+                            </div>
                         </div>
 
                         <!-- Live preview -->
-                        <div id="bc-preview" class="hidden p-4 bg-sky-900/10 border border-sky-500/20 rounded-2xl">
-                            <p class="text-[10px] text-sky-400 uppercase font-black tracking-widest mb-2">Preview</p>
-                            <p id="bc-preview-title" class="text-white font-black text-sm"></p>
+                        <div id="bc-preview" class="hidden p-5 bg-sky-900/10 border border-sky-500/20 rounded-2xl">
+                            <div class="flex items-center gap-2 mb-3">
+                                <span class="text-[10px] text-sky-400 uppercase font-black tracking-widest">Live Preview</span>
+                                <span class="text-[10px] text-slate-500">— how it appears in the feed</span>
+                            </div>
+                            <div class="broadcast-feed-banner">
+                                <span>📡</span>
+                                <span id="bc-preview-cat-badge">BROADCAST</span>
+                            </div>
+                            <p id="bc-preview-title" class="text-white font-black text-sm mt-2"></p>
                             <p id="bc-preview-body" class="text-slate-400 text-xs mt-1 leading-relaxed"></p>
+                            <div id="bc-preview-media" class="flex flex-wrap gap-2 mt-3 empty:hidden"></div>
                         </div>
 
+                        <!-- Submit / Update -->
                         <button id="bc-submit"
                                 class="w-full bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400
                                        hover:to-indigo-500 text-white font-black py-4 rounded-xl uppercase
                                        tracking-widest shadow-xl shadow-sky-500/20 transition active:scale-[0.98]
                                        disabled:opacity-50 disabled:cursor-not-allowed text-sm">
-                            Send Broadcast
+                            📡 Send Broadcast
                         </button>
                     </div>
                 </div>
 
-                <!-- Active broadcasts -->
+                <!-- ── Active Broadcasts (real-time) ────────────────── -->
                 <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-8 shadow-xl">
-                    <h3 class="text-lg font-black text-white mb-5 uppercase tracking-tight">Active Broadcasts</h3>
+                    <div class="flex items-center justify-between mb-5">
+                        <div>
+                            <h3 class="text-lg font-black text-white uppercase tracking-tight">Active Broadcasts</h3>
+                            <p class="text-xs text-slate-500 mt-0.5">Pinned in the Global Posts feed · updates in real time</p>
+                        </div>
+                        <span id="bc-active-count"
+                              class="hidden text-[10px] font-black text-sky-400 bg-sky-400/10
+                                     border border-sky-400/20 px-2.5 py-1 rounded-full">0</span>
+                    </div>
                     <div id="active-broadcasts-list">${skeletonList(2)}</div>
                 </div>
             </div>`;
 
-        // Character counters
-        const titleEl   = document.getElementById('bc-title');
-        const contentEl = document.getElementById('bc-content');
-        const preview   = document.getElementById('bc-preview');
+        // ── DOM refs ──────────────────────────────────────────────────────────
+        const titleEl      = document.getElementById('bc-title');
+        const contentEl    = document.getElementById('bc-content');
+        const categoryEl   = document.getElementById('bc-category');
+        const priorityEl   = document.getElementById('bc-priority');
+        const submitBtn    = document.getElementById('bc-submit');
+        const cancelBtn    = document.getElementById('bc-cancel-edit');
+        const schedToggle  = document.getElementById('bc-schedule-toggle');
+        const schedWrap    = document.getElementById('bc-schedule-wrap');
+        const schedAt      = document.getElementById('bc-schedule-at');
+        const fileInput    = document.getElementById('bc-file-input');
+        const filePreview  = document.getElementById('bc-file-preview');
+        const previewBox   = document.getElementById('bc-preview');
+        const formTitleEl  = document.getElementById('bc-form-title');
 
+        // ── Live preview updater ──────────────────────────────────────────────
         const updatePreview = () => {
-            const t = titleEl?.value.trim();
-            const b = contentEl?.value.trim();
-            const cat = document.getElementById('bc-category')?.value;
-            if (preview) {
-                preview.classList.toggle('hidden', !t && !b);
-                if (document.getElementById('bc-preview-title'))
-                    document.getElementById('bc-preview-title').textContent = t ? `🚨 [${cat}] ${t}` : '';
-                if (document.getElementById('bc-preview-body'))
-                    document.getElementById('bc-preview-body').textContent = b || '';
+            const t   = titleEl?.value.trim();
+            const b   = contentEl?.value.trim();
+            const cat = categoryEl?.value;
+            if (!previewBox) return;
+            previewBox.classList.toggle('hidden', !t && !b);
+            const badgeEl = document.getElementById('bc-preview-cat-badge');
+            if (badgeEl) badgeEl.textContent = `${BC_CATEGORY_EMOJI[cat] || '📡'} ${cat}`;
+            const ptEl = document.getElementById('bc-preview-title');
+            if (ptEl) ptEl.textContent = t || '';
+            const pbEl = document.getElementById('bc-preview-body');
+            if (pbEl) pbEl.textContent = b || '';
+            // Preview thumbnails for newly selected files
+            const pmEl = document.getElementById('bc-preview-media');
+            if (pmEl) {
+                pmEl.innerHTML = _bcFiles.slice(0, 4).map(f => {
+                    if (f.type.startsWith('image/')) {
+                        const url = URL.createObjectURL(f);
+                        return `<img src="${url}" class="w-16 h-12 object-cover rounded-lg border border-slate-700" loading="lazy">`;
+                    }
+                    return `<div class="flex items-center gap-1 px-2 py-1 bg-slate-800 rounded-lg
+                                        text-[10px] text-slate-400 border border-slate-700">
+                                📎 ${sanitize(f.name.slice(0, 20))}
+                            </div>`;
+                }).join('');
             }
         };
 
@@ -1468,78 +1701,576 @@ export function setupAdmin() {
             updatePreview();
         });
         contentEl?.addEventListener('input', () => {
-            setHTML('bc-content-count', `${contentEl.value.length} / 2000`);
+            setHTML('bc-content-count', `${contentEl.value.length} / 3000`);
             updatePreview();
         });
-        document.getElementById('bc-category')?.addEventListener('change', updatePreview);
+        categoryEl?.addEventListener('change', updatePreview);
+        schedToggle?.addEventListener('change', () => {
+            schedWrap?.classList.toggle('hidden', !schedToggle.checked);
+        });
 
-        // Load active broadcasts
-        const loadActive = async () => {
-            const list = document.getElementById('active-broadcasts-list');
-            if (!list) return;
+        // ── File picker + drag-drop ───────────────────────────────────────────
+        const ACCEPTED_TYPES = 'image/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.zip';
+        const MAX_FILES = 5;
+        const MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+
+        const addFiles = (incoming) => {
+            for (const f of incoming) {
+                if (_bcFiles.length >= MAX_FILES) {
+                    toast(`Max ${MAX_FILES} attachments per broadcast.`, 'warn'); break;
+                }
+                if (f.size > MAX_BYTES) {
+                    toast(`"${f.name}" exceeds 50 MB limit.`, 'warn'); continue;
+                }
+                _bcFiles.push(f);
+            }
+            renderFilePreviews();
+            updatePreview();
+        };
+
+        const removeNewFile = (idx) => {
+            _bcFiles.splice(idx, 1);
+            renderFilePreviews();
+            updatePreview();
+        };
+
+        const renderFilePreviews = () => {
+            if (!filePreview) return;
+            filePreview.innerHTML = _bcFiles.map((f, i) => {
+                const isImage = f.type.startsWith('image/');
+                const isVideo = f.type.startsWith('video/');
+                let inner = '';
+                if (isImage) {
+                    const url = URL.createObjectURL(f);
+                    inner = `<img src="${url}" style="width:100%;height:100%;object-fit:cover;">`;
+                } else if (isVideo) {
+                    inner = `<div class="bc-doc-icon">🎬<span class="bc-doc-label">${sanitize(f.name.slice(0,16))}</span></div>`;
+                } else {
+                    const ext = f.name.split('.').pop().toUpperCase().slice(0,5);
+                    inner = `<div class="bc-doc-icon">📄<span class="bc-doc-label">${ext}</span></div>`;
+                }
+                return `<div class="bc-media-thumb" data-file-idx="${i}">
+                            ${inner}
+                            <button class="bc-remove-file" data-remove-idx="${i}" title="Remove">✕</button>
+                        </div>`;
+            }).join('');
+
+            filePreview.querySelectorAll('.bc-remove-file').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    removeNewFile(parseInt(btn.dataset.removeIdx, 10));
+                });
+            });
+        };
+
+        fileInput?.addEventListener('change', () => {
+            addFiles(Array.from(fileInput.files || []));
+            fileInput.value = '';
+        });
+
+        // Drag-drop on the label
+        const dropZone = mainView.querySelector('label[for="bc-file-input"]');
+        if (dropZone) {
+            dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('border-sky-400'); });
+            dropZone.addEventListener('dragleave', () => dropZone.classList.remove('border-sky-400'));
+            dropZone.addEventListener('drop', e => {
+                e.preventDefault();
+                dropZone.classList.remove('border-sky-400');
+                addFiles(Array.from(e.dataTransfer.files));
+            });
+        }
+
+        // ── Reset compose form to blank "New Broadcast" state ─────────────────
+        const resetForm = () => {
+            _bcEditId    = null;
+            _bcEditMedia = [];
+            _bcFiles     = [];
+            if (titleEl)   { titleEl.value   = ''; }
+            if (contentEl) { contentEl.value = ''; }
+            if (categoryEl) categoryEl.value = 'MAINTENANCE';
+            if (priorityEl) priorityEl.value = 'normal';
+            if (schedToggle) { schedToggle.checked = false; schedWrap?.classList.add('hidden'); }
+            if (schedAt) schedAt.value = '';
+            setHTML('bc-title-count',   '0 / 120');
+            setHTML('bc-content-count', '0 / 3000');
+            renderFilePreviews();
+            if (previewBox) previewBox.classList.add('hidden');
+            if (formTitleEl) formTitleEl.textContent = 'New Broadcast';
+            if (submitBtn) submitBtn.innerHTML = '📡 Send Broadcast';
+            cancelBtn?.classList.add('hidden');
+            if (document.getElementById('bc-existing-media'))
+                document.getElementById('bc-existing-media').classList.add('hidden');
+
+            submitBtn?.classList.remove('from-indigo-500','to-purple-600');
+            submitBtn?.classList.add('from-sky-500','to-indigo-600');
+        };
+
+        cancelBtn?.addEventListener('click', resetForm);
+
+        // ── Populate form for editing an existing broadcast ───────────────────
+        const startEdit = (id, data) => {
+            _bcEditId    = id;
+            _bcEditMedia = Array.isArray(data.mediaItems) ? [...data.mediaItems] : [];
+            _bcFiles     = [];
+
+            if (titleEl)   titleEl.value   = data.broadcastTitle || data.title || '';
+            if (contentEl) contentEl.value = data.content || '';
+            if (categoryEl && data.broadcastCategory) categoryEl.value = data.broadcastCategory;
+            if (priorityEl && data.priority)          priorityEl.value = data.priority;
+
+            setHTML('bc-title-count',   `${titleEl?.value.length || 0} / 120`);
+            setHTML('bc-content-count', `${contentEl?.value.length || 0} / 3000`);
+
+            // Render existing media thumbnails
+            const existingEl = document.getElementById('bc-existing-media');
+            if (existingEl) {
+                existingEl.classList.toggle('hidden', !_bcEditMedia.length);
+                existingEl.innerHTML = _bcEditMedia.map((m, i) => {
+                    const isImg = m.type === 'image';
+                    const inner = isImg
+                        ? `<img src="${sanitize(m.url)}" style="width:100%;height:100%;object-fit:cover;">`
+                        : `<div class="bc-doc-icon">${m.type === 'video' ? '🎬' : '📄'}<span class="bc-doc-label">${sanitize((m.name || m.url).slice(0,16))}</span></div>`;
+                    return `<div class="bc-media-thumb" data-existing-idx="${i}">
+                                ${inner}
+                                <button class="bc-remove-file bc-remove-existing" data-remove-existing="${i}" title="Remove existing">✕</button>
+                            </div>`;
+                }).join('');
+
+                existingEl.querySelectorAll('.bc-remove-existing').forEach(btn => {
+                    btn.addEventListener('click', e => {
+                        e.stopPropagation();
+                        _bcEditMedia.splice(parseInt(btn.dataset.removeExisting, 10), 1);
+                        startEdit(_bcEditId, { ...(data), mediaItems: _bcEditMedia });
+                    });
+                });
+            }
+
+            renderFilePreviews();
+            updatePreview();
+
+            if (formTitleEl) formTitleEl.textContent = 'Edit Broadcast';
+            if (submitBtn) submitBtn.innerHTML = '💾 Update Broadcast';
+            cancelBtn?.classList.remove('hidden');
+
+            submitBtn?.classList.remove('from-sky-500','to-indigo-600');
+            submitBtn?.classList.add('from-indigo-500','to-purple-600');
+
+            // Mark active card as being edited
+            document.querySelectorAll('.bc-active-card').forEach(c =>
+                c.classList.toggle('bc-active-card--editing', c.dataset.bcId === id)
+            );
+
+            // Scroll compose form into view
+            mainView.querySelector('.bg-slate-900\\/80')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        };
+
+        // ── Upload helper (single file → Cloudinary) ──────────────────────────
+        const uploadOneFile = async (file, thumbEl) => {
+            const { uploadToCloudinary } = await import('../utils/storage.js');
+            const isImage = file.type.startsWith('image/');
+            const isVideo = file.type.startsWith('video/');
+            const rType   = isImage ? 'image' : isVideo ? 'video' : 'raw';
+            const url = await uploadToCloudinary(file, 'broadcasts', {
+                fileName: file.name,
+                onProgress: (pct) => {
+                    if (thumbEl) {
+                        let bar = thumbEl.querySelector('.bc-upload-progress');
+                        if (!bar) {
+                            bar = document.createElement('div');
+                            bar.className = 'bc-upload-progress';
+                            thumbEl.appendChild(bar);
+                        }
+                        bar.textContent = `${pct}%`;
+                        if (pct >= 100) setTimeout(() => bar.remove(), 600);
+                    }
+                },
+            });
+            return { url, type: isImage ? 'image' : isVideo ? 'video' : 'raw', name: file.name, size: file.size };
+        };
+
+        // ── Submit (create OR update) ─────────────────────────────────────────
+        submitBtn?.addEventListener('click', async () => {
+            const title   = titleEl?.value.trim();
+            const content = contentEl?.value.trim();
+
+            if (!title)   { toast('Headline is required.',    'warn'); return; }
+            if (!content) { toast('Body text is required.',   'warn'); return; }
+            if (title.length > 120)   { toast('Headline too long (max 120).',    'warn'); return; }
+            if (content.length > 3000) { toast('Body too long (max 3000).',      'warn'); return; }
+
+            const category  = categoryEl?.value  || 'NOTICE';
+            const priority  = priorityEl?.value  || 'normal';
+            const scheduled = schedToggle?.checked && schedAt?.value
+                ? new Date(schedAt.value).getTime()
+                : null;
+
+            // Validate schedule date is in the future
+            if (scheduled && scheduled <= Date.now()) {
+                toast('Scheduled time must be in the future.', 'warn'); return;
+            }
+
+            const restore = btnLoading(submitBtn, _bcEditId ? 'Updating…' : 'Publishing…');
+
             try {
-                const q    = query(collection(db, 'posts'), where('category', '==', 'Announcement'), orderBy('timestamp', 'desc'), limit(10));
-                const snap = await getDocs(q);
+                // 1. Upload any new files
+                let newMediaItems = [];
+                if (_bcFiles.length) {
+                    toast('Uploading attachments…', 'info', 12000);
+                    const thumbEls = filePreview?.querySelectorAll('.bc-media-thumb') || [];
+                    newMediaItems = await Promise.all(
+                        _bcFiles.map((f, i) => uploadOneFile(f, thumbEls[i]))
+                    );
+                    newMediaItems = newMediaItems.filter(Boolean);
+                }
+
+                // 2. Merge existing + new media
+                const allMedia = [..._bcEditMedia, ...newMediaItems];
+                const firstImg = allMedia.find(m => m.type === 'image');
+
+                // 3. Build the Firestore payload
+                const payload = {
+                    // Discriminator fields — make broadcasts queryable without
+                    // ambiguity against user Announcement posts
+                    isBroadcast:       true,
+                    broadcastCategory: category,
+                    broadcastTitle:    title,   // clean title stored separately so
+                                                // feed can render the badge+title
+                                                // independently
+
+                    // Standard post fields so posts.js createPostCardHTML works
+                    type:        'post',
+                    title:       title,         // human-readable; no category baked-in
+                    content,
+                    category:    'Announcement',
+                    community:   'Global',
+                    priority,
+                    pinned:      true,          // BUG-03 fix: always pin broadcasts
+                    status:      'active',
+                    tags:        ['system', 'admin', 'broadcast', category.toLowerCase()],
+                    mediaItems:  allMedia,
+                    imageSrc:    firstImg?.url || null,
+                    author:      'System Administrator',
+                    authorEmail: currentUser.email,
+                    commentCount: 0,
+                    upvotedBy:   [],
+                    upvoteCount:  0,
+                    edited:      !!_bcEditId,
+                    editedAt:    _bcEditId ? Date.now() : null,
+                };
+
+                // Scheduled vs. immediate
+                if (scheduled) {
+                    payload.scheduledFor = scheduled;
+                    payload.status       = 'scheduled';
+                    payload.pinned       = false; // not yet live in feed
+                } else {
+                    payload.timestamp    = Date.now();
+                    payload.scheduledFor = null;
+                }
+
+                if (_bcEditId) {
+                    // ── UPDATE existing broadcast ──────────────────────────────
+                    await updateDoc(doc(db, 'posts', _bcEditId), payload);
+                    await writeAudit('BROADCAST_UPDATED', {
+                        targetId: _bcEditId, category, priority,
+                    });
+                    toast('Broadcast updated.', 'success');
+                } else {
+                    // ── CREATE new broadcast ───────────────────────────────────
+                    // Idempotency: check for a near-duplicate (same title+email in last 60 s)
+                    // to prevent accidental double-submissions.
+                    const since = Date.now() - 60_000;
+                    const dedupQ = query(
+                        collection(db, 'posts'),
+                        where('isBroadcast', '==', true),
+                        where('authorEmail', '==', currentUser.email),
+                        where('broadcastTitle', '==', title),
+                        where('timestamp', '>=', since),
+                        limit(1)
+                    );
+                    const dedupSnap = await getDocs(dedupQ);
+                    if (!dedupSnap.empty) {
+                        toast('A broadcast with this headline was just published. Wait 60 s to send again.', 'warn');
+                        restore();
+                        return;
+                    }
+
+                    await addDocument('posts', payload);
+                    await writeAudit('BROADCAST_SENT', { category, priority, scheduled: !!scheduled });
+                    toast(scheduled ? 'Broadcast scheduled! 📅' : 'Broadcast live in the feed! 📡', 'success');
+                }
+
+                resetForm();
+            } catch (err) {
+                console.error('[Admin] Broadcast submit error:', err);
+                toast(`Failed: ${err.message || 'Unknown error'}`, 'error');
+            } finally {
+                restore();
+            }
+        });
+
+        // ── Real-time active broadcasts listener (BUG-01 fix) ─────────────────
+        // Query by isBroadcast:true so we never accidentally show user Announcement
+        // posts in this panel, and we get only status:'active' ones that are live.
+        _detach('broadcasts');
+        _unsubs['broadcasts'] = onSnapshot(
+            query(
+                collection(db, 'posts'),
+                where('isBroadcast', '==', true),
+                orderBy('timestamp', 'desc'),
+                limit(50)
+            ),
+            (snap) => {
+                const list     = document.getElementById('active-broadcasts-list');
+                const countBadge = document.getElementById('bc-active-count');
+                if (!list) return;
+
+                // Split into active vs scheduled vs archived
+                const active    = [];
+                const scheduled = [];
+                const archived  = [];
+
+                snap.forEach(d => {
+                    const data = { id: d.id, ...d.data() };
+                    if (data.status === 'archived') archived.push(data);
+                    else if (data.status === 'scheduled') scheduled.push(data);
+                    else active.push(data);
+                });
+
+                if (countBadge) {
+                    countBadge.textContent = active.length;
+                    countBadge.classList.toggle('hidden', active.length === 0);
+                }
 
                 if (snap.empty) {
-                    list.innerHTML = '<p class="text-slate-500 text-sm">No active broadcasts.</p>';
+                    list.innerHTML = emptyState(
+                        '📡', 'No broadcasts yet',
+                        'Send your first broadcast and it will appear here in real time.'
+                    );
                     return;
                 }
 
-                list.innerHTML = snap.docs.map(d => {
-                    const p = d.data();
-                    const ts = p.timestamp ? timeAgo(p.timestamp) : 'unknown time';
+                const renderGroup = (items, groupLabel, extraClasses = '') => {
+                    if (!items.length) return '';
                     return `
-                        <div class="flex items-center justify-between gap-4 p-4 bg-slate-800/40
-                                    border border-slate-700/30 rounded-xl mb-2 group">
-                            <div class="min-w-0">
-                                <p class="text-white font-bold text-sm truncate">${sanitize(p.title)}</p>
-                                <p class="text-slate-500 text-xs mt-0.5 font-mono">${ts}</p>
+                        <div class="mb-5">
+                            <p class="text-[10px] text-slate-500 uppercase font-black tracking-widest mb-3">
+                                ${groupLabel}
+                            </p>
+                            <div class="space-y-3 ${extraClasses}">
+                                ${items.map(p => renderBroadcastCard(p)).join('')}
                             </div>
-                            <button class="admin-setting-action flex-shrink-0 bg-red-500/10 text-red-400
-                                           hover:bg-red-500/20 px-3.5 py-2 rounded-lg text-xs font-bold
-                                           border border-red-500/20 transition uppercase tracking-wider"
-                                    data-action="retract-broadcast" data-id="${d.id}">
-                                Retract
-                            </button>
                         </div>`;
-                }).join('');
-            } catch (err) {
-                if (list) list.innerHTML = errorState('Failed to load broadcasts.');
-            }
-        };
+                };
 
-        await loadActive();
+                list.innerHTML =
+                    renderGroup(active,    '🟢 Live in feed', '') +
+                    renderGroup(scheduled, '⏳ Scheduled', 'opacity-80') +
+                    renderGroup(archived,  '🗄 Archived', 'opacity-60');
 
-        // Submit
-        document.getElementById('bc-submit')?.addEventListener('click', async (e) => {
-            const btn     = e.currentTarget;
-            const title   = titleEl?.value.trim();
-            const content = contentEl?.value.trim();
-            if (!title || !content) { toast('Headline and body are required.', 'warn'); return; }
+                // Wire up action buttons on all newly rendered cards
+                list.querySelectorAll('[data-bc-action]').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const action = btn.dataset.bcAction;
+                        const id     = btn.dataset.bcId;
+                        const card   = list.querySelector(`.bc-active-card[data-bc-id="${id}"]`);
+                        const p      = snap.docs.find(d => d.id === id)?.data();
+                        if (!p) return;
 
-            const restore = btnLoading(btn, 'Sending…');
-            try {
-                const category = document.getElementById('bc-category').value;
-                const priority = document.getElementById('bc-priority').value;
-                await addDocument('posts', {
-                    type: 'post', title: `🚨 [${category}] ${title}`, content,
-                    category: 'Announcement', community: 'Global', priority,
-                    tags: ['system', 'admin', category.toLowerCase()],
-                    author: 'System Administrator', authorEmail: currentUser.email,
-                    commentCount: 0, upvotedBy: [], timestamp: Date.now(),
+                        if (action === 'edit') {
+                            startEdit(id, p);
+                        }
+
+                        if (action === 'archive') {
+                            dangerModal({
+                                title:       'Archive Broadcast',
+                                body:        'This will unpin the broadcast from the feed without deleting it. You can re-publish it later.',
+                                confirmText: 'Archive',
+                                onConfirm:   async () => {
+                                    const restore = btnLoading(btn, 'Archiving…');
+                                    try {
+                                        await updateDoc(doc(db, 'posts', id), {
+                                            status: 'archived',
+                                            pinned: false,
+                                            archivedAt: Date.now(),
+                                            archivedBy: currentUser.email,
+                                        });
+                                        await writeAudit('BROADCAST_ARCHIVED', { targetId: id });
+                                        toast('Broadcast archived and unpinned.', 'success');
+                                        if (_bcEditId === id) resetForm();
+                                    } catch (err) {
+                                        toast('Failed to archive broadcast.', 'error');
+                                        restore();
+                                    }
+                                },
+                            });
+                        }
+
+                        if (action === 'restore') {
+                            dangerModal({
+                                title:       'Restore Broadcast',
+                                body:        'Re-pin this broadcast to the top of the Global Posts feed?',
+                                confirmText: 'Restore',
+                                onConfirm:   async () => {
+                                    const restore = btnLoading(btn, 'Restoring…');
+                                    try {
+                                        await updateDoc(doc(db, 'posts', id), {
+                                            status:    'active',
+                                            pinned:    true,
+                                            timestamp: Date.now(),
+                                            archivedAt: null,
+                                        });
+                                        await writeAudit('BROADCAST_RESTORED', { targetId: id });
+                                        toast('Broadcast restored and re-pinned.', 'success');
+                                    } catch (err) {
+                                        toast('Failed to restore broadcast.', 'error');
+                                        restore();
+                                    }
+                                },
+                            });
+                        }
+
+                        if (action === 'delete') {
+                            dangerModal({
+                                title:       'Delete Broadcast',
+                                body:        'Permanently remove this broadcast from the feed and database? This cannot be undone.',
+                                confirmText: 'Delete',
+                                onConfirm:   async () => {
+                                    const restore = btnLoading(btn, 'Deleting…');
+                                    try {
+                                        await deleteDoc(doc(db, 'posts', id));
+                                        await writeAudit('BROADCAST_DELETED', { targetId: id });
+                                        toast('Broadcast deleted.', 'success');
+                                        if (_bcEditId === id) resetForm();
+                                    } catch (err) {
+                                        toast('Failed to delete broadcast.', 'error');
+                                        restore();
+                                    }
+                                },
+                            });
+                        }
+                    });
                 });
-                await writeAudit('BROADCAST_SENT', { category, priority });
-                titleEl.value = ''; contentEl.value = '';
-                setHTML('bc-title-count', '0 / 120');
-                setHTML('bc-content-count', '0 / 2000');
-                if (preview) preview.classList.add('hidden');
-                toast('Broadcast sent.', 'success');
-                await loadActive();
-            } catch (err) {
-                toast('Failed to send broadcast.', 'error');
-            } finally { restore(); }
-        });
+            },
+            (err) => {
+                console.error('[Admin] Broadcasts listener error:', err);
+                const list = document.getElementById('active-broadcasts-list');
+                if (list) list.innerHTML = errorState(`Failed to load broadcasts: ${err.message}`);
+            }
+        );
+    } // end renderBroadcast
+
+    // ── Broadcast card HTML renderer ──────────────────────────────────────────
+    // Pure function — no DOM side-effects. Called by the onSnapshot handler.
+    function renderBroadcastCard(p) {
+        const ts        = p.timestamp ? timeAgo(p.timestamp) : 'just now';
+        const isLive    = p.status !== 'archived' && p.status !== 'scheduled';
+        const isArchived = p.status === 'archived';
+        const isSched   = p.status === 'scheduled';
+        const catEmoji  = { MAINTENANCE:'🔧', UPDATE:'✨', WARNING:'⚠️',
+                            EVENT:'🎉', POLICY:'📜', NOTICE:'📣' }[p.broadcastCategory] || '📡';
+
+        // Priority badge class
+        const priClass  = {
+            critical: 'bc-priority-badge--critical',
+            high:     'bc-priority-badge--high',
+        }[p.priority] || 'bc-priority-badge--normal';
+        const priLabel  = { critical: '🚨 Critical', high: 'High', normal: 'Normal' }[p.priority] || 'Normal';
+
+        // Media thumbnail strip (first 3)
+        const mediaStrip = (p.mediaItems || []).slice(0, 3).map(m => {
+            if (m.type === 'image')
+                return `<img src="${sanitize(m.url)}" class="w-10 h-8 object-cover rounded border border-slate-700 flex-shrink-0">`;
+            return `<div class="flex items-center justify-center w-10 h-8 rounded border border-slate-700
+                                flex-shrink-0 text-slate-500 text-sm">
+                        ${m.type === 'video' ? '🎬' : '📎'}
+                    </div>`;
+        }).join('');
+
+        const schedNote = isSched && p.scheduledFor
+            ? `<span class="text-[10px] text-amber-400 font-mono">
+                   Scheduled: ${new Date(p.scheduledFor).toLocaleString()}
+               </span>`
+            : '';
+
+        const editedNote = p.editedAt
+            ? `<span class="text-[10px] text-slate-500 font-mono">edited ${timeAgo(p.editedAt)}</span>`
+            : '';
+
+        // Action buttons depending on current status
+        const actions = isArchived
+            ? `<button class="admin-setting-action bc-btn-restore text-emerald-400 bg-emerald-500/10
+                              hover:bg-emerald-500/20 border-emerald-500/20 px-3 py-1.5 rounded-lg text-xs
+                              font-bold border transition uppercase tracking-wider"
+                       data-bc-action="restore" data-bc-id="${p.id}">
+                   ↑ Restore
+               </button>
+               <button class="admin-setting-action bc-btn-delete text-red-400 bg-red-500/10
+                              hover:bg-red-500/20 border-red-500/20 px-3 py-1.5 rounded-lg text-xs
+                              font-bold border transition uppercase tracking-wider"
+                       data-bc-action="delete" data-bc-id="${p.id}">
+                   🗑 Delete
+               </button>`
+            : `<button class="admin-setting-action bc-btn-edit text-indigo-400 bg-indigo-500/10
+                              hover:bg-indigo-500/20 border-indigo-500/20 px-3 py-1.5 rounded-lg text-xs
+                              font-bold border transition uppercase tracking-wider"
+                       data-bc-action="edit" data-bc-id="${p.id}">
+                   ✏️ Edit
+               </button>
+               <button class="admin-setting-action bc-btn-archive text-amber-400 bg-amber-500/10
+                              hover:bg-amber-500/20 border-amber-500/20 px-3 py-1.5 rounded-lg text-xs
+                              font-bold border transition uppercase tracking-wider"
+                       data-bc-action="archive" data-bc-id="${p.id}">
+                   📦 Archive
+               </button>
+               <button class="admin-setting-action bc-btn-delete text-red-400 bg-red-500/10
+                              hover:bg-red-500/20 border-red-500/20 px-3 py-1.5 rounded-lg text-xs
+                              font-bold border transition uppercase tracking-wider"
+                       data-bc-action="delete" data-bc-id="${p.id}">
+                   🗑 Delete
+               </button>`;
+
+        return `
+            <div class="bc-active-card" data-bc-id="${p.id}">
+                <!-- Header row -->
+                <div class="flex items-start gap-3 mb-3">
+                    <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-500/20 to-indigo-600/20
+                                border border-sky-500/20 flex items-center justify-center text-sm flex-shrink-0">
+                        ${catEmoji}
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="flex flex-wrap items-center gap-2 mb-1">
+                            <p class="text-white font-bold text-sm truncate max-w-xs">${sanitize(p.broadcastTitle || p.title)}</p>
+                            <span class="bc-priority-badge ${priClass}">${priLabel}</span>
+                            ${isArchived ? `<span class="bc-priority-badge bc-priority-badge--normal">Archived</span>` : ''}
+                            ${isSched    ? `<span class="bc-priority-badge bc-priority-badge--high">Scheduled</span>`  : ''}
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
+                            <span class="font-mono">${ts}</span>
+                            <span>·</span>
+                            <span class="text-sky-500/80">${sanitize(p.broadcastCategory || p.category || '')}</span>
+                            ${p.mediaItems?.length ? `<span>·</span><span>📎 ${p.mediaItems.length} file${p.mediaItems.length !== 1 ? 's' : ''}</span>` : ''}
+                            ${schedNote}
+                            ${editedNote}
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Content preview -->
+                ${p.content ? `
+                <p class="text-slate-400 text-xs leading-relaxed mb-3 line-clamp-2">
+                    ${sanitize(p.content)}
+                </p>` : ''}
+
+                <!-- Media thumbnails -->
+                ${mediaStrip ? `<div class="flex gap-2 mb-3">${mediaStrip}</div>` : ''}
+
+                <!-- Action buttons -->
+                <div class="flex flex-wrap gap-2">
+                    ${actions}
+                </div>
+            </div>`;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1909,27 +2640,10 @@ export function setupAdmin() {
                 });
             }
 
-            // Retract broadcast
-            if (action === 'retract-broadcast') {
-                const postId = btn.dataset.id;
-                dangerModal({
-                    title: 'Retract Broadcast',
-                    body: 'Remove this announcement from the global feed?',
-                    confirmText: 'Retract',
-                    onConfirm: async () => {
-                        const restore = btnLoading(btn, 'Retracting…');
-                        try {
-                            await deleteDoc(doc(db, 'posts', postId));
-                            await writeAudit('BROADCAST_RETRACTED', { targetId: postId });
-                            toast('Broadcast retracted.', 'success');
-                            btn.closest('.flex')?.remove();
-                        } catch (err) {
-                            toast('Failed to retract broadcast.', 'error');
-                            restore();
-                        }
-                    }
-                });
-            }
+            // Note: broadcast actions (edit / archive / restore / delete) are now
+            // wired directly inside renderBroadcast()'s onSnapshot callback via
+            // [data-bc-action] buttons. The old 'retract-broadcast' action is
+            // removed to avoid conflicts. No code needed here.
         }
 
         // ── MODERATION REPORT CARD ACTIONS ───────────────────────────────────

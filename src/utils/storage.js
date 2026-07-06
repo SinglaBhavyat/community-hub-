@@ -1,7 +1,7 @@
 // src/utils/storage.js
 
-const CLOUD_NAME    = 'dqipn2dty';
-const UPLOAD_PRESET = 'app1234';
+const CLOUD_NAME    = 'YOUR_CLOUDINARY_CLOUD_NAME';
+const UPLOAD_PRESET = 'YOUR_CLOUDINARY_UPLOAD_PRESET';
 
 // ─── Resource type ────────────────────────────────────────────────────────────
 function resourceTypeFor(file) {

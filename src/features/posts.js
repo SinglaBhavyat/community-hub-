@@ -1168,21 +1168,46 @@ export function setupPosts() {
 
             if (reset) feed.innerHTML = '';
 
-            const pinned = [];
-            const normal = [];
-            let count    = 0;
+            const broadcasts = [];  // isBroadcast:true — always topmost
+            const pinned     = [];  // regular pinned posts — below broadcasts
+            const normal     = [];
+            let count        = 0;
 
             snapshot.forEach(docSnap => {
                 const post = { id: docSnap.id, ...docSnap.data() };
                 if (!matchesFilters(post)) return;
                 if (!reset && feed.querySelector(`.post-card[data-post-id="${post.id}"]`)) return;
                 const card = renderPost(post);
-                if (post.pinned) { card.classList.add('post-card--pinned'); pinned.push(card); }
-                else normal.push(card);
+
+                // Active broadcasts: mark with both CSS classes and inject
+                // a "Broadcast" banner chip at the top of the card content.
+                if (post.isBroadcast && post.status !== 'archived' && post.status !== 'scheduled') {
+                    card.classList.add('post-card--pinned', 'post-card--broadcast');
+                    // Inject broadcast badge above the card title (if not already there)
+                    const cardBody = card.querySelector('.post-header, .post-content, .post-body, h2, h3, p');
+                    if (cardBody && !card.querySelector('.broadcast-feed-banner')) {
+                        const catEmoji = {
+                            MAINTENANCE:'🔧', UPDATE:'✨', WARNING:'⚠️',
+                            EVENT:'🎉', POLICY:'📜', NOTICE:'📣',
+                        }[post.broadcastCategory] || '📡';
+                        const banner = document.createElement('div');
+                        banner.className = 'broadcast-feed-banner';
+                        banner.innerHTML = `<span>${catEmoji} BROADCAST · ${post.broadcastCategory || 'ANNOUNCEMENT'}</span>`;
+                        cardBody.parentElement?.insertBefore(banner, cardBody);
+                    }
+                    broadcasts.push(card);
+                } else if (post.pinned) {
+                    card.classList.add('post-card--pinned');
+                    pinned.push(card);
+                } else {
+                    normal.push(card);
+                }
                 count++;
             });
 
             if (reset) {
+                // Render order: broadcasts → regular pinned → normal posts
+                broadcasts.forEach(c => feed.appendChild(c));
                 pinned.forEach(c => feed.appendChild(c));
                 normal.forEach(c => feed.appendChild(c));
                 if (count === 0) {
@@ -1993,6 +2018,21 @@ function _injectGlobalStyles() {
         .post-card--pinned {
             border-left: 3px solid #6366f1;
         }
+        /* Broadcast cards override the pinned indigo border with sky blue */
+        .post-card--broadcast {
+            border-left: 3px solid #38bdf8 !important;
+            background: linear-gradient(135deg, rgba(56,189,248,0.04) 0%, transparent 60%);
+        }
+        .broadcast-feed-banner {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 2px 10px; border-radius: 20px; margin-bottom: 8px;
+            background: rgba(56,189,248,0.12);
+            border: 1px solid rgba(56,189,248,0.25);
+        }
+        .broadcast-feed-banner span {
+            font-size: 10px; font-weight: 800; color: #38bdf8;
+            text-transform: uppercase; letter-spacing: 0.08em;
+        }
 
         /* ── Post header ───────────────────── */
         .post-header {
@@ -2479,6 +2519,8 @@ function _injectGlobalStyles() {
         body.dark-mode .post-edited-badge   { background: #27272a; color: #71717a; }
         body.dark-mode .author-avatar       { box-shadow: 0 2px 8px rgba(99,102,241,0.5); }
         body.dark-mode .post-card--pinned   { background: rgba(99,102,241,0.06); }
+        body.dark-mode .post-card--broadcast { border-left-color: #38bdf8 !important; background: rgba(56,189,248,0.05) !important; }
+        body.dark-mode .broadcast-feed-banner { background: rgba(56,189,248,0.1); border-color: rgba(56,189,248,0.2); }
     `;
     document.head.appendChild(style);
 }

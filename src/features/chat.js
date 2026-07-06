@@ -16,7 +16,8 @@ import {
 let chatSub              = null;
 let rootChatSub          = null;
 let recentChatsSub       = null;
-let presenceSub          = null;
+let presenceSub          = null;   // real-time presence (online/last-seen) listener
+let typingSub            = null;   // real-time typing indicator listener (private from presenceSub)
 let activeRoomId         = null;
 let activeRoomDetails    = null;
 let cachedUsersHTML      = null;
@@ -65,6 +66,23 @@ let _portalListenerSetup = false;
 // handleMessageAction from the CURRENT setupChat() closure, even after re-login.
 let _globalPortalClickHandler = null;
 
+// ── MODULE-LEVEL CONSTANTS ────────────────────────────────────────────────────
+// MAX_UPLOAD_BYTES must be at module scope so it is accessible inside event
+// handlers that are registered before setupChat()'s local scope is reached.
+// (Using const inside setupChat() creates a temporal dead zone at the call sites
+// inside handleMessageAction which are declared via async function expressions
+// also inside setupChat() — JavaScript hoists the function declaration but NOT
+// the const binding, so a reference at line 4683 would throw ReferenceError.)
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+
+// ── MULTI-ATTACHMENT COMPOSE QUEUE ──────────────────────────────────────────
+// pendingAttachments holds files the user has selected but not yet sent.
+// Each entry: { id, file, name, mime, size, type, previewUrl, uploadedUrl,
+//               progress, error, compressing, uploadXhr }
+// The compose tray renders from this array; clearComposeTray revokes blob URLs.
+let pendingAttachments     = [];
+let _attachIdCounter       = 0;
+
 const TYPING_TTL_MS    = 6000;
 const EMOJI_LIST       = ['😀','😂','😍','🥰','😎','🤔','😮','😢','😡','👍','❤️','🙏','🎉','🔥','✅','💯','🤣','😭','😊','🥺','🤩','😴','🤯','💀','👋','🤝','💪','👀','🫡','🫶'];
 const REACTION_EMOJIS  = ['👍','❤️','😂','😮','😢','🙏'];
@@ -102,8 +120,11 @@ async function uploadBytesWithRetry(file, folder, onProgress, fileName) {
                 onProgress: (pct) => onProgress?.(pct, attempt),
             });
         } catch (err) {
+            // BUG FIX: was incrementing attempt BEFORE the > check, so retries were
+            // capped at MAX_UPLOAD_RETRIES-1. Increment after the check so the full
+            // MAX_UPLOAD_RETRIES attempts are actually performed.
+            if (attempt >= MAX_UPLOAD_RETRIES) throw err;
             attempt++;
-            if (attempt > MAX_UPLOAD_RETRIES) throw err;
             onProgress?.(0, attempt);
             await sleep(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1));
         }
@@ -293,6 +314,7 @@ function unsubscribeRoomListeners() {
     chatSub?.();       chatSub     = null;
     rootChatSub?.();   rootChatSub = null;
     presenceSub?.();   presenceSub = null;
+    typingSub?.();     typingSub   = null;
     // FIX BUG-STARRED: always tear down the starred listener when leaving a room so
     // it doesn't keep writing to a stale starredMessages Set for the old room.
     starredSub?.();    starredSub  = null;
@@ -310,7 +332,8 @@ function clearTypingState() {
 }
 
 function writeTypingState(roomId, typing) {
-    if (!roomId) return;
+    // BUG FIX: currentUser may be null during teardown / beforeunload after logout.
+    if (!roomId || !currentUser?.email) return;
     setDoc(doc(db, `chats/${roomId}/typing`, currentUser.email), {
         typing, name: currentUser.name, updatedAt: serverTimestamp()
     }).catch(() => {});
@@ -335,6 +358,7 @@ export function teardownChat() {
     unsubscribeRoomListeners();
     unsubscribeRecent();
     stopRecording(true);
+    typingSub?.();     typingSub   = null;
     if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
     // FIX BUG-DROPDOWN: remove the document-level click listener that closes the
     // header dropdown.  Previously teardownChat only nulled the reference without
@@ -372,6 +396,16 @@ export function teardownChat() {
     if (navDot) { navDot.classList.add('hidden'); navDot.textContent = ''; }
     // Remove injected hidden file inputs on teardown to prevent accumulation
     document.querySelectorAll('[data-chat-input="true"]').forEach(el => el.remove());
+    // Clear compose tray: revoke all blob preview URLs to free memory
+    pendingAttachments.forEach(item => {
+        if (item.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(item.previewUrl);
+    });
+    pendingAttachments = [];
+    document.getElementById('wa-compose-tray')?.remove();
+
+    // Clear any open per-attachment action strips (touch UX cleanup)
+    document.querySelectorAll('.wa-att-item.wa-att-open').forEach(el => el.classList.remove('wa-att-open'));
+
     delete window.startDirectChat;
     const chatContainer = document.getElementById('chat-messages');
     if (chatContainer) delete chatContainer.dataset.chatWired;
@@ -410,7 +444,8 @@ function isUserOnline(ts) {
 }
 
 function formatLastSeen(ts) {
-    if (!ts?.toDate) return '';
+    // BUG FIX: return a readable fallback instead of blank when timestamp is missing.
+    if (!ts?.toDate) return 'last seen a while ago';
     const diffMs = Date.now() - ts.toDate().getTime();
     const mins   = Math.floor(diffMs / 60000);
     if (mins < 1)  return 'last seen recently';
@@ -555,7 +590,8 @@ function buildReactionsHTML(reactions, msgId) {
     const entries = Object.entries(reactions).filter(([, u]) => u?.length > 0);
     if (!entries.length) return '';
     const pills = entries.map(([emoji, users]) => {
-        const mine = users.includes(currentUser.email);
+        // BUG FIX: users may be undefined/null from a partially-written Firestore doc.
+        const mine = Array.isArray(users) && users.includes(currentUser.email);
         return `<button class="wa-reaction-pill ${mine ? 'wa-reaction-pill--mine' : ''}"
                         data-msg-id="${msgId}" data-emoji="${emoji}">
                     ${emoji} <span>${users.length}</span>
@@ -595,7 +631,13 @@ function buildReplyPreviewHTML(replyData) {
     if (!replyData) return '';
     const isMe  = replyData.senderEmail === currentUser.email;
     const label = isMe ? 'You' : sanitize(replyData.senderName || 'Someone');
-    const text  = replyData.imageUrl  ? '📷 Photo'
+    const _attCount = replyData.attachments?.length || 0;
+    const _attFirst = _attCount ? replyData.attachments[0] : null;
+    const text  = _attFirst?.type === 'image' ? `📷 Photo${_attCount > 1 ? ` ×${_attCount}` : ''}`
+                : _attFirst?.type === 'video' ? '🎥 Video'
+                : _attFirst?.type === 'audio' ? '🎤 Voice note'
+                : _attFirst            ? `📎 ${sanitize(_attFirst.name || 'File')}`
+                : replyData.imageUrl  ? '📷 Photo'
                 : replyData.voiceUrl  ? '🎤 Voice note'
                 : replyData.fileUrl   ? `📎 ${sanitize(replyData.fileName || 'File')}`
                 : sanitize(replyData.text || '');
@@ -647,6 +689,185 @@ function buildFileHTML(msg) {
             <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
         </svg>
     </a>`;
+}
+
+// ─────────────────────────────────────────────
+// MULTI-ATTACHMENT HTML BUILDERS
+// Each attachment is rendered individually in a WhatsApp-style block.
+// Supported types: image, video, audio, document.
+// Backwards compat: legacy single-field messages still use the old builders.
+// ─────────────────────────────────────────────
+
+// Per-attachment action menu button — rendered over every attachment cell.
+// data-msg-id and data-att-idx let the handler look up the exact attachment
+// from lastMessagesSnapshot without any ambiguity.
+function _buildAttMenuBtn(msgId, idx, isOwner) {
+    // Owners get: Download · Reply · Forward · Replace · Delete
+    // Others get: Download · Reply · Forward
+    const ownerItems = isOwner ? `
+        <button class="wa-att-menu-item att-replace-btn" data-msg-id="${msgId}" data-att-idx="${idx}">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+            Replace
+        </button>
+        <button class="wa-att-menu-item att-delete-btn" data-msg-id="${msgId}" data-att-idx="${idx}">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            Delete
+        </button>` : '';
+    return `
+    <div class="wa-att-actions" data-msg-id="${msgId}" data-att-idx="${idx}">
+        <button class="wa-att-menu-item att-download-btn" data-msg-id="${msgId}" data-att-idx="${idx}">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+            Download
+        </button>
+        <button class="wa-att-menu-item att-reply-btn" data-msg-id="${msgId}" data-att-idx="${idx}">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"/></svg>
+            Reply
+        </button>
+        <button class="wa-att-menu-item att-forward-btn" data-msg-id="${msgId}" data-att-idx="${idx}">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 9l3 3-3 3m-4 0a9 9 0 110-6"/></svg>
+            Forward
+        </button>
+        ${ownerItems}
+    </div>`;
+}
+
+// Resolve a single attachment object from the snapshot by msgId + attIdx.
+// Returns null if the message or attachment index is not found.
+function _resolveAttachment(msgId, attIdx) {
+    const msg = lastMessagesSnapshot.find(m => m.id === msgId);
+    if (!msg?.attachments) return null;
+    const idx = parseInt(attIdx, 10);
+    if (isNaN(idx) || idx < 0 || idx >= msg.attachments.length) return null;
+    return { msg, att: msg.attachments[idx], idx };
+}
+
+function buildSingleAttachmentHTML(att, msgId, idx, isOwner = false) {
+    const _url = safeUrl(att.url || '') || '';
+    if (!_url) return '';
+
+    // Every attachment gets the same wrapper that carries identity data and
+    // reveals the per-attachment action strip on hover/focus.
+    const wrapOpen  = `<div class="wa-att-item" data-msg-id="${msgId}" data-att-idx="${idx}">`;
+    const wrapClose = `${_buildAttMenuBtn(msgId, idx, isOwner)}</div>`;
+
+    if (att.type === 'image') {
+        return `${wrapOpen}<div class="wa-att-image-wrap">
+            <img src="${_url}" class="wa-att-image msg-image"
+                 data-full="${_url}" data-att-idx="${idx}" data-msg-id="${msgId}"
+                 loading="lazy" alt="${sanitize(att.name || 'Image')}"
+                 decoding="async">
+        </div>${wrapClose}`;
+    }
+
+    if (att.type === 'video') {
+        return `${wrapOpen}<div class="wa-att-video-wrap" data-msg-id="${msgId}" data-att-idx="${idx}">
+            <video class="wa-att-video" src="${_url}"
+                   controls preload="metadata"
+                   aria-label="${sanitize(att.name || 'Video')}"></video>
+        </div>${wrapClose}`;
+    }
+
+    if (att.type === 'audio') {
+        const durSec = att.duration || 0;
+        const durStr = durSec ? formatDuration(durSec) : '0:00';
+        let seed = 0;
+        for (let i = 0; i < (_url).length; i++) seed = (seed * 31 + _url.charCodeAt(i)) >>> 0;
+        const pr = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return (seed >>> 0) / 4294967296; };
+        const bars = Array.from({length: 20}, (_, i) => {
+            const h = 4 + Math.sin(i * 0.9) * 8 + pr() * 6;
+            return `<span class="wa-wave-bar" style="height:${Math.round(h)}px"></span>`;
+        }).join('');
+        return `${wrapOpen}<div class="wa-voice-note wa-att-audio" data-voice-url="${_url}">
+            <button class="wa-voice-play-btn" data-voice-url="${_url}">
+                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24" class="wa-play-icon">
+                    <path d="M8 5v14l11-7z"/>
+                </svg>
+            </button>
+            <div class="wa-voice-waveform">${bars}</div>
+            <span class="wa-voice-duration">${durStr}</span>
+        </div>${wrapClose}`;
+    }
+
+    // Document / raw file
+    const icon = getFileIcon(att.mime || '');
+    const name = sanitize(att.name || 'File');
+    const size = att.size ? `${(att.size / 1024).toFixed(1)} KB` : '';
+    return `${wrapOpen}<a href="${_url}" target="_blank" rel="noopener noreferrer" class="wa-file-attachment wa-att-doc">
+        <span class="wa-file-icon">${icon}</span>
+        <div class="wa-file-info">
+            <span class="wa-file-name">${name}</span>
+            ${size ? `<span class="wa-file-size">${size}</span>` : ''}
+        </div>
+        <svg class="wa-file-dl" width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+        </svg>
+    </a>${wrapClose}`;
+}
+
+// Render a multi-attachment block with WhatsApp-style grid layout.
+// 1 image → full width; 2 → side-by-side; 3-4 → 2-col grid with aspect ratio;
+// 5+ → mosaic with a "+N more" overlay on the 4th cell.
+// Non-image types (video, audio, doc) are always full-width rows.
+//
+// FIXED: use the attachment's ORIGINAL index in `attachments[]` throughout —
+// previously used attachments.indexOf(a) which is O(n²) and breaks when two
+// attachments share the same object reference. Now we build (value, realIdx)
+// pairs upfront so every call to buildSingleAttachmentHTML receives the correct
+// index into the canonical array stored in lastMessagesSnapshot.
+function buildAttachmentsHTML(attachments, msgId, isOwner = false) {
+    if (!attachments?.length) return '';
+
+    // Build (att, originalIndex) pairs for images and non-images separately
+    const imagePairs    = [];
+    const nonImagePairs = [];
+    attachments.forEach((a, realIdx) => {
+        if (a.type === 'image') imagePairs.push({ a, realIdx });
+        else                    nonImagePairs.push({ a, realIdx });
+    });
+
+    let html = '<div class="wa-att-block">';
+
+    // ── Image grid ──
+    if (imagePairs.length === 1) {
+        const { a, realIdx } = imagePairs[0];
+        html += `<div class="wa-att-grid wa-att-grid--1">
+            ${buildSingleAttachmentHTML(a, msgId, realIdx, isOwner)}
+        </div>`;
+    } else if (imagePairs.length === 2) {
+        html += `<div class="wa-att-grid wa-att-grid--2">
+            ${imagePairs.map(({ a, realIdx }) => buildSingleAttachmentHTML(a, msgId, realIdx, isOwner)).join('')}
+        </div>`;
+    } else if (imagePairs.length >= 3) {
+        const visiblePairs = imagePairs.slice(0, 4);
+        const extra        = imagePairs.length - 4; // may be negative (3 images → extra=-1 → no overlay)
+        html += `<div class="wa-att-grid wa-att-grid--4">`;
+        visiblePairs.forEach(({ a, realIdx }, i) => {
+            if (i === 3 && extra > 0) {
+                // "+N more" overlay on the 4th tile. Still a full att-item so it
+                // supports the action strip (download/forward/delete).
+                const _url = safeUrl(a.url || '') || '';
+                html += `<div class="wa-att-item" data-msg-id="${msgId}" data-att-idx="${realIdx}">
+                    <div class="wa-att-image-wrap wa-att-more-wrap">
+                        <img src="${_url}" class="wa-att-image" loading="lazy" alt=""
+                             data-full="${_url}" data-msg-id="${msgId}" data-att-idx="${realIdx}">
+                        <div class="wa-att-more-overlay" data-msg-id="${msgId}" data-att-start-idx="${realIdx}" style="cursor:pointer">+${extra + 1}</div>
+                    </div>
+                    ${_buildAttMenuBtn(msgId, realIdx, isOwner)}
+                </div>`;
+            } else {
+                html += buildSingleAttachmentHTML(a, msgId, realIdx, isOwner);
+            }
+        });
+        html += '</div>';
+    }
+
+    // ── Non-image rows (video, audio, document) ──
+    nonImagePairs.forEach(({ a, realIdx }) => {
+        html += `<div class="wa-att-row">${buildSingleAttachmentHTML(a, msgId, realIdx, isOwner)}</div>`;
+    });
+
+    html += '</div>';
+    return html;
 }
 
 const URL_REGEX = /https?:\/\/[^\s<>"]+/g;
@@ -733,19 +954,22 @@ function buildMessageHTML(msg, index, messages, chatType) {
     const replyHTML = msg.replyTo ? buildReplyPreviewHTML(msg.replyTo) : '';
 
     let contentHTML = '';
-    if (msg.voiceUrl) {
+    // NEW: multi-attachment array takes priority over legacy single-field media
+    const _isOwner = msg.senderEmail === currentUser?.email;
+    if (msg.attachments?.length) {
+        contentHTML = buildAttachmentsHTML(msg.attachments, msg.id, _isOwner);
+    } else if (msg.voiceUrl) {
         contentHTML = buildVoiceNoteHTML(msg, isMe);
     } else if (msg.imageUrl) {
         // Fix #9 (High): validate imageUrl through safeUrl() before injecting into src/data-full
         const _safeImg = safeUrl(msg.imageUrl) || encodeURI(msg.imageUrl);
-        contentHTML = `<img src="${_safeImg}" class="wa-msg-image msg-image" data-full="${_safeImg}" loading="lazy" alt="Image">`;
+        contentHTML = `<div class="wa-att-block"><div class="wa-att-grid wa-att-grid--1"><div class="wa-att-image-wrap"><img src="${_safeImg}" class="wa-att-image msg-image" data-full="${_safeImg}" loading="lazy" alt="Image"></div></div></div>`;
     } else if (msg.fileUrl && msg.fileMime?.startsWith('video/')) {
         // FIXED: render video files as an inline <video> player, not a raw file link
         const _safeVid = safeUrl(msg.fileUrl) || '';
-        contentHTML = `<video class="wa-msg-video" src="${_safeVid}" controls preload="metadata"
-            style="max-width:260px;max-height:200px;border-radius:10px;display:block;background:#000"></video>`;
+        contentHTML = `<div class="wa-att-block"><div class="wa-att-row"><video class="wa-att-video" src="${_safeVid}" controls preload="metadata"></video></div></div>`;
     } else if (msg.fileUrl) {
-        contentHTML = buildFileHTML(msg);
+        contentHTML = `<div class="wa-att-block"><div class="wa-att-row">${buildFileHTML(msg)}</div></div>`;
     }
 
     let textHTML = '';
@@ -758,9 +982,12 @@ function buildMessageHTML(msg, index, messages, chatType) {
             if (!safe) return sanitize(u);
             return `<a href="${safe}" target="_blank" rel="noopener noreferrer" class="wa-link">${sanitize(u)}</a>`;
         });
-        textHTML = `<span class="wa-msg-text">${linkedText}</span>`;
+        // Use caption styling when media is present, plain text otherwise
+        const hasMedia = !!(msg.attachments?.length || msg.imageUrl || msg.voiceUrl || msg.fileUrl);
+        const textClass = hasMedia ? 'wa-att-caption' : 'wa-msg-text';
+        textHTML = `<span class="${textClass}">${linkedText}</span>`;
         const firstUrl = extractFirstUrl(msg.text);
-        if (firstUrl && !msg.imageUrl && !msg.fileUrl) {
+        if (firstUrl && !msg.attachments?.length && !msg.imageUrl && !msg.fileUrl) {
             textHTML += buildLinkPreviewHTML(firstUrl);
         }
     }
@@ -854,9 +1081,13 @@ function buildMessageHTML(msg, index, messages, chatType) {
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                     Copy text
                 </button>` : ''}
-                ${(msg.imageUrl || msg.fileUrl || msg.voiceUrl) ? `<button class="wa-drop-item msg-download-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}" data-url="${safeUrl(msg.imageUrl || msg.fileUrl || msg.voiceUrl || '') || ''}" data-filename="${sanitize(msg.fileName || (msg.imageUrl ? 'image' : msg.voiceUrl ? 'voice-note' : 'file'))}">
+                ${(msg.imageUrl || msg.fileUrl || msg.voiceUrl || msg.attachments?.length) ? `<button class="wa-drop-item msg-download-btn" role="menuitem" tabindex="-1"
+                    data-msg-id="${msg.id}"
+                    data-url="${safeUrl(msg.imageUrl || msg.fileUrl || msg.voiceUrl || '') || ''}"
+                    data-filename="${sanitize(msg.fileName || (msg.imageUrl ? 'image' : msg.voiceUrl ? 'voice-note' : 'file'))}"
+                    data-has-attachments="${!!(msg.attachments?.length)}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-                    Download
+                    Download${msg.attachments?.length > 1 ? ` (${msg.attachments.length})` : ''}
                 </button>` : ''}
                 ${!isMe ? `<button class="wa-drop-item msg-report-btn" role="menuitem" tabindex="-1" data-msg-id="${msg.id}">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
@@ -1091,6 +1322,278 @@ function ensureChatStyles() {
         body.dark-mode .ch-profile-area:hover { background: rgba(255,255,255,.06); }
         body.dark-mode .wa-nav-btn:hover { background: rgba(255,255,255,.08); }
         body.dark-mode #wa-attach-progress { background: var(--wa-panel); border-color: var(--wa-border); }
+        /* ═══ Per-attachment item wrapper & action overlay ═══ */
+        /* FIXED: display:contents broke grid layout — absolute-positioned children had
+           no positioned ancestor, overlays rendered in wrong place, and grid cells
+           collapsed. Use display:block everywhere; the grid item IS the wrapper. */
+        .wa-att-item {
+            position: relative;
+            display: block;
+            /* Clip children (img hover scale) without hiding the action overlay.
+               The overlay is inside .wa-att-item so it IS clipped correctly. */
+            overflow: hidden;
+            border-radius: 10px;
+        }
+        /* Grid cells — fill their cell completely */
+        .wa-att-grid > .wa-att-item {
+            display: block;
+            position: relative;
+            overflow: hidden;
+            border-radius: 0; /* grid clips via parent border-radius */
+        }
+        /* Ensure inner wrap fills the item */
+        .wa-att-item > .wa-att-image-wrap,
+        .wa-att-item > .wa-att-video-wrap {
+            width: 100%; height: 100%;
+            border-radius: 0;
+        }
+
+        /* Action strip — hidden by default, revealed on hover / focus-within */
+        .wa-att-actions {
+            position: absolute;
+            bottom: 0; left: 0; right: 0;
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            padding: 5px 6px;
+            background: linear-gradient(to top, rgba(0,0,0,.72) 0%, transparent 100%);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .18s;
+            border-radius: 0 0 10px 10px;
+            z-index: 4;
+            flex-wrap: wrap;
+        }
+        /* For document/audio rows the overlay sits at the right edge */
+        .wa-att-row .wa-att-actions {
+            top: 0; bottom: 0; right: 0; left: auto;
+            flex-direction: column;
+            justify-content: center;
+            padding: 6px 4px;
+            background: linear-gradient(to left, rgba(0,0,0,.6) 0%, transparent 100%);
+            border-radius: 0 10px 10px 0;
+        }
+        .wa-att-item:hover  > .wa-att-actions,
+        .wa-att-item:focus-within > .wa-att-actions {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        /* Touch: tap the item to toggle (JS adds .wa-att-open) */
+        .wa-att-item.wa-att-open > .wa-att-actions {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .wa-att-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 8px;
+            border: none;
+            border-radius: 6px;
+            background: rgba(255,255,255,.18);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+            backdrop-filter: blur(4px);
+            transition: background .12s;
+            line-height: 1;
+        }
+        .wa-att-menu-item:hover { background: rgba(255,255,255,.32); }
+        .att-delete-btn { background: rgba(239,68,68,.55); }
+        .att-delete-btn:hover  { background: rgba(239,68,68,.8); }
+        body.dark-mode .wa-att-menu-item { background: rgba(255,255,255,.15); }
+        body.dark-mode .wa-att-menu-item:hover { background: rgba(255,255,255,.28); }
+
+        /* ═══ Multi-attachment block ═══ */
+        .wa-att-block {
+            display: flex; flex-direction: column; gap: 4px;
+            /* FIXED: removed max-width:280px — was capping the grid narrower than
+               the bubble, causing images to render smaller than necessary.
+               The bubble itself (max-width:72% of viewport) provides the outer bound. */
+            width: 100%;
+            /* isolation:isolate so stacking contexts inside (overlays, z-index)
+               don't leak outside the attachment block */
+            isolation: isolate;
+        }
+        .wa-att-row { width: 100%; }
+
+        /* Image grid layouts */
+        .wa-att-grid {
+            display: grid; gap: 3px;
+            /* FIXED: removed overflow:hidden — the action overlay is position:absolute
+               inside .wa-att-item. overflow:hidden on the grid clipped those overlays.
+               Instead we clip the rounded corners via the outer .wa-att-block. */
+            border-radius: 12px; overflow: hidden;
+            width: 100%;
+        }
+        .wa-att-grid--1 { grid-template-columns: 1fr; max-width: 260px; }
+        .wa-att-grid--2 { grid-template-columns: 1fr 1fr; }
+        .wa-att-grid--4 { grid-template-columns: 1fr 1fr; }
+
+        /* Rounded corners on grid edge cells */
+        .wa-att-grid--1 > .wa-att-item:first-child  { border-radius: 12px; }
+        .wa-att-grid--2 > .wa-att-item:first-child  { border-radius: 12px 0 0 12px; }
+        .wa-att-grid--2 > .wa-att-item:last-child   { border-radius: 0 12px 12px 0; }
+        .wa-att-grid--4 > .wa-att-item:nth-child(1) { border-radius: 12px 0 0 0; }
+        .wa-att-grid--4 > .wa-att-item:nth-child(2) { border-radius: 0 12px 0 0; }
+        .wa-att-grid--4 > .wa-att-item:nth-child(3) { border-radius: 0 0 0 12px; }
+        .wa-att-grid--4 > .wa-att-item:nth-child(4) { border-radius: 0 0 12px 0; }
+
+        .wa-att-image-wrap {
+            position: relative; overflow: hidden;
+            background: var(--wa-input-bg);
+            width: 100%; height: 100%;
+        }
+        /* Single image: aspect ratio preserved with max dimensions */
+        .wa-att-grid--1 > .wa-att-item { aspect-ratio: unset; }
+        .wa-att-grid--1 .wa-att-image-wrap { aspect-ratio: unset; }
+        .wa-att-grid--2 > .wa-att-item { aspect-ratio: 1; }
+        .wa-att-grid--4 > .wa-att-item { aspect-ratio: 1; }
+
+        .wa-att-image {
+            width: 100%; height: 100%;
+            object-fit: cover; display: block;
+            cursor: zoom-in; transition: transform .18s;
+        }
+        .wa-att-image:hover { transform: scale(1.04); }
+        /* Single image: contain so portrait/landscape show in full */
+        .wa-att-grid--1 .wa-att-image {
+            max-height: 300px; object-fit: contain;
+            background: var(--wa-input-bg);
+        }
+
+        /* +N overlay on mosaic last tile */
+        .wa-att-more-wrap { position: relative; }
+        .wa-att-more-overlay {
+            position: absolute; inset: 0;
+            background: rgba(0,0,0,.55);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 22px; font-weight: 800; color: #fff;
+            letter-spacing: -0.5px;
+        }
+
+        /* Video attachment */
+        .wa-att-video-wrap {
+            border-radius: 12px; overflow: hidden;
+            background: #000; max-width: 260px;
+        }
+        .wa-att-video {
+            width: 100%; max-height: 200px;
+            display: block; border-radius: 12px;
+        }
+
+        /* Caption text — sits below the media block */
+        .wa-att-caption {
+            font-size: 14px; color: var(--wa-msg-text, #111);
+            line-height: 1.45; margin-top: 4px;
+            white-space: pre-wrap; word-break: break-word;
+        }
+        .wa-bubble--me .wa-att-caption { color: rgba(255,255,255,.95); }
+
+        /* Tighter bubble padding when the bubble contains only media */
+        .wa-bubble:has(.wa-att-block:first-child):not(:has(.wa-msg-text)) {
+            padding: 4px;
+        }
+        /* Keep meta row (timestamp/ticks) spaced from media */
+        .wa-bubble:has(.wa-att-block) .wa-msg-meta {
+            margin-top: 4px; padding: 0 4px 2px;
+        }
+
+        /* ═══ Compose Tray ═══ */
+        #wa-compose-tray {
+            background: var(--wa-panel); border-top: 1px solid var(--wa-border);
+            padding: 10px 12px 8px;
+            display: flex; flex-direction: column; gap: 8px;
+            flex-shrink: 0; position: relative;
+        }
+        .wa-ct-header {
+            display: flex; align-items: center; justify-content: space-between;
+            font-size: 12px; font-weight: 700; color: var(--wa-sub);
+            text-transform: uppercase; letter-spacing: .05em;
+        }
+        .wa-ct-clear {
+            background: none; border: none; color: var(--wa-sub);
+            cursor: pointer; font-size: 11px; padding: 2px 6px;
+            border-radius: 6px; transition: background .1s, color .1s;
+        }
+        .wa-ct-clear:hover { background: var(--wa-input-bg); color: var(--wa-danger); }
+        .wa-ct-thumbs {
+            display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
+        }
+        .wa-ct-thumbs::-webkit-scrollbar { height: 3px; }
+        .wa-ct-thumbs::-webkit-scrollbar-thumb { background: var(--wa-border); border-radius: 3px; }
+
+        .wa-ct-thumb {
+            position: relative; flex-shrink: 0;
+            width: 72px; height: 72px; border-radius: 10px;
+            overflow: hidden; background: var(--wa-input-bg);
+            border: 1.5px solid var(--wa-border);
+        }
+        .wa-ct-thumb-img {
+            width: 100%; height: 100%; object-fit: cover; display: block;
+        }
+        .wa-ct-thumb-doc {
+            width: 100%; height: 100%; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 4px;
+            font-size: 11px; color: var(--wa-sub); text-align: center;
+            padding: 4px; overflow: hidden;
+        }
+        .wa-ct-thumb-doc span:first-child { font-size: 22px; }
+        .wa-ct-thumb-doc span:last-child {
+            white-space: nowrap; overflow: hidden;
+            text-overflow: ellipsis; max-width: 100%;
+        }
+        .wa-ct-thumb-video-icon {
+            position: absolute; inset: 0; display: flex;
+            align-items: center; justify-content: center;
+            background: rgba(0,0,0,.35);
+        }
+        .wa-ct-remove {
+            position: absolute; top: 3px; right: 3px;
+            width: 18px; height: 18px; border-radius: 50%;
+            background: rgba(0,0,0,.55); border: none; color: #fff;
+            font-size: 11px; cursor: pointer; display: flex;
+            align-items: center; justify-content: center;
+            line-height: 1; transition: background .1s;
+        }
+        .wa-ct-remove:hover { background: var(--wa-danger); }
+        .wa-ct-progress-ring {
+            position: absolute; inset: 0; display: flex;
+            align-items: center; justify-content: center;
+            background: rgba(0,0,0,.45); border-radius: 10px;
+            font-size: 11px; font-weight: 700; color: #fff;
+        }
+        .wa-ct-error-badge {
+            position: absolute; bottom: 3px; left: 3px;
+            width: 16px; height: 16px; border-radius: 50%;
+            background: var(--wa-danger); color: #fff;
+            font-size: 10px; font-weight: 700;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .wa-ct-add-more {
+            flex-shrink: 0; width: 72px; height: 72px;
+            border-radius: 10px; border: 1.5px dashed var(--wa-border);
+            background: var(--wa-input-bg); color: var(--wa-sub);
+            font-size: 24px; cursor: pointer; display: flex;
+            align-items: center; justify-content: center;
+            transition: background .1s, color .1s, border-color .1s;
+        }
+        .wa-ct-add-more:hover {
+            background: var(--wa-accent-dim); color: var(--wa-accent);
+            border-color: var(--wa-accent);
+        }
+        .wa-ct-send-hint {
+            font-size: 11px; color: var(--wa-sub);
+            text-align: center; padding-bottom: 2px;
+        }
+        .wa-ct-caption-hint {
+            font-size: 12px; color: var(--wa-sub);
+        }
+        body.dark-mode #wa-compose-tray { background: var(--wa-panel); border-color: var(--wa-border); }
+        body.dark-mode .wa-ct-thumb { background: #1a1d35; border-color: var(--wa-border); }
 
         /* ═══ Chat page layout ═══ */
         #page-chat { padding-top: 20px !important; padding-bottom: 20px !important; }
@@ -1861,17 +2364,9 @@ function ensureChatStyles() {
         .wa-ep-btn { font-size: 20px; background: none; border: none; cursor: pointer; border-radius: 8px; padding: 3px; transition: background .1s; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; }
         .wa-ep-btn:hover { background: var(--wa-input-bg); }
 
-        /* ═══ Image lightbox ═══ */
-        #wa-lightbox {
-            position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,.92);
-            display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px;
-        }
-        #wa-lightbox img { max-width: 90vw; max-height: 80vh; border-radius: 14px; object-fit: contain; }
-        .wa-lb-close { position: absolute; top: 20px; right: 20px; background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.2); color: #fff; width: 40px; height: 40px; border-radius: 50%; cursor: pointer; font-size: 18px; display: flex; align-items: center; justify-content: center; transition: background .15s; }
-        .wa-lb-close:hover { background: rgba(255,255,255,.22); }
-        /* FIX: was <button> inside <a>; now use a proper <a> styled as button */
-        .wa-lb-download { color: #fff; background: var(--wa-accent); border: none; padding: 10px 24px; border-radius: 10px; cursor: pointer; font-size: 14px; font-weight: 700; transition: background .15s; text-decoration: none; display: inline-block; }
-        .wa-lb-download:hover { background: #4338ca; }
+        /* ═══ Gallery lightbox — full CSS injected lazily by openGallery() ═══ */
+        /* z-index stub so any early #wa-lightbox reference still stacks correctly */
+        #wa-lightbox { z-index: 9999; }
 
         /* ═══ Forward modal ═══ */
         #wa-forward-modal { position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.45); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; }
@@ -2352,47 +2847,323 @@ function stopAndSendRecording() {
 }
 
 // ─────────────────────────────────────────────
-// LIGHTBOX
-// FIX: replaced <button> inside <a> with plain <a> styled as button
+// GALLERY LIGHTBOX
+// Full-screen viewer with prev/next navigation, zoom (images), custom
+// video player, and download. Supports both multi-attachment messages
+// (all attachments browseable) and legacy single-image messages.
+//
+// openGallery(items, startIndex)
+//   items: [{ url, type, name }]  — type: 'image'|'video'|'audio'|'document'
+//   startIndex: which item to show first
+//
+// openLightbox(url) — backwards-compatible shim for legacy .msg-image clicks
 // ─────────────────────────────────────────────
-function openLightbox(url) {
-    // FIX (Security): use DOM APIs for src/href so no URL ends up injected via innerHTML
-    const safe = safeUrl(url);
-    if (!safe) return;
+
+function openGallery(items, startIndex = 0) {
+    if (!items?.length) return;
+    // Validate + filter to viewable items (image / video); others just download
+    const viewable = items.filter(it => {
+        const safe = safeUrl(it.url || '');
+        return safe && (it.type === 'image' || it.type === 'video');
+    });
+    if (!viewable.length) return;
+
+    // Clamp startIndex to viewable array
+    let idx = Math.max(0, Math.min(startIndex, viewable.length - 1));
+
     document.getElementById('wa-lightbox')?.remove();
+
+    // ── Inject gallery CSS once ──
+    if (!document.getElementById('wa-gallery-styles')) {
+        const gs = document.createElement('style');
+        gs.id = 'wa-gallery-styles';
+        gs.textContent = `
+        #wa-lightbox {
+            position: fixed; inset: 0; z-index: 9999;
+            background: rgba(0,0,0,.93);
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            animation: walbIn .18s ease-out;
+        }
+        @keyframes walbIn { from { opacity:0; } to { opacity:1; } }
+        #wa-lightbox .wa-lb-toolbar {
+            position: absolute; top: 0; left: 0; right: 0;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 16px; gap: 12px;
+            background: linear-gradient(to bottom, rgba(0,0,0,.7) 0%, transparent 100%);
+            z-index: 2;
+        }
+        #wa-lightbox .wa-lb-counter {
+            color: rgba(255,255,255,.8); font-size: 13px; font-weight: 600;
+            letter-spacing: .04em; flex-shrink: 0;
+        }
+        #wa-lightbox .wa-lb-filename {
+            flex: 1; color: rgba(255,255,255,.7); font-size: 13px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            text-align: center;
+        }
+        #wa-lightbox .wa-lb-actions {
+            display: flex; gap: 6px; flex-shrink: 0;
+        }
+        #wa-lightbox .wa-lb-btn {
+            width: 36px; height: 36px; border-radius: 50%;
+            border: none; cursor: pointer;
+            background: rgba(255,255,255,.14); color: #fff;
+            display: flex; align-items: center; justify-content: center;
+            transition: background .15s; font-size: 16px;
+        }
+        #wa-lightbox .wa-lb-btn:hover { background: rgba(255,255,255,.28); }
+        #wa-lightbox .wa-lb-btn:disabled { opacity: .3; cursor: default; }
+        #wa-lightbox .wa-lb-media-wrap {
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            width: 100%; max-width: 1280px; padding: 64px 60px 64px;
+            position: relative; overflow: hidden;
+        }
+        #wa-lightbox .wa-lb-img {
+            max-width: 100%; max-height: 100%;
+            object-fit: contain; border-radius: 6px;
+            cursor: zoom-in; user-select: none;
+            transition: transform .2s, opacity .15s;
+        }
+        #wa-lightbox .wa-lb-img.zoomed { cursor: zoom-out; }
+        #wa-lightbox .wa-lb-video {
+            max-width: 100%; max-height: 100%;
+            border-radius: 6px;
+        }
+        #wa-lightbox .wa-lb-nav {
+            position: absolute; top: 50%; transform: translateY(-50%);
+            width: 44px; height: 44px; border-radius: 50%;
+            border: none; cursor: pointer;
+            background: rgba(255,255,255,.15); color: #fff;
+            display: flex; align-items: center; justify-content: center;
+            transition: background .15s; z-index: 3;
+            font-size: 22px; font-weight: 300;
+        }
+        #wa-lightbox .wa-lb-nav:hover { background: rgba(255,255,255,.3); }
+        #wa-lightbox .wa-lb-nav:disabled { opacity: .2; cursor: default; }
+        #wa-lightbox .wa-lb-prev { left: 10px; }
+        #wa-lightbox .wa-lb-next { right: 10px; }
+        #wa-lightbox .wa-lb-dots {
+            position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+            display: flex; gap: 6px; z-index: 2;
+        }
+        #wa-lightbox .wa-lb-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            background: rgba(255,255,255,.35); transition: background .15s;
+        }
+        #wa-lightbox .wa-lb-dot.active { background: #fff; }
+        @media (max-width: 600px) {
+            #wa-lightbox .wa-lb-media-wrap { padding: 56px 40px 56px; }
+            #wa-lightbox .wa-lb-nav { width: 36px; height: 36px; font-size: 18px; }
+        }`;
+        document.head.appendChild(gs);
+    }
+
     const box = document.createElement('div');
     box.id = 'wa-lightbox';
-
-    const closeBtn = document.createElement('button');
-    closeBtn.className = 'wa-lb-close';
-    closeBtn.id = 'wa-lb-close';
-    closeBtn.setAttribute('aria-label', 'Close');
-    closeBtn.textContent = '✕';
-
-    const img = document.createElement('img');
-    img.src = safe;  // assigned via property, not innerHTML
-    img.alt = 'Full size image';
-
-    const dlLink = document.createElement('a');
-    dlLink.href = safe;  // assigned via property, not innerHTML
-    dlLink.download = '';
-    dlLink.target = '_blank';
-    dlLink.rel = 'noopener noreferrer';
-    dlLink.className = 'wa-lb-download';
-    dlLink.textContent = '⬇ Download';
-
-    box.appendChild(closeBtn);
-    box.appendChild(img);
-    box.appendChild(dlLink);
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-label', 'Media viewer');
     document.body.appendChild(box);
 
-    closeBtn.addEventListener('click', () => box.remove());
-    box.addEventListener('click', e => { if (e.target === box) box.remove(); });
+    // Prevent body scroll
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    let _zoomed    = false;
+    let _zoomScale = 1;
+
+    function renderSlide() {
+        const item = viewable[idx];
+        const safe = safeUrl(item.url);
+
+        box.innerHTML = `
+        <div class="wa-lb-toolbar">
+            <span class="wa-lb-counter">${viewable.length > 1 ? `${idx + 1} / ${viewable.length}` : ''}</span>
+            <span class="wa-lb-filename">${sanitize(item.name || '')}</span>
+            <div class="wa-lb-actions">
+                <a class="wa-lb-btn" id="wa-lb-download" title="Download" download
+                   href="${safe}" target="_blank" rel="noopener noreferrer"
+                   style="text-decoration:none">
+                    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                </a>
+                <button class="wa-lb-btn" id="wa-lb-close" title="Close" aria-label="Close">
+                    <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+        </div>
+        <div class="wa-lb-media-wrap" id="wa-lb-media-wrap">
+            ${viewable.length > 1
+                ? `<button class="wa-lb-nav wa-lb-prev" id="wa-lb-prev" aria-label="Previous"${idx === 0 ? ' disabled' : ''}>&#8249;</button>
+                   <button class="wa-lb-nav wa-lb-next" id="wa-lb-next" aria-label="Next"${idx === viewable.length - 1 ? ' disabled' : ''}>&#8250;</button>`
+                : ''}
+            ${item.type === 'video'
+                ? `<video class="wa-lb-video" src="${safe}" controls autoplay playsinline preload="metadata"></video>`
+                : `<img class="wa-lb-img" id="wa-lb-img" src="${safe}" alt="${sanitize(item.name || 'Image')}" draggable="false">`}
+            ${viewable.length > 1
+                ? `<div class="wa-lb-dots">${viewable.map((_, i) =>
+                    `<div class="wa-lb-dot${i === idx ? ' active' : ''}"></div>`).join('')}</div>`
+                : ''}
+        </div>`;
+
+        _zoomed = false; _zoomScale = 1;
+
+        // Wire close
+        document.getElementById('wa-lb-close')?.addEventListener('click', closeLightbox);
+
+        // Wire prev/next
+        document.getElementById('wa-lb-prev')?.addEventListener('click', e => { e.stopPropagation(); if (idx > 0) { idx--; renderSlide(); } });
+        document.getElementById('wa-lb-next')?.addEventListener('click', e => { e.stopPropagation(); if (idx < viewable.length - 1) { idx++; renderSlide(); } });
+
+        // Image zoom toggle
+        const imgEl = document.getElementById('wa-lb-img');
+        if (imgEl) {
+            imgEl.addEventListener('click', e => {
+                e.stopPropagation();
+                _zoomed = !_zoomed;
+                _zoomScale = _zoomed ? 2.2 : 1;
+                imgEl.style.transform = `scale(${_zoomScale})`;
+                imgEl.classList.toggle('zoomed', _zoomed);
+            });
+        }
+
+        // Background click closes (but not when zoomed into image)
+        box.addEventListener('click', e => {
+            if (e.target === box || e.target.id === 'wa-lb-media-wrap') {
+                if (_zoomed) { _zoomed = false; _zoomScale = 1; const el = document.getElementById('wa-lb-img'); if (el) { el.style.transform = ''; el.classList.remove('zoomed'); } }
+                else closeLightbox();
+            }
+        }, { once: false });
+    }
+
+    function closeLightbox() {
+        box.remove();
+        document.body.style.overflow = prevOverflow;
+        document.removeEventListener('keydown', _onKey);
+    }
+
+    function _onKey(e) {
+        if (!document.getElementById('wa-lightbox')) { document.removeEventListener('keydown', _onKey); return; }
+        if (e.key === 'Escape')     { closeLightbox(); }
+        if (e.key === 'ArrowLeft'  && idx > 0)                    { idx--; renderSlide(); }
+        if (e.key === 'ArrowRight' && idx < viewable.length - 1)  { idx++; renderSlide(); }
+    }
+    document.addEventListener('keydown', _onKey);
+
+    // Touch swipe support
+    let _touchX = null;
+    box.addEventListener('touchstart', e => { _touchX = e.touches[0].clientX; }, { passive: true });
+    box.addEventListener('touchend', e => {
+        if (_touchX === null) return;
+        const dx = e.changedTouches[0].clientX - _touchX;
+        _touchX = null;
+        if (Math.abs(dx) < 40) return;
+        if (dx < 0 && idx < viewable.length - 1) { idx++; renderSlide(); }
+        if (dx > 0 && idx > 0)                   { idx--; renderSlide(); }
+    }, { passive: true });
+
+    renderSlide();
+}
+
+// Legacy shim: single image lightbox → gallery with one item
+function openLightbox(url, name = '') {
+    const safe = safeUrl(url);
+    if (!safe) return;
+    openGallery([{ url: safe, type: 'image', name }], 0);
 }
 
 // ─────────────────────────────────────────────
 // FORWARD MODAL — light theme
 // ─────────────────────────────────────────────
+// Forward a single attachment from a multi-attachment message.
+// Creates a new message in the target room containing only the selected file,
+// preserving the forwarded:true flag so recipients see the forward indicator.
+async function openForwardSingleAttachment(sourceMsg, att) {
+    if (!requireAuth()) return;
+    document.getElementById('wa-forward-modal')?.remove();
+    const modal = document.createElement('div');
+    modal.id = 'wa-forward-modal';
+    const typeIcon = att.type === 'image' ? '📷' : att.type === 'video' ? '🎥' : att.type === 'audio' ? '🎤' : '📎';
+    modal.innerHTML = `
+        <div id="wa-forward-card">
+            <div class="wa-fwd-header">
+                <span class="wa-fwd-title">Forward ${typeIcon} ${sanitize(att.name || 'attachment')} to…</span>
+                <button id="wa-fwd-close" style="background:none;border:none;cursor:pointer;color:var(--wa-sub);font-size:18px;padding:4px" aria-label="Close">✕</button>
+            </div>
+            <div id="wa-fwd-list" style="overflow-y:auto;flex:1;padding:8px 0">
+                <div style="text-align:center;color:var(--wa-sub);padding:20px;font-size:14px">Loading…</div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+    const close = () => modal.remove();
+    modal.addEventListener('click', e => { if (e.target === modal) close(); });
+    document.getElementById('wa-fwd-close').addEventListener('click', close);
+
+    try {
+        const snap  = await getDocs(query(collection(db, 'chats'), where('members', 'array-contains', currentUser.email)));
+        const chats = [];
+        snap.forEach(d => { if (d.id !== activeRoomId) chats.push({ id: d.id, ...d.data() }); });
+        let html = '';
+        chats.forEach(c => {
+            const name = c.type === 'group'
+                ? sanitize(c.name || '')
+                : sanitize(c.memberNames?.find(n => n !== currentUser.name) || 'Unknown');
+            html += `<div class="wa-sidebar-item" data-fwd-room="${c.id}">
+                ${avatarEl(name, c.type || 'private', false, 40)}
+                <span style="color:var(--wa-text);font-size:14px;font-weight:500">${sanitize(name)}</span>
+            </div>`;
+        });
+        document.getElementById('wa-fwd-list').innerHTML =
+            html || '<div style="text-align:center;color:var(--wa-sub);padding:20px;font-size:14px">No other conversations</div>';
+
+        document.querySelectorAll('[data-fwd-room]').forEach(el => {
+            el.addEventListener('click', async () => {
+                const toRoom = el.dataset.fwdRoom;
+                try {
+                    // Forward as a single-attachment message
+                    const payload = {
+                        senderEmail: currentUser.email, senderName: currentUser.name,
+                        createdAt:   serverTimestamp(), seenBy: [],
+                        text:        '',
+                        forwarded:   true,
+                        attachments: [{
+                            url:  att.url,
+                            type: att.type,
+                            mime: att.mime || '',
+                            name: att.name || '',
+                            size: att.size || 0,
+                        }],
+                    };
+                    const _rSnap  = await getDoc(doc(db, 'chats', toRoom)).catch(() => null);
+                    const _rData  = _rSnap?.data();
+                    const _rMembers = _rData?.members || [];
+                    const _lastMsg  = `${typeIcon} ${att.name || 'Attachment'}`;
+                    const _update   = {
+                        lastMessage: _lastMsg, lastSenderEmail: currentUser.email,
+                        lastUpdated: serverTimestamp(),
+                        [`unreadCount.${currentUser.email}`]: 0,
+                    };
+                    if (_rData?.type === 'private') {
+                        const _recip = _rMembers.find(e => e !== currentUser.email);
+                        if (_recip) _update[`unreadCount.${_recip}`] = increment(1);
+                    } else if (_rData?.type === 'group') {
+                        for (const _gm of _rMembers) {
+                            if (_gm && _gm !== currentUser.email) _update[`unreadCount.${_gm}`] = increment(1);
+                        }
+                    }
+                    const _batch = writeBatch(db);
+                    const _mRef  = doc(collection(db, `chats/${toRoom}/messages`));
+                    _batch.set(_mRef, payload);
+                    _batch.set(doc(db, 'chats', toRoom), _update, { merge: true });
+                    await _batch.commit();
+                    showToast('Attachment forwarded!', 'success');
+                } catch (err) { console.error('[Chat] fwd-att error:', err); showToast('Failed to forward.', 'error'); }
+                close();
+            });
+        });
+    } catch (err) { console.error('[Chat] fwd-att-list error:', err); close(); showToast('Could not load conversations.', 'error'); }
+}
+
 async function openForwardModal(msgId) {
     // FIX AUTH-GUARD: verify auth before opening forward modal
     if (!requireAuth()) return;
@@ -2558,9 +3329,10 @@ function subscribeStarred(roomId) {
 // TYPING SUBSCRIPTION (with server-side TTL awareness)
 // ─────────────────────────────────────────────
 function subscribeTypingIndicator(roomId, chatType) {
-    presenceSub?.();
+    // BUG FIX: unsubscribe existing listener before creating a new one
+    typingSub?.(); typingSub = null;
     const typingCol = collection(db, `chats/${roomId}/typing`);
-    presenceSub = onSnapshot(typingCol, snap => {
+    typingSub = onSnapshot(typingCol, snap => {
         let typingName = null;
         const now      = Date.now();
         snap.forEach(d => {
@@ -3683,6 +4455,15 @@ export function setupChat() {
         document.getElementById('wa-reply-preview')?.remove();
         replyingTo   = null;
         editingMsgId = null;  // EXT: clear any in-progress edit when switching rooms
+        // Clear compose tray (revoke blob URLs) when switching rooms
+        if (typeof teardownComposeTray === 'function') teardownComposeTray();
+        else {
+            pendingAttachments.forEach(item => {
+                if (item.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(item.previewUrl);
+            });
+            pendingAttachments = [];
+            document.getElementById('wa-compose-tray')?.remove();
+        }
         // FIX: mutate both collections in place, never reassign
         pinnedMessages.splice(0, pinnedMessages.length);
         starredMessages.clear();
@@ -3876,6 +4657,26 @@ export function setupChat() {
             orderBy('createdAt', 'desc'),
             limit(100)
         );
+        // Real-time presence listener for private chat header status.
+        // Updates the online/last-seen indicator without requiring a page reload.
+        // presenceSub is now dedicated to presence only; typingSub handles typing.
+        // Both are torn down by unsubscribeRoomListeners() when changing rooms.
+        presenceSub?.();
+        presenceSub = null;
+        if (chatType === 'private' && targetEmail) {
+            const _presenceRef = doc(db, 'users', targetEmail);
+            presenceSub = onSnapshot(_presenceRef, userSnap => {
+                if (!userSnap.exists()) return;
+                const ud = userSnap.data();
+                const isOnline = isUserOnline(ud.lastActive);
+                const statusEl = chatHeader.querySelector('.ch-status');
+                if (statusEl) {
+                    statusEl.className = isOnline ? 'ch-status ch-status--online' : 'ch-status ch-status--offline';
+                    statusEl.textContent = isOnline ? '● Online' : formatLastSeen(ud.lastActive);
+                }
+            }, () => {}); // non-fatal: ignore errors on presence reads
+        }
+
         chatSub = onSnapshot(msgsQuery, snap => {
             // FIX: always merge in-flight optimistic messages back — they have no Firestore doc yet
             // so they won't appear in snap.docs. Without this, sending a message wipes the
@@ -3917,6 +4718,9 @@ export function setupChat() {
             const name     = item.dataset.name;
             const chatType = item.dataset.type || 'private';
             if (!email || !name) return;
+            // BUG FIX: prevent opening a private chat with yourself — a members array
+            // with two identical emails creates an ambiguous room that breaks read-receipts.
+            if (chatType === 'private' && email === currentUser?.email) return;
             document.querySelectorAll('.wa-sidebar-item--active').forEach(el =>
                 el.classList.remove('wa-sidebar-item--active'));
             item.classList.add('wa-sidebar-item--active');
@@ -4496,33 +5300,325 @@ export function setupChat() {
             return true;
         }
 
-        // FIX UI: Download button — saves image/file/voice attachment to device
+        // Download button — saves image/file/voice attachment(s) to device.
+        // BUG FIX: Previously only read data-url (one legacy URL) and ignored
+        // msg.attachments[] entirely, so multi-attachment messages either showed
+        // no download button or silently downloaded nothing.
+        // FIX: when data-has-attachments is true, look up the message snapshot and
+        // download every attachment in sequence; fall back to the single legacy URL
+        // for backwards-compatible single-file messages.
         const downloadBtn = e.target.closest('.msg-download-btn');
         if (downloadBtn) {
             closeAllDropdowns();
-            // FIX SECURITY: validate URL through safeUrl() before fetching.
-            // dataset.url is a sanitized https:// value set at render time, but
-            // safeUrl() provides a final defence-in-depth check.
-            const rawUrl = downloadBtn.dataset.url;
-            const url    = safeUrl(rawUrl);
-            const filename = downloadBtn.dataset.filename || 'download';
-            if (!url) { showToast('No valid file to download.', 'error'); return true; }
-            try {
-                // Fetch as blob so the browser triggers a Save dialog rather than navigating
+            const msgId          = downloadBtn.dataset.msgId;
+            const hasAttachments = downloadBtn.dataset.hasAttachments === 'true';
+
+            // Helper: fetch one URL and trigger a browser Save dialog.
+            // Falls back to window.open if cross-origin fetch is blocked.
+            const downloadOne = async (url, filename) => {
+                const safe = safeUrl(url);
+                if (!safe) { console.warn('[Chat] skipping unsafe URL:', url); return; }
+                try {
+                    const resp = await fetch(safe);
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const blob   = await resp.blob();
+                    const objUrl = URL.createObjectURL(blob);
+                    const a      = document.createElement('a');
+                    a.href     = objUrl;
+                    a.download = filename || 'download';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+                } catch (err) {
+                    console.warn('[Chat] download-blob error (falling back to new tab):', err);
+                    window.open(safe, '_blank', 'noopener,noreferrer');
+                }
+            };
+
+            if (hasAttachments) {
+                // Multi-attachment message: download each attachment file.
+                const snapMsg = lastMessagesSnapshot.find(m => m.id === msgId);
+                const atts    = snapMsg?.attachments;
+                if (!atts?.length) {
+                    showToast('No files found on this message.', 'error');
+                    return true;
+                }
+                const count = atts.length;
+                showToast(`Downloading ${count} file${count > 1 ? 's' : ''}…`, 'info');
+                for (let i = 0; i < atts.length; i++) {
+                    const att      = atts[i];
+                    const attUrl   = safeUrl(att.url || '');
+                    if (!attUrl) continue;
+                    const attName  = att.name || `file_${i + 1}`;
+                    await downloadOne(attUrl, attName);
+                    // Small delay between sequential downloads so browsers don't block them.
+                    if (i < atts.length - 1) await new Promise(r => setTimeout(r, 400));
+                }
+                showToast(`${count} file${count > 1 ? 's' : ''} downloaded.`, 'success');
+            } else {
+                // Legacy single-field message (imageUrl / fileUrl / voiceUrl).
+                const url      = safeUrl(downloadBtn.dataset.url);
+                const filename = downloadBtn.dataset.filename || 'download';
+                if (!url) { showToast('No valid file to download.', 'error'); return true; }
                 showToast('Preparing download…', 'info');
+                await downloadOne(url, filename);
+                showToast('Download started.', 'success');
+            }
+            return true;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // PER-ATTACHMENT ACTIONS
+        // Every handler resolves the exact attachment from lastMessagesSnapshot
+        // via msgId + attIdx so there is zero ambiguity even after edits/deletes.
+        // ══════════════════════════════════════════════════════════════════════
+
+        // ── Touch toggle: tap an attachment to reveal/hide its action strip ──
+        // On pointer devices the CSS :hover handles this; on touch we need a tap.
+        const attItem = e.target.closest('.wa-att-item');
+        if (attItem && e.pointerType === 'touch' && !e.target.closest('.wa-att-actions')) {
+            // Toggle .wa-att-open on this item; close all others in the same message
+            const isOpen = attItem.classList.contains('wa-att-open');
+            const row    = attItem.closest('[data-message-row]');
+            row?.querySelectorAll('.wa-att-item.wa-att-open').forEach(el => el.classList.remove('wa-att-open'));
+            if (!isOpen) attItem.classList.add('wa-att-open');
+            return true;
+        }
+
+        // ── Download single attachment ────────────────────────────────────────
+        const attDownBtn = e.target.closest('.att-download-btn');
+        if (attDownBtn) {
+            const resolved = _resolveAttachment(attDownBtn.dataset.msgId, attDownBtn.dataset.attIdx);
+            if (!resolved) { showToast('Attachment not found.', 'error'); return true; }
+            const { att } = resolved;
+            const url  = safeUrl(att.url || '');
+            if (!url) { showToast('Invalid attachment URL.', 'error'); return true; }
+            showToast('Downloading…', 'info');
+            try {
                 const resp = await fetch(url);
                 if (!resp.ok) throw new Error('fetch failed');
-                const blob = await resp.blob();
+                const blob   = await resp.blob();
                 const objUrl = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = objUrl; a.download = filename;
+                const a      = document.createElement('a');
+                a.href     = objUrl;
+                a.download = att.name || 'attachment';
                 document.body.appendChild(a); a.click(); a.remove();
                 setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
                 showToast('Download started.', 'success');
-            } catch (err) {
-                console.warn('[Chat] download-blob error (falling back to new tab):', err);
-                // Fallback: open in a new tab if fetch/blob fails (cross-origin restriction)
+            } catch (_err) {
                 window.open(url, '_blank', 'noopener,noreferrer');
+            }
+            return true;
+        }
+
+        // ── Reply to single attachment ────────────────────────────────────────
+        // The reply preview shows the specific attachment thumbnail/icon, not the
+        // whole message, so the recipient context is always unambiguous.
+        const attReplyBtn = e.target.closest('.att-reply-btn');
+        if (attReplyBtn) {
+            const resolved = _resolveAttachment(attReplyBtn.dataset.msgId, attReplyBtn.dataset.attIdx);
+            if (!resolved) return true;
+            const { msg: rMsg, att: rAtt, idx: rIdx } = resolved;
+            const isMe   = rMsg.senderEmail === currentUser.email;
+            // Build a synthetic replyTo that points to the specific attachment.
+            // attIdx is stored so the reply bubble renderer can highlight the right cell.
+            replyingTo = {
+                id:          rMsg.id,
+                senderName:  rMsg.senderName || '',
+                senderEmail: rMsg.senderEmail || '',
+                text:        rAtt.name || '',
+                // Populate the media preview fields depending on attachment type:
+                imageUrl:    rAtt.type === 'image' ? rAtt.url : '',
+                voiceUrl:    rAtt.type === 'audio' ? rAtt.url : '',
+                fileUrl:     (rAtt.type === 'document' || rAtt.type === 'video') ? rAtt.url : '',
+                fileName:    rAtt.name || '',
+                _attIdx:     rIdx,   // kept for future per-attachment scroll-to
+                attachments: rMsg.attachments,
+            };
+            // Show the reply preview bar above the compose form
+            document.getElementById('wa-reply-preview')?.remove();
+            const isMe2   = rMsg.senderEmail === currentUser.email;
+            const label   = isMe2 ? 'You' : sanitize(rMsg.senderName || 'Someone');
+            const typeIcon = rAtt.type === 'image' ? '📷' : rAtt.type === 'video' ? '🎥' : rAtt.type === 'audio' ? '🎤' : '📎';
+            const preview  = `${typeIcon} ${sanitize(rAtt.name || 'Attachment')}`;
+            const bar = document.createElement('div');
+            bar.id = 'wa-reply-preview';
+            bar.innerHTML = `
+                <div class="wa-rp-line"></div>
+                <div class="wa-rp-content">
+                    <span class="wa-rp-name">${label}</span>
+                    <span class="wa-rp-text">${preview}</span>
+                </div>
+                <button id="wa-reply-close" aria-label="Cancel reply">
+                    <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>`;
+            const form = document.getElementById('chat-message-form');
+            form?.parentElement?.insertBefore(bar, form);
+            document.getElementById('wa-reply-close')?.addEventListener('click', () => {
+                replyingTo = null; bar.remove();
+            });
+            input.focus();
+            return true;
+        }
+
+        // ── Forward single attachment ─────────────────────────────────────────
+        // Opens the forward modal pre-scoped to this specific attachment only.
+        const attFwdBtn = e.target.closest('.att-forward-btn');
+        if (attFwdBtn) {
+            if (!requireAuth()) return true;
+            const resolved = _resolveAttachment(attFwdBtn.dataset.msgId, attFwdBtn.dataset.attIdx);
+            if (!resolved) return true;
+            const { msg: fMsg, att: fAtt } = resolved;
+            // Build a synthetic single-attachment message for the forward modal.
+            // We pass a fabricated message object so openForwardModal's existing logic
+            // copies exactly this attachment — no changes needed inside that function.
+            await openForwardSingleAttachment(fMsg, fAtt);
+            return true;
+        }
+
+        // ── Replace single attachment (owner only) ────────────────────────────
+        const attReplaceBtn = e.target.closest('.att-replace-btn');
+        if (attReplaceBtn) {
+            if (!requireAuth()) return true;
+            const resolved = _resolveAttachment(attReplaceBtn.dataset.msgId, attReplaceBtn.dataset.attIdx);
+            if (!resolved) { showToast('Attachment not found.', 'error'); return true; }
+            const { msg: repMsg, att: repAtt, idx: repIdx } = resolved;
+
+            if (repMsg.senderEmail !== currentUser.email) {
+                showToast('You can only replace your own attachments.', 'error'); return true;
+            }
+
+            // Derive accept filter from the existing attachment type
+            const acceptFilter = repAtt.type === 'image'    ? 'image/*'
+                               : repAtt.type === 'video'    ? 'video/*'
+                               : repAtt.type === 'audio'    ? 'audio/*'
+                               : '*/*';
+            const repInput = getAttachInput(acceptFilter, 'chat-att-replace-input');
+            repInput.value = '';
+
+            const onRepChange = async (evt) => {
+                repInput.removeEventListener('change', onRepChange);
+                const newFile = evt.target.files?.[0];
+                repInput.value = '';
+                if (!newFile || !activeRoomId) return;
+                if (newFile.size > MAX_UPLOAD_BYTES) { showToast('File too large (max 50 MB).', 'error'); return; }
+
+                const savedPH = input.placeholder;
+                input.placeholder = 'Uploading replacement…';
+                input.disabled = true; sendBtn.disabled = true;
+                if (attachBtn) attachBtn.disabled = true;
+                try {
+                    const toSend  = newFile.type?.startsWith('image/') ? await compressImageFile(newFile) : newFile;
+                    const newUrl  = await uploadBytesWithRetry(toSend, 'chats', null, toSend.name || `att_replace_${Date.now()}`);
+
+                    // Build the updated attachments array — only the target index changes.
+                    // Use runTransaction to guarantee we read the latest array, splice the
+                    // one entry, and write back atomically, eliminating any race condition
+                    // where two simultaneous replacements on the same message corrupt the array.
+                    const msgRef = doc(db, `chats/${activeRoomId}/messages`, repMsg.id);
+                    await runTransaction(db, async tx => {
+                        const snap = await tx.get(msgRef);
+                        if (!snap.exists()) throw new Error('msg_gone');
+                        const d    = snap.data();
+                        if (d.senderEmail !== currentUser.email) throw new Error('not_owner');
+                        const atts = [...(d.attachments || [])];
+                        if (repIdx >= atts.length) throw new Error('idx_oob');
+
+                        const oldUrl = atts[repIdx].url;
+                        atts[repIdx] = {
+                            ...atts[repIdx],
+                            url:  newUrl,
+                            name: newFile.name,
+                            mime: newFile.type,
+                            size: newFile.size,
+                        };
+                        const update = {
+                            attachments: atts,
+                            edited:      true,
+                            editedAt:    serverTimestamp(),
+                        };
+                        // Queue old Cloudinary asset for server-side cleanup
+                        if (oldUrl) update._deletedMediaUrls = arrayUnion(oldUrl);
+                        tx.update(msgRef, update);
+                    });
+                    showToast('Attachment replaced.', 'success');
+                } catch (err) {
+                    console.error('[Chat] att-replace error:', err);
+                    showToast(err.message === 'not_owner' ? 'Permission denied.' : 'Failed to replace.', 'error');
+                } finally {
+                    input.placeholder = savedPH;
+                    input.disabled = false; sendBtn.disabled = false;
+                    if (attachBtn) attachBtn.disabled = false;
+                }
+            };
+            repInput.addEventListener('change', onRepChange);
+            repInput.click();
+            return true;
+        }
+
+        // ── Delete single attachment (owner only) ─────────────────────────────
+        // Removes the attachment from the attachments[] array and queues its
+        // Cloudinary URL for server-side deletion. If it was the last attachment,
+        // the message text is preserved (or the whole message soft-deleted if empty too).
+        const attDelBtn = e.target.closest('.att-delete-btn');
+        if (attDelBtn) {
+            if (!requireAuth()) return true;
+            const resolved = _resolveAttachment(attDelBtn.dataset.msgId, attDelBtn.dataset.attIdx);
+            if (!resolved) { showToast('Attachment not found.', 'error'); return true; }
+            const { msg: dMsg, att: dAtt, idx: dIdx } = resolved;
+
+            if (dMsg.senderEmail !== currentUser.email) {
+                showToast('You can only delete your own attachments.', 'error'); return true;
+            }
+
+            const isLastAtt   = dMsg.attachments.length === 1;
+            const hasText     = !!(dMsg.text?.trim());
+            const confirmBody = isLastAtt && !hasText
+                ? 'This is the only attachment. The entire message will be deleted for everyone.'
+                : isLastAtt
+                    ? 'This is the only attachment. The message text will remain.'
+                    : 'Only this file will be removed. Other attachments and the message text will remain.';
+
+            const ok = await showConfirm({
+                title: 'Delete this attachment?',
+                body:  confirmBody,
+                confirmLabel: 'Delete',
+                tone: 'danger',
+            });
+            if (!ok) return true;
+
+            try {
+                const msgRef = doc(db, `chats/${activeRoomId}/messages`, dMsg.id);
+                await runTransaction(db, async tx => {
+                    const snap = await tx.get(msgRef);
+                    if (!snap.exists()) throw new Error('msg_gone');
+                    const d    = snap.data();
+                    if (d.senderEmail !== currentUser.email) throw new Error('not_owner');
+                    const atts = [...(d.attachments || [])];
+                    if (dIdx >= atts.length) throw new Error('idx_oob');
+
+                    const removedUrl = atts[dIdx].url;
+                    atts.splice(dIdx, 1);
+
+                    const update = { editedAt: serverTimestamp() };
+                    if (removedUrl) update._deletedMediaUrls = arrayUnion(removedUrl);
+
+                    if (atts.length === 0 && !d.text?.trim()) {
+                        // No content left — soft-delete the whole message for everyone
+                        update.isDeletedForEveryone = true;
+                        update.attachments = [];
+                        update.text = null;
+                    } else {
+                        update.attachments = atts;
+                        update.edited = true;
+                    }
+                    tx.update(msgRef, update);
+                });
+                showToast(isLastAtt && !hasText ? 'Message deleted.' : 'Attachment removed.', 'success');
+            } catch (err) {
+                console.error('[Chat] att-delete error:', err);
+                showToast(err.message === 'not_owner' ? 'Permission denied.' : 'Failed to delete attachment.', 'error');
             }
             return true;
         }
@@ -4635,20 +5731,21 @@ export function setupChat() {
                 // from Cloudinary. Client-side deletion is impossible — Cloudinary's
                 // destroy API requires a signed request using the API secret which must
                 // never be exposed in browser code.
+                // Collect ALL media URLs (legacy fields + multi-attachment array)
+                // so the Cloud Function cleanup queue is exhaustive.
                 const orphanedUrls = [
                     msgToDelete.imageUrl,
                     msgToDelete.voiceUrl,
-                    msgToDelete.fileUrl
+                    msgToDelete.fileUrl,
+                    ...(msgToDelete.attachments || []).map(a => a.url).filter(Boolean),
                 ].filter(Boolean);
 
                 const deleteUpdate = {
                     isDeletedForEveryone: true,
                     text: null, imageUrl: null, voiceUrl: null, fileUrl: null,
-                    fileName: null, fileMime: null, fileSize: null
+                    fileName: null, fileMime: null, fileSize: null,
+                    attachments: [],   // clear multi-attachment array too
                 };
-                // Store orphaned URLs on the document for server-side cleanup.
-                // A Cloud Function watching for _deletedMediaUrls can call
-                // Cloudinary's authenticated destroy endpoint to free the storage.
                 if (orphanedUrls.length) {
                     deleteUpdate._deletedMediaUrls = orphanedUrls;
                 }
@@ -4742,14 +5839,59 @@ export function setupChat() {
         if (!e.target.closest('.wa-msg-menu') && !e.target.closest('.wa-msg-dropdown')) {
             closeAllDropdowns();
         }
+        // Close any open per-attachment action strips when tapping outside an attachment
+        if (!e.target.closest('.wa-att-item')) {
+            document.querySelectorAll('.wa-att-item.wa-att-open').forEach(el => el.classList.remove('wa-att-open'));
+        }
 
         // Delegate to shared handler — returns true if handled
         if (await handleMessageAction(e)) return;
 
         // ── Non-menu interactions that only exist in the chat scroll area ──
 
+        // ── Gallery / lightbox open ────────────────────────────────────────────
+        // Clicking a .wa-att-image, a video thumbnail, or the +N overlay opens the
+        // full-screen gallery with ALL attachments from that message at the right position.
+        // Clicks inside the action strip (.wa-att-actions) are excluded.
+        const _galleryTrigger = e.target.closest('.wa-att-image, .wa-att-more-overlay, .wa-att-video-wrap');
+        if (_galleryTrigger && !e.target.closest('.wa-att-actions') && !e.target.closest('video')) {
+            // For video wraps, don't steal clicks on the native video controls
+            if (_galleryTrigger.classList.contains('wa-att-video-wrap') && e.target.tagName === 'VIDEO') {
+                // Let the browser handle native video control clicks
+            } else {
+                const msgId  = _galleryTrigger.dataset.msgId
+                            || _galleryTrigger.closest('[data-msg-id]')?.dataset.msgId;
+                const attIdx = parseInt(
+                    _galleryTrigger.dataset.attIdx
+                    ?? _galleryTrigger.dataset.attStartIdx
+                    ?? _galleryTrigger.closest('[data-att-idx]')?.dataset.attIdx
+                    ?? '-1',
+                    10
+                );
+                const snapMsg = msgId ? lastMessagesSnapshot.find(m => m.id === msgId) : null;
+
+                if (snapMsg?.attachments?.length) {
+                    // Build gallery items from the message's full attachments array
+                    const galleryItems = snapMsg.attachments.map(a => ({
+                        url:  safeUrl(a.url || '') || '',
+                        type: a.type || 'image',
+                        name: a.name || '',
+                    })).filter(it => it.url);
+                    openGallery(galleryItems, Math.max(0, attIdx));
+                } else {
+                    // Legacy single-image or unknown — fall back to simple lightbox
+                    const url = _galleryTrigger.dataset.full
+                             || (_galleryTrigger.tagName === 'IMG' ? _galleryTrigger.src : '')
+                             || '';
+                    if (url) openLightbox(url);
+                }
+                return;
+            }
+        }
+
+        // Legacy .msg-image click (non-attachment images, e.g. old imageUrl field)
         const imgEl = e.target.closest('.msg-image, .wa-msg-image');
-        if (imgEl) { openLightbox(imgEl.dataset.full || imgEl.src); return; }
+        if (imgEl && !e.target.closest('.wa-att-image')) { openLightbox(imgEl.dataset.full || imgEl.src); return; }
 
         const replyBubble = e.target.closest('.wa-reply-bubble');
         if (replyBubble) {
@@ -5049,19 +6191,18 @@ export function setupChat() {
                 createdAt: serverTimestamp(), seenBy: []
             };
             if (replyTo) payload.replyTo = replyTo;
-            await addDoc(collection(db, `chats/${roomId}/messages`), payload);
-            // FIX: use pre-captured _recipEmail (not live activeRoomDetails) to avoid room-switch race
+
+            // FIX ATOMIC-TEXT: use writeBatch so message + room metadata land together.
+            // The old sequential addDoc → setDoc had a window where the Firestore listener
+            // would see the new message but the room doc still showed the old lastMessage —
+            // causing a momentary sidebar flash with stale preview text.
             const _sendUpdate = {
                 lastMessage: text, lastSenderEmail: currentUser.email,
                 lastUpdated: serverTimestamp(),
                 [`unreadCount.${currentUser.email}`]: 0
             };
-            // FIX Bug 4: read the room doc once and build the entire unread update
-            // in a single pass. Previously the group branch also called getDoc()
-            // separately from the result it was already using — two reads for the same doc.
+            // FIX Bug 4: build the entire unread update before opening the batch.
             if (_roomType === 'private' && _recipEmail) {
-                // Use server-side increment so concurrent sends from multiple
-                // devices can't clobber each other's unread count.
                 _sendUpdate[`unreadCount.${_recipEmail}`] = increment(1);
             } else if (_roomType === 'group') {
                 const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
@@ -5072,7 +6213,14 @@ export function setupChat() {
                     }
                 }
             }
-            await setDoc(doc(db, 'chats', roomId), _sendUpdate, { merge: true });
+
+            // Atomic write: message doc + room metadata in one batch
+            const _txBatch = writeBatch(db);
+            const _msgRef  = doc(collection(db, `chats/${roomId}/messages`));
+            _txBatch.set(_msgRef, payload);
+            _txBatch.set(doc(db, 'chats', roomId), _sendUpdate, { merge: true });
+            await _txBatch.commit();
+
             // FIX #1: mutate in-place; also handles the case where
             // the Firestore snapshot already removed the temp entry
             const _si = lastMessagesSnapshot.findIndex(m => m.id === tempId);
@@ -5107,6 +6255,15 @@ export function setupChat() {
     // FIX: shared helper — was copy-pasted identically in both submit and keydown handlers
     async function commitInput() {
         const text = input.value.trim();
+
+        // ── NEW: if compose tray has attachments, send them (with optional caption) ──
+        if (pendingAttachments.length) {
+            if (!editingMsgId) { // don't mix edit-mode with attachment send
+                await sendComposedMessage(text);
+                return;
+            }
+        }
+
         if (!text) return;
         // EXT: if in edit mode, update the existing message instead of sending new
         if (editingMsgId) {
@@ -5188,19 +6345,37 @@ export function setupChat() {
         menu.id = 'wa-attach-menu';
         menu.innerHTML = `
             <button class="wa-attach-item" id="wa-attach-image-btn">
-                <span class="wa-attach-icon" style="background:rgba(16,185,129,.12)">🖼️</span> Photo
+                <span class="wa-attach-icon" style="background:rgba(16,185,129,.12)">🖼️</span>
+                <span>Photo / Image</span>
             </button>
             <button class="wa-attach-item" id="wa-attach-video-btn">
-                <span class="wa-attach-icon" style="background:rgba(59,130,246,.12)">🎥</span> Video
+                <span class="wa-attach-icon" style="background:rgba(59,130,246,.12)">🎥</span>
+                <span>Video</span>
+            </button>
+            <button class="wa-attach-item" id="wa-attach-audio-btn">
+                <span class="wa-attach-icon" style="background:rgba(245,158,11,.12)">🎵</span>
+                <span>Audio file</span>
             </button>
             <button class="wa-attach-item" id="wa-attach-file-btn">
-                <span class="wa-attach-icon" style="background:rgba(168,85,247,.12)">📄</span> Document
-            </button>`;
+                <span class="wa-attach-icon" style="background:rgba(168,85,247,.12)">📄</span>
+                <span>Document</span>
+            </button>
+            <p style="font-size:11px;color:var(--wa-sub);padding:6px 14px 4px;margin:0">
+                Select multiple files — they'll send together
+            </p>`;
         const inputArea = input.closest('form') || input.parentElement;
         (inputArea?.parentElement || document.body).appendChild(menu);
 
+        // Lazily create the audio input (same pattern as other inputs)
+        const audioAttachInput = getAttachInput('audio/*', 'chat-attach-audio-input');
+        audioAttachInput.addEventListener('change', async e => {
+            const files = Array.from(e.target.files || []);
+            if (files.length) { await addFilesToCompose(files); audioAttachInput.value = ''; }
+        });
+
         document.getElementById('wa-attach-image-btn').addEventListener('click', () => { imageAttachInput.click(); menu.remove(); });
         document.getElementById('wa-attach-video-btn').addEventListener('click', () => { videoAttachInput.click(); menu.remove(); });
+        document.getElementById('wa-attach-audio-btn').addEventListener('click', () => { audioAttachInput.click(); menu.remove(); });
         document.getElementById('wa-attach-file-btn').addEventListener('click', () => { fileAttachInput.click(); menu.remove(); });
 
         setTimeout(() => {
@@ -5214,8 +6389,8 @@ export function setupChat() {
     }
 
     // ── File upload ──────────────────────────────
-    // FIX (Security): 50 MB client-side limit to prevent accidental/malicious huge uploads
-    const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+    // MAX_UPLOAD_BYTES is declared at module scope (above) so it is accessible
+    // from handleMessageAction (replace-media handler) without a TDZ error.
 
     // FIXED: sendMediaFile is intentionally single-file; multi-file callers use sendFilesSequentially.
     // Progress bar is re-created per file so sequential uploads each show their own progress.
@@ -5330,29 +6505,355 @@ export function setupChat() {
         }
     }
 
-    // FIXED: multi-file support — queue all selected files and send sequentially.
-    // Shows progress per file; if any single file fails sendMediaFile shows its own toast.
-    async function sendFilesSequentially(files) {
-        for (let i = 0; i < files.length; i++) {
-            if (!activeRoomId) break; // user navigated away
-            await sendMediaFile(files[i]);
+    // ── COMPOSE TRAY SYSTEM ─────────────────────────────────────────────────────
+    // Files are queued here before sending. The tray shows previews, per-file
+    // progress, and lets the user add/remove attachments before committing.
+    // A caption can be typed in the normal input while the tray is open.
+    // All uploads happen in parallel; sendComposedMessage waits for them all,
+    // then writes one Firestore document with an `attachments[]` array.
+    // ───────────────────────────────────────────────────────────────────────────
+
+    function _classifyFile(file) {
+        if (file.type?.startsWith('image/')) return 'image';
+        if (file.type?.startsWith('video/')) return 'video';
+        if (file.type?.startsWith('audio/')) return 'audio';
+        return 'document';
+    }
+
+    // Render (or update) the compose tray DOM above the message form.
+    function renderComposeTray() {
+        const form = document.getElementById('chat-message-form');
+        if (!form) return;
+        let tray = document.getElementById('wa-compose-tray');
+
+        if (!pendingAttachments.length) {
+            tray?.remove();
+            input.placeholder = input._savedPlaceholder || 'Type a message…';
+            return;
+        }
+
+        if (!tray) {
+            tray = document.createElement('div');
+            tray.id = 'wa-compose-tray';
+            form.parentElement?.insertBefore(tray, form);
+        }
+
+        const thumbsHTML = pendingAttachments.map(item => {
+            let thumbContent = '';
+            if (item.type === 'image' && item.previewUrl) {
+                thumbContent = `<img class="wa-ct-thumb-img" src="${item.previewUrl}" alt="">`;
+            } else if (item.type === 'video' && item.previewUrl) {
+                thumbContent = `<img class="wa-ct-thumb-img" src="${item.previewUrl}" alt="">
+                    <div class="wa-ct-thumb-video-icon">
+                        <svg width="22" height="22" fill="#fff" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                    </div>`;
+            } else {
+                const icon = item.type === 'audio' ? '🎵'
+                           : item.type === 'video' ? '🎥'
+                           : getFileIcon(item.mime || '');
+                thumbContent = `<div class="wa-ct-thumb-doc">
+                    <span>${icon}</span>
+                    <span>${sanitize(item.name || 'File')}</span>
+                </div>`;
+            }
+
+            let overlay = '';
+            if (item.compressing) {
+                overlay = `<div class="wa-ct-progress-ring">⚙️</div>`;
+            } else if (item.uploadedUrl) {
+                // uploaded — no overlay
+            } else if (item.error) {
+                overlay = `<div class="wa-ct-error-badge" title="${sanitize(item.error)}">!</div>`;
+            } else if (typeof item.progress === 'number') {
+                overlay = `<div class="wa-ct-progress-ring">${item.progress}%</div>`;
+            }
+
+            return `<div class="wa-ct-thumb" data-att-id="${item.id}">
+                ${thumbContent}
+                ${overlay}
+                <button class="wa-ct-remove" data-remove-id="${item.id}" aria-label="Remove">✕</button>
+            </div>`;
+        }).join('');
+
+        tray.innerHTML = `
+            <div class="wa-ct-header">
+                <span>${pendingAttachments.length} attachment${pendingAttachments.length > 1 ? 's' : ''} selected</span>
+                <button class="wa-ct-clear" id="wa-ct-clear-all">Clear all</button>
+            </div>
+            <div class="wa-ct-thumbs" id="wa-ct-thumbs-row">
+                ${thumbsHTML}
+                <button class="wa-ct-add-more" id="wa-ct-add-more-btn" title="Add more files">+</button>
+            </div>
+            <p class="wa-ct-caption-hint">Add a caption (optional) and press Send ↑</p>`;
+
+        // Wire up remove buttons
+        tray.querySelectorAll('.wa-ct-remove').forEach(btn => {
+            btn.addEventListener('click', e => {
+                e.stopPropagation();
+                removeFromCompose(btn.dataset.removeId);
+            });
+        });
+
+        document.getElementById('wa-ct-clear-all')?.addEventListener('click', () => clearComposeTray());
+
+        document.getElementById('wa-ct-add-more-btn')?.addEventListener('click', () => {
+            // BUG FIX: was hardcoded to imageAttachInput — prevented adding non-image files
+            // when using "Add more". Open fileAttachInput (accepts all types) instead.
+            fileAttachInput.click();
+        });
+
+        // Update input placeholder to hint at caption
+        input._savedPlaceholder = input._savedPlaceholder || 'Type a message…';
+        input.placeholder = 'Add a caption… (optional)';
+    }
+
+    function removeFromCompose(id) {
+        const idx = pendingAttachments.findIndex(a => a.id === id);
+        if (idx === -1) return;
+        const item = pendingAttachments[idx];
+        if (item.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(item.previewUrl);
+        pendingAttachments.splice(idx, 1);
+        renderComposeTray();
+    }
+
+    function clearComposeTray() {
+        // BUG FIX: was `pendingAttachments = []`, which breaks closures that captured
+        // the original array reference (e.g. sendComposedMessage's _traySnapshot restore).
+        // Mutate in-place with splice() so all references stay valid.
+        pendingAttachments.forEach(item => {
+            if (item.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(item.previewUrl);
+        });
+        pendingAttachments.splice(0, pendingAttachments.length);
+        renderComposeTray();
+    }
+
+    // Upload a single pending attachment in the background, updating progress.
+    async function uploadPendingAttachment(item) {
+        if (!item || item.uploadedUrl) return; // already uploaded
+        try {
+            // Compress images before upload
+            if (item.type === 'image') {
+                item.compressing = true;
+                renderComposeTray();
+                item.file = await compressImageFile(item.file);
+                item.compressing = false;
+            }
+            item.progress = 0;
+            renderComposeTray();
+            const url = await uploadBytesWithRetry(item.file, 'chats',
+                (pct, attempt) => {
+                    item.progress = pct;
+                    if (attempt > 0) item.retrying = attempt;
+                    renderComposeTray();
+                },
+                item.name
+            );
+            item.uploadedUrl = url;
+            item.progress   = 100;
+            item.error      = null;
+        } catch (err) {
+            item.error    = err?.message || 'Upload failed';
+            item.progress = null;
+        }
+        renderComposeTray();
+    }
+
+    // Add files to the compose queue and start background uploads.
+    async function addFilesToCompose(files) {
+        if (!files?.length || !activeRoomId) return;
+        for (const file of files) {
+            if (file.size > MAX_UPLOAD_BYTES) { showToast(`"${file.name}" is too large (max 50 MB).`, 'error'); continue; }
+            const type = _classifyFile(file);
+            let previewUrl = null;
+            if (type === 'image') {
+                previewUrl = URL.createObjectURL(file);
+            } else if (type === 'video') {
+                // Generate thumbnail from first frame
+                try { previewUrl = await getVideoThumbnail(file) || null; } catch { previewUrl = null; }
+            }
+            const item = {
+                id: String(++_attachIdCounter), file, name: file.name,
+                mime: file.type, size: file.size, type,
+                previewUrl, uploadedUrl: null, progress: null, error: null, compressing: false
+            };
+            pendingAttachments.push(item);
+            // Start upload immediately in background — don't await
+            uploadPendingAttachment(item).catch(() => {});
+        }
+        renderComposeTray();
+        input.focus();
+    }
+
+    // Import getVideoThumbnail from storage.js (used for compose previews)
+    let _getVideoThumbnailFn = null;
+    import('../utils/storage.js').then(m => { _getVideoThumbnailFn = m.getVideoThumbnail; }).catch(() => {});
+    function getVideoThumbnail(file) {
+        return _getVideoThumbnailFn ? _getVideoThumbnailFn(file) : Promise.resolve(null);
+    }
+
+    // ── Send composed message (text + attachments[]) ──────────────────────────
+    // Waits for any still-uploading items to finish, then sends a single message
+    // document containing all attachments and an optional caption.
+    async function sendComposedMessage(caption) {
+        if (!pendingAttachments.length || !activeRoomId || !requireAuth()) return;
+
+        // Snapshot room context before any await (race-condition guard)
+        const roomId      = activeRoomId;
+        const _roomType   = activeRoomDetails?.type;
+        const _recipEmail = activeRoomDetails?.targetEmail;
+
+        // Disable UI while sending
+        input.disabled   = true;
+        sendBtn.disabled = true;
+        if (attachBtn) attachBtn.disabled = true;
+
+        // Wait for any in-flight uploads to finish (or fail)
+        const MAX_WAIT_MS = 90_000;
+        const started     = Date.now();
+        while (pendingAttachments.some(a => !a.uploadedUrl && !a.error)) {
+            if (Date.now() - started > MAX_WAIT_MS) { showToast('Upload timed out. Please retry.', 'error'); break; }
+            await sleep(250);
+        }
+
+        // Collect successful uploads; warn on failures
+        const failed   = pendingAttachments.filter(a => a.error);
+        const uploaded = pendingAttachments.filter(a => a.uploadedUrl);
+        if (failed.length) {
+            showToast(`${failed.length} file(s) failed to upload — sending the rest.`, 'warning');
+        }
+        if (!uploaded.length) {
+            showToast('All uploads failed. Please try again.', 'error');
+            input.disabled = false; sendBtn.disabled = false;
+            if (attachBtn) attachBtn.disabled = false;
+            return;
+        }
+
+        // Build attachments array
+        const attachments = uploaded.map(a => ({
+            url:  a.uploadedUrl,
+            type: a.type,
+            mime: a.mime  || '',
+            name: a.name  || '',
+            size: a.size  || 0,
+        }));
+
+        // Clear compose tray immediately (optimistic)
+        const _traySnapshot = [...pendingAttachments];
+        clearComposeTray();
+
+        // Clear caption input
+        const captionText = caption?.trim() || '';
+        input.value       = '';
+        input.style.height = 'auto';
+
+        // Clear typing state
+        clearTypingState();
+        writeTypingState(roomId, false);
+
+        // Clear reply if set
+        const replyTo = replyingTo ? { ...replyingTo } : null;
+        replyingTo    = null;
+        document.getElementById('wa-reply-preview')?.remove();
+
+        // Optimistic bubble
+        const tempId = `pending_${Date.now()}_${optimisticCounter++}`;
+        const optMsg = {
+            id: tempId, text: captionText, attachments,
+            senderEmail: currentUser.email, senderName: currentUser.name,
+            createdAt: { toDate: () => new Date() }, _pending: true, replyTo
+        };
+        if (roomId === activeRoomId) {
+            lastMessagesSnapshot.unshift(optMsg);
+            renderMessages();
+        }
+
+        try {
+            // ── Compose the Firestore payload ──
+            const msgPayload = {
+                senderEmail: currentUser.email, senderName: currentUser.name,
+                createdAt: serverTimestamp(), seenBy: [],
+                attachments,
+                text: captionText,  // caption (may be empty)
+            };
+            if (replyTo) msgPayload.replyTo = replyTo;
+
+            // ── Compute unread update ──
+            const _roomUpdate = {
+                lastMessage: captionText || (attachments[0]?.type === 'image' ? '📷 Photo'
+                           : attachments[0]?.type === 'video' ? '🎥 Video'
+                           : attachments[0]?.type === 'audio' ? '🎤 Voice'
+                           : `📎 ${attachments[0]?.name || 'File'}`),
+                lastSenderEmail: currentUser.email,
+                lastUpdated:     serverTimestamp(),
+                [`unreadCount.${currentUser.email}`]: 0,
+            };
+            if (_roomType === 'private' && _recipEmail) {
+                _roomUpdate[`unreadCount.${_recipEmail}`] = increment(1);
+            } else if (_roomType === 'group') {
+                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
+                for (const _gm of (_rSnap?.data()?.members || [])) {
+                    if (_gm && _gm !== currentUser.email) {
+                        _roomUpdate[`unreadCount.${_gm}`] = increment(1);
+                    }
+                }
+            }
+
+            // ── Atomic batch: message + room metadata ──
+            const _batch = writeBatch(db);
+            const _msgRef = doc(collection(db, `chats/${roomId}/messages`));
+            _batch.set(_msgRef, msgPayload);
+            _batch.set(doc(db, 'chats', roomId), _roomUpdate, { merge: true });
+            await _batch.commit();
+
+            // Remove optimistic entry; real snapshot will add it back
+            const _si = lastMessagesSnapshot.findIndex(m => m.id === tempId);
+            if (_si !== -1) lastMessagesSnapshot.splice(_si, 1);
+            if (roomId === activeRoomId) renderMessages();
+
+            const attLabel = attachments.length === 1
+                ? (attachments[0].type === 'image' ? 'Photo' : attachments[0].type === 'video' ? 'Video' : 'File')
+                : `${attachments.length} files`;
+            showToast(`${attLabel} sent!`, 'success');
+        } catch (err) {
+            console.error('[Chat] sendComposedMessage error:', err);
+            // Mark optimistic entry as failed
+            const _fi = lastMessagesSnapshot.findIndex(m => m.id === tempId);
+            if (_fi !== -1) {
+                lastMessagesSnapshot[_fi] = { ...lastMessagesSnapshot[_fi], _pending: false, _failed: true };
+            }
+            if (roomId === activeRoomId) renderMessages();
+            showToast('Failed to send. Please try again.', 'error');
+            // Re-populate tray so user can retry
+            _traySnapshot.forEach(item => { if (!pendingAttachments.find(a => a.id === item.id)) pendingAttachments.push(item); });
+            renderComposeTray();
+        } finally {
+            input.disabled   = false;
+            sendBtn.disabled = false;
+            if (attachBtn) attachBtn.disabled = false;
+            input.focus();
         }
     }
 
+    // Teardown helper: clears compose tray when switching rooms or logging out
+    function teardownComposeTray() {
+        clearComposeTray();
+    }
+
+    // Wire input handlers to use addFilesToCompose (compose-then-send flow)
     imageAttachInput.addEventListener('change', async e => {
         const files = Array.from(e.target.files || []);
-        if (files.length) { await sendFilesSequentially(files); imageAttachInput.value = ''; }
+        if (files.length) { await addFilesToCompose(files); imageAttachInput.value = ''; }
     });
     fileAttachInput.addEventListener('change', async e => {
         const files = Array.from(e.target.files || []);
-        if (files.length) { await sendFilesSequentially(files); fileAttachInput.value = ''; }
+        if (files.length) { await addFilesToCompose(files); fileAttachInput.value = ''; }
     });
     videoAttachInput.addEventListener('change', async e => {
         const files = Array.from(e.target.files || []);
-        if (files.length) { await sendFilesSequentially(files); videoAttachInput.value = ''; }
+        if (files.length) { await addFilesToCompose(files); videoAttachInput.value = ''; }
     });
 
-    // Drag & drop
+    // Drag & drop — add to compose tray
     chatContainer?.addEventListener('dragover', e => {
         if (!activeRoomId) return;
         e.preventDefault();
@@ -5363,13 +6864,11 @@ export function setupChat() {
         e.preventDefault();
         chatContainer.classList.remove('wa-drag-over');
         if (!activeRoomId) return;
-        // FIXED: send all dropped files, not just the first
         const files = Array.from(e.dataTransfer.files || []);
-        if (files.length) await sendFilesSequentially(files);
+        if (files.length) await addFilesToCompose(files);
     });
 
-    // Paste image(s) from clipboard
-    // FIXED: send ALL pasted image items, not just the first
+    // Paste image(s) from clipboard — add to compose tray
     input.addEventListener('paste', async e => {
         if (!activeRoomId) return;
         const imageFiles = [];
@@ -5381,7 +6880,7 @@ export function setupChat() {
         }
         if (imageFiles.length) {
             e.preventDefault();
-            await sendFilesSequentially(imageFiles);
+            await addFilesToCompose(imageFiles);
         }
     });
 
