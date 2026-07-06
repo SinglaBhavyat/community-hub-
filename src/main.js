@@ -5,7 +5,7 @@ import { setupEventsAndPolls } from './features/eventsAndPolls.js';
 import { setupComments } from './features/comments.js';
 import { setupChat, teardownChat } from './features/chat.js';
 import { setupLostFound } from './features/lostFound.js';
-import { setupAiChat } from './features/aiChat.js';
+import { setupAiChat, setApiKey } from './features/aiChat.js';
 import { setupAchievements } from './features/achievements.js';
 import { setupProfile } from './features/profile.js';
 import { setupAdmin } from './features/admin.js';
@@ -196,6 +196,11 @@ document.addEventListener('DOMContentLoaded', () => {
             setupComments();
             setupChat();
             setupLostFound();
+            // Inject Gemini API key before initialising the AI chat.
+            // This project has no build step so we read from window.__GEMINI_KEY
+            // which is set in index.html, OR call setApiKey() directly here.
+            // IMPORTANT: replace the string below with your actual Gemini API key.
+            setApiKey(window.__GEMINI_KEY || 'AQ.Ab8RN6Klhov6IgGsFx1iYHKaCOs6jUMrfWsJUSqAzottSOfe7g');
             setupAiChat();
             setupAchievements();
             setupProfile();

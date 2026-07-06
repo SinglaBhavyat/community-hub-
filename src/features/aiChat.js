@@ -114,8 +114,13 @@ export function setApiKey(key) {
 }
 
 function resolveApiKey() {
-  const key = _configApiKey ?? window.__ECHO_API_KEY ?? import.meta.env?.VITE_GEMINI_API_KEY ?? '';
-  if (!key) console.warn('[Echo] No API key found. Call setApiKey(key) or set window.__ECHO_API_KEY before setupAiChat().');
+  // Resolution order:
+  // 1. setApiKey(key) called from main.js
+  // 2. window.__ECHO_API_KEY set anywhere before setupAiChat()
+  // Note: import.meta.env is NOT used — this project has no Vite build step.
+  //       The key is injected at runtime via setApiKey() in main.js.
+  const key = _configApiKey || window.__ECHO_API_KEY || '';
+  if (!key) console.warn('[Echo] No Gemini API key found. Ensure setApiKey() is called in main.js before setupAiChat().');
   return key;
 }
 
@@ -125,11 +130,11 @@ const MAX_CHARS         = 2000;
 const RETRY_DELAYS      = [1000, 2000, 4000];
 
 // Gemini streaming endpoint.
-// AQ.Ab8... format keys do NOT work via the x-goog-api-key header —
-// they must be sent as a ?key= query parameter instead.
+// AQ.Ab8... format keys work via the X-goog-api-key header (confirmed via curl).
 const GEMINI_BASE_URL =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse';
-const geminiUrl = (key) => GEMINI_BASE_URL + '&key=' + encodeURIComponent(key);
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:streamGenerateContent?alt=sse';
+// Key sent via x-goog-api-key header (proven to work with AQ.Ab8... format keys)
+const geminiUrl = () => GEMINI_BASE_URL;
 
 const SYSTEM_PAIR = Object.freeze([
   {
@@ -1604,10 +1609,11 @@ export function setupAiChat(config = {}) {
   async function streamGemini({ history, signal, onChunk }) {
     const apiKey = resolveApiKey();
     // [SEC-FIX-01] Key in header, not query string
-    const response = await fetch(geminiUrl(apiKey), {
+    const response = await fetch(geminiUrl(), {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type':    'application/json',
+        'X-goog-api-key':  apiKey,
       },
       signal,
       body: JSON.stringify({ contents: history }),

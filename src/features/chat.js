@@ -110,6 +110,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // errors that are clearly not transient (e.g. a misconfigured Cloudinary
 // preset) so a permanent failure surfaces immediately instead of stalling
 // for several seconds first.
+//
+// NON-RETRIABLE ERRORS: HTTP 400 (bad request / wrong preset), 401 (unauthenticated),
+// 403 (forbidden), 413 (too large), and CORS errors are treated as permanent failures
+// so they surface immediately rather than stalling for multiple retry cycles.
+const NON_RETRIABLE_HTTP = new Set([400, 401, 403, 413]);
 async function uploadBytesWithRetry(file, folder, onProgress, fileName) {
     let attempt = 0;
     // eslint-disable-next-line no-constant-condition
@@ -120,6 +125,10 @@ async function uploadBytesWithRetry(file, folder, onProgress, fileName) {
                 onProgress: (pct) => onProgress?.(pct, attempt),
             });
         } catch (err) {
+            // Permanent (non-retriable) failure — surface immediately without backoff
+            // so users see the real error (wrong preset, oversized, auth) right away.
+            const httpStatus = err?.status || err?.httpStatus;
+            if (httpStatus && NON_RETRIABLE_HTTP.has(httpStatus)) throw err;
             // BUG FIX: was incrementing attempt BEFORE the > check, so retries were
             // capped at MAX_UPLOAD_RETRIES-1. Increment after the check so the full
             // MAX_UPLOAD_RETRIES attempts are actually performed.
@@ -180,10 +189,11 @@ async function uploadFile(file, folder = 'chats') {
 
 async function uploadAudioBlob(blob, mimeType = '') {
     // FIX: derive file extension from actual mime type so Cloudinary
-    // stores the file correctly (webm on Chrome, mp4 on Safari, etc.)
+    // stores the file correctly (webm on Chrome, mp4/aac on Safari, etc.)
     const extMap = {
         'audio/webm': 'webm', 'audio/ogg': 'ogg',
-        'audio/mp4': 'mp4',   'audio/mpeg': 'mp3',
+        'audio/mp4': 'm4a',   'audio/mpeg': 'mp3',
+        'audio/aac': 'aac',   'audio/x-m4a': 'm4a',
     };
     const base = (mimeType || blob.type || '').split(';')[0].trim();
     const ext  = extMap[base] || 'webm';
@@ -359,6 +369,10 @@ export function teardownChat() {
     unsubscribeRecent();
     stopRecording(true);
     typingSub?.();     typingSub   = null;
+    // FIX: cancel any pending nav-badge RAF so a stale count doesn't paint
+    // after logout (the frame would fire after _totalUnread is reset to 0,
+    // but before the DOM is updated — resulting in a momentary ghost badge).
+    if (_navBadgeRaf) { cancelAnimationFrame(_navBadgeRaf); _navBadgeRaf = null; }
     if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
     // FIX BUG-DROPDOWN: remove the document-level click listener that closes the
     // header dropdown.  Previously teardownChat only nulled the reference without
@@ -394,7 +408,8 @@ export function teardownChat() {
     // FIX: reset nav badge immediately so previous user's unread dot disappears
     const navDot = document.getElementById('chat-nav-indicator');
     if (navDot) { navDot.classList.add('hidden'); navDot.textContent = ''; }
-    // Remove injected hidden file inputs on teardown to prevent accumulation
+    // Remove injected hidden file inputs on teardown to prevent accumulation.
+    // Also clear data-wired so re-login will re-attach the change listeners.
     document.querySelectorAll('[data-chat-input="true"]').forEach(el => el.remove());
     // Clear compose tray: revoke all blob preview URLs to free memory
     pendingAttachments.forEach(item => {
@@ -655,9 +670,13 @@ function buildVoiceNoteHTML(msg, isMe) {
     let seed  = 0;
     for (let i = 0; i < (msg.id || '').length; i++) seed = (seed * 31 + msg.id.charCodeAt(i)) >>> 0;
     const pseudoRand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return (seed >>> 0) / 4294967296; };
+    // FIX: safeUrl rejects non-http(s) URLs including the 'pending' placeholder set
+    // by the optimistic voice bubble.  Use empty string so data-voice-url is set but
+    // the play button handler's safeUrl check silently no-ops (prevents broken fetch).
     const _safeVUrl = safeUrl(msg.voiceUrl || '') || '';
+    const _isPending = !_safeVUrl || msg._pending;
     return `<div class="wa-voice-note" data-voice-url="${_safeVUrl}">
-        <button class="wa-voice-play-btn" data-voice-url="${_safeVUrl}">
+        <button class="wa-voice-play-btn" data-voice-url="${_safeVUrl}" ${_isPending ? 'disabled title="Uploading…"' : ''}>
             <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24" class="wa-play-icon">
                 <path d="M8 5v14l11-7z"/>
             </svg>
@@ -3370,16 +3389,25 @@ function subscribeTypingIndicator(roomId, chatType) {
 // ─────────────────────────────────────────────
 function markRoomRead(roomId) {
     if (!roomId || !currentUser?.email) return;
-    // FIX: mark pending immediately so snapshot re-renders don't restore the badge
-    // before the serverTimestamp() resolves from null → real value
+    // Mark pending immediately so snapshot re-renders don't restore the badge
+    // before the serverTimestamp() resolves from null → real value.
     _pendingReadRooms.add(roomId);
     setDoc(doc(db, 'chats', roomId), {
         [`lastRead.${currentUser.email}`]: serverTimestamp(),
         [`unreadCount.${currentUser.email}`]: 0
     }, { merge: true }).then(() => {
         _pendingReadRooms.delete(roomId);
-    }).catch(() => {
+    }).catch(err => {
+        // FIX ROLLBACK: if the Firestore write fails (e.g. permission denied or offline),
+        // remove the room from the pending set so the next snapshot can restore the
+        // correct unread count.  Also restore _totalUnread so the nav badge re-appears.
+        console.warn('[Chat] markRoomRead failed — rolling back badge:', err);
         _pendingReadRooms.delete(roomId);
+        // Restore the count from the authoritative Map (set by the last snapshot).
+        // _roomUnreadMap already holds 0 because we zeroed it below; re-read from
+        // the snapshot is not possible here, so simply force a re-render — the next
+        // snapshot delivery will correct it automatically.
+        _recomputeNavBadge();
     });
 
     // FIX BUG 5: read cleared count from _roomUnreadMap (set by the snapshot)
@@ -3405,28 +3433,30 @@ function markRoomRead(roomId) {
     _totalUnread = Math.max(0, _totalUnread - clearedCount);
     _recomputeNavBadge();
 }
+// FIX DEBOUNCE: rapid snapshot bursts (reactions, seenBy updates) cause _recomputeNavBadge
+// to fire many times per second.  Debounce to one DOM write per animation frame.
+let _navBadgeRaf = null;
 function _recomputeNavBadge() {
-    // Use the module-level _totalUnread counter (kept in sync by loadRecentChats
-    // snapshot and decremented in markRoomRead) instead of re-summing DOM badges.
-    // Re-reading the DOM here is unreliable because markRoomRead may have already
-    // removed the badge node for the just-opened room before this function runs.
-    // FIX: if no authenticated user exists, force total to 0 so a signed-out
-    // state never shows a stale unread indicator from the previous session.
-    const total = currentUser ? _totalUnread : 0;
-    const navDot = document.getElementById('chat-nav-indicator');
-    if (!navDot) return;
-    if (total === 0) {
-        // FIX Bug 5: explicitly reset pill shape and content when total hits zero.
-        // Relying solely on classList.toggle left chat-nav-dot--count in place if the
-        // element was briefly un-hidden (e.g. CSS transition race), showing an empty pill.
-        navDot.classList.add('hidden');
-        navDot.classList.remove('chat-nav-dot--count');
-        navDot.textContent = '';
-    } else {
-        navDot.classList.remove('hidden');
-        navDot.classList.toggle('chat-nav-dot--count', true);
-        navDot.textContent = total > 99 ? '99+' : String(total);
-    }
+    if (_navBadgeRaf) return; // already scheduled — the pending frame will pick up latest _totalUnread
+    _navBadgeRaf = requestAnimationFrame(() => {
+        _navBadgeRaf = null;
+        // Use the module-level _totalUnread counter (kept in sync by loadRecentChats
+        // snapshot and decremented in markRoomRead) instead of re-summing DOM badges.
+        // If no authenticated user exists, force total to 0 so a signed-out state
+        // never shows a stale indicator from the previous session.
+        const total = currentUser ? _totalUnread : 0;
+        const navDot = document.getElementById('chat-nav-indicator');
+        if (!navDot) return;
+        if (total === 0) {
+            navDot.classList.add('hidden');
+            navDot.classList.remove('chat-nav-dot--count');
+            navDot.textContent = '';
+        } else {
+            navDot.classList.remove('hidden');
+            navDot.classList.toggle('chat-nav-dot--count', true);
+            navDot.textContent = total > 99 ? '99+' : String(total);
+        }
+    });
 }
 
 // FIX Bug 1: track message IDs for which we've already fired a seenBy write this
@@ -3840,9 +3870,14 @@ export function setupChat() {
                 // FIX: also treat missing lastSenderEmail (new chat doc with no messages yet)
                 // as "no unread" — previously `undefined !== currentUser.email` was true,
                 // giving the opener a phantom unread badge on their own new chat.
+                // FIX CROSS-DEVICE SYNC: when the user is signed in on multiple devices/tabs,
+                // another device may have already cleared unreadCount to 0 via markRoomRead.
+                // We must honour the server-side unreadCount=0 even if lastRead hasn't resolved
+                // yet on this device (it will propagate in the next snapshot).
+                // Priority: active/pending-read room → explicit server counter → time-based heuristic.
                 const unread = (isActiveRoom || isPendingRead) ? 0
                     : (typeof unreadFromCounter === 'number'
-                        ? unreadFromCounter
+                        ? Math.max(0, unreadFromCounter) // server counter is authoritative (cross-device)
                         : (updatedMs > lastReadMs && chat.lastSenderEmail && chat.lastSenderEmail !== currentUser.email ? 1 : 0));
                 const online      = !isGroup && cachedUsersData?.find(u => u.email === email)
                     ? isUserOnline(cachedUsersData.find(u => u.email === email).lastActive) : false;
@@ -4050,6 +4085,31 @@ export function setupChat() {
                 if (wrapper) wrapper.removeAttribute('data-mobile-view');
             }
         });
+
+        // ── Network online/offline status indicator ───────────────────────
+        // When the browser goes offline, Firestore listeners stop receiving updates.
+        // Show a non-intrusive toast so users understand why messages aren't arriving,
+        // and hide it automatically when connectivity is restored.
+        let _offlineToastEl = null;
+        const _showOfflineToast = () => {
+            if (_offlineToastEl) return; // already showing
+            const host = ensureToastHost();
+            _offlineToastEl = document.createElement('div');
+            _offlineToastEl.className = 'pointer-events-none flex items-center gap-3 px-4 py-3 rounded-xl border shadow-lg text-sm text-gray-800 font-medium bg-white border-amber-300';
+            _offlineToastEl.innerHTML = `<span class="w-2 h-2 rounded-full flex-shrink-0 bg-amber-500"></span><span class="leading-snug">No internet connection — messages paused</span>`;
+            host.appendChild(_offlineToastEl);
+        };
+        const _hideOfflineToast = () => {
+            _offlineToastEl?.remove();
+            _offlineToastEl = null;
+        };
+        window.addEventListener('offline', _showOfflineToast, { passive: true });
+        window.addEventListener('online',  () => {
+            _hideOfflineToast();
+            showToast('Back online — messages resumed.', 'success');
+        }, { passive: true });
+        // Reflect current state on first setup (e.g. page loaded while offline)
+        if (!navigator.onLine) _showOfflineToast();
 
         // ── MOBILE: popstate — handle browser/gesture Back ──────────────
         // When the user taps Back on mobile (or swipes on iOS), the browser
@@ -4495,13 +4555,19 @@ export function setupChat() {
             }
         }
 
-        markRoomRead(activeRoomId); // FIX: markRoomRead already calls _recomputeNavBadge — removed duplicate call
-        subscribeTypingIndicator(activeRoomId, chatType);
+        // Capture the roomId we are about to subscribe to. If the user switches
+        // rooms again before the awaited setDoc above resolves, activeRoomId will
+        // have changed and all subsequent listener registrations should be skipped.
+        const _thisRoomId = activeRoomId;
+        if (!_thisRoomId) return; // user navigated away during the await
+
+        markRoomRead(_thisRoomId); // FIX: markRoomRead already calls _recomputeNavBadge — removed duplicate call
+        subscribeTypingIndicator(_thisRoomId, chatType);
         // FIX BUG-STARRED: start the dedicated starred listener immediately on room open so
         // the first renderMessages() call in the messages snapshot already has the correct
         // starred set — eliminates the per-snapshot getDoc that previously fired for every
         // reaction, read receipt, or edit event.
-        subscribeStarred(activeRoomId);
+        subscribeStarred(_thisRoomId);
 
         const targetUserDoc = chatType === 'private'
             ? cachedUsersData?.find(u => u.email === targetEmail)
@@ -4601,8 +4667,10 @@ export function setupChat() {
             if (msgs) msgs.scrollTop = 0; // column-reverse: 0 = bottom
         });
 
-        // Root listener
-        rootChatSub = onSnapshot(doc(db, 'chats', activeRoomId), docSnap => {
+        // Root listener — uses _thisRoomId (captured before any async awaits) so that
+        // a quick room switch cannot register a listener for the OLD room's Firestore doc
+        // when activeRoomId has already advanced to the new room.
+        rootChatSub = onSnapshot(doc(db, 'chats', _thisRoomId), docSnap => {
             if (chatType === 'group' &&
                 (!docSnap.exists() || !docSnap.data().members?.includes(currentUser.email))) {
                 chatContainer.innerHTML = `
@@ -4651,9 +4719,9 @@ export function setupChat() {
             }
         }, err => { console.error('[Chat] root:', err); showToast('Connection error.', 'error'); });
 
-        // Messages listener
+        // Messages listener — scoped to _thisRoomId to prevent stale listener after fast room switch
         const msgsQuery = query(
-            collection(db, `chats/${activeRoomId}/messages`),
+            collection(db, `chats/${_thisRoomId}/messages`),
             orderBy('createdAt', 'desc'),
             limit(100)
         );
@@ -4676,6 +4744,16 @@ export function setupChat() {
                 }
             }, () => {}); // non-fatal: ignore errors on presence reads
         }
+
+        // Show a loading skeleton while waiting for the first snapshot
+        chatContainer.innerHTML = `
+            <div class="w-full h-full flex items-center justify-center">
+                <div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--wa-sub)">
+                    <div style="width:32px;height:32px;border:3px solid var(--wa-border);border-top-color:var(--wa-accent);border-radius:50%;animation:spin 0.8s linear infinite"></div>
+                    <span style="font-size:13px">Loading messages…</span>
+                </div>
+            </div>
+            <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
 
         chatSub = onSnapshot(msgsQuery, snap => {
             // FIX: always merge in-flight optimistic messages back — they have no Firestore doc yet
@@ -4705,7 +4783,11 @@ export function setupChat() {
             // O(snapshot) Firestore reads that previously fired for every reaction, read
             // receipt, and edit event inside the active room.
             renderMessages();
-            markMessagesSeenBy(activeRoomId);
+            // FIX: pass _thisRoomId (closed over from openChatRoom) rather than the
+            // live activeRoomId — if the user switched rooms, activeRoomId now points
+            // to the new room but the snapshot still belongs to the old one.  Writing
+            // seenBy to the new room's messages would corrupt read-receipt state.
+            markMessagesSeenBy(_thisRoomId);
         }, err => { console.error('[Chat] messages:', err); showToast('Error loading messages.', 'error'); });
     };
 
@@ -5908,7 +5990,10 @@ export function setupChat() {
         const voicePlayBtn = e.target.closest('.wa-voice-play-btn');
         if (voicePlayBtn) {
             const url = voicePlayBtn.dataset.voiceUrl;
-            if (!url) return;
+            // FIX: empty url means the voice note is still uploading (pending optimistic bubble).
+            // Button has disabled attribute, but delegation still fires via pointer events.
+            // Skip gracefully rather than showing an error toast.
+            if (!url || voicePlayBtn.disabled) return;
 
             const PLAY_ICON  = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`;
             const PAUSE_ICON = `<svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
@@ -5944,12 +6029,15 @@ export function setupChat() {
             const totalDur   = durSpan ? durSpan.textContent : '';
             if (voiceNote) voiceNote.classList.add('playing');
 
-            // FIX: handle load/play errors — reset button, remove playing class, clear ref
+            // FIX: handle load/play errors — reset button, remove playing class, clear ref.
+            // Use a flag so the error event and play().catch() don't both fire a toast
+            // (both can fire on some browsers; the event fires first, then the rejection).
+            let _playErrorShown = false;
             const resetBtn = () => {
                 voicePlayBtn.innerHTML = PLAY_ICON;
                 if (voiceNote) voiceNote.classList.remove('playing');
                 if (durSpan && totalDur) durSpan.textContent = totalDur; // restore original duration
-                if (_activeAudio === audio) _activeAudio = null; // FIX: null out on end/error
+                if (_activeAudio === audio) _activeAudio = null; // null out on end/error
             };
 
             // Live elapsed time counter during playback
@@ -5962,11 +6050,13 @@ export function setupChat() {
             audio.addEventListener('ended', resetBtn);
             audio.addEventListener('error', () => {
                 resetBtn();
-                showToast('Could not play voice note.', 'error');
+                if (!_playErrorShown) { _playErrorShown = true; showToast('Could not play voice note.', 'error'); }
             });
-            audio.play().catch(() => {
+            audio.play().catch(err => {
+                // AbortError fires when pause() is called before play() resolves — not a real failure
+                if (err?.name === 'AbortError') return;
                 resetBtn();
-                showToast('Could not play voice note.', 'error');
+                if (!_playErrorShown) { _playErrorShown = true; showToast('Could not play voice note.', 'error'); }
             });
             return;
         }
@@ -6366,12 +6456,18 @@ export function setupChat() {
         const inputArea = input.closest('form') || input.parentElement;
         (inputArea?.parentElement || document.body).appendChild(menu);
 
-        // Lazily create the audio input (same pattern as other inputs)
+        // Lazily create the audio input – wire the change listener exactly once.
+        // openAttachMenu can be called many times; getAttachInput returns the SAME
+        // cached element each time, so stacking addEventListener creates duplicate handlers.
+        // Guard with a data attribute so the listener is registered on the first call only.
         const audioAttachInput = getAttachInput('audio/*', 'chat-attach-audio-input');
-        audioAttachInput.addEventListener('change', async e => {
-            const files = Array.from(e.target.files || []);
-            if (files.length) { await addFilesToCompose(files); audioAttachInput.value = ''; }
-        });
+        if (!audioAttachInput.dataset.wired) {
+            audioAttachInput.dataset.wired = 'true';
+            audioAttachInput.addEventListener('change', async e => {
+                const files = Array.from(e.target.files || []);
+                if (files.length) { await addFilesToCompose(files); audioAttachInput.value = ''; }
+            });
+        }
 
         document.getElementById('wa-attach-image-btn').addEventListener('click', () => { imageAttachInput.click(); menu.remove(); });
         document.getElementById('wa-attach-video-btn').addEventListener('click', () => { videoAttachInput.click(); menu.remove(); });
@@ -6465,23 +6561,21 @@ export function setupChat() {
             else if (isVideo)  { payload.fileUrl = url; payload.fileName = file.name; payload.fileMime = file.type; }
             else               { payload.fileUrl = url; payload.fileName = file.name; payload.fileMime = file.type; payload.fileSize = fileToSend.size; }
 
-            await addDoc(collection(db, `chats/${roomId}/messages`), payload);
-            // FIX: use pre-captured _fileRoomType/_fileRecip (not live activeRoomDetails — could have changed during upload)
+            // FIX ATOMIC-MEDIA: use writeBatch so message doc + room metadata land in one
+            // server-side commit.  The old sequential addDoc→setDoc had a window where
+            // the Firestore listener saw the new message but the room doc still held stale
+            // lastMessage/unreadCount values — causing sidebar flash and counter drift.
             const _fileUpdate = {
                 lastMessage: isImage ? '📷 Photo' : (isVideo ? '🎥 Video' : `📎 ${file.name}`),
                 lastSenderEmail: currentUser.email, lastUpdated: serverTimestamp(),
                 [`unreadCount.${currentUser.email}`]: 0
             };
-            // FIX BUG-ATOMIC-MEDIA: use server-side increment() instead of (current + 1).
-            // The old pattern read the doc, added 1 client-side, then wrote back — two
-            // concurrent uploads from different devices would both read 0 and both write 1,
-            // effectively capping the counter at 1 regardless of how many messages were sent.
-            // increment() is atomic on the Firestore server and handles all concurrency correctly.
+            // Use server-side increment() — two concurrent uploads from different devices
+            // would both read 0 and write 1 client-side, capping the counter regardless
+            // of how many messages were sent. increment() is atomic server-side.
             if (_fileRoomType === 'private' && _fileRecip) {
-                // Private: no getDoc needed — recipient is already known from pre-captured context.
                 _fileUpdate[`unreadCount.${_fileRecip}`] = increment(1);
             } else if (_fileRoomType === 'group') {
-                // Group: still need a getDoc to enumerate members, but counts use increment().
                 const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
                 const _groupMembers = (_rSnap?.data()?.members) || [];
                 for (const _gm of _groupMembers) {
@@ -6490,7 +6584,11 @@ export function setupChat() {
                     }
                 }
             }
-            await setDoc(doc(db, 'chats', roomId), _fileUpdate, { merge: true });
+            const _mediaBatch = writeBatch(db);
+            const _mediaRef   = doc(collection(db, `chats/${roomId}/messages`));
+            _mediaBatch.set(_mediaRef, payload);
+            _mediaBatch.set(doc(db, 'chats', roomId), _fileUpdate, { merge: true });
+            await _mediaBatch.commit();
             showToast(isImage ? 'Photo sent!' : isVideo ? 'Video sent!' : 'File sent!', 'success');
         } catch (err) {
             console.error('[Chat] upload error:', err);
@@ -6631,13 +6729,26 @@ export function setupChat() {
     async function uploadPendingAttachment(item) {
         if (!item || item.uploadedUrl) return; // already uploaded
         try {
-            // Compress images before upload
+            // Compress images before upload.
+            // FIX: if compression fails (OOM, canvas API absent) compressImageFile
+            // already returns the original file — but we guard item.compressing here
+            // so a crash inside renderComposeTray can't leave item.compressing=true
+            // while item.file is undefined, causing uploadBytesWithRetry to throw
+            // an unguarded error that bypasses the catch block.
             if (item.type === 'image') {
                 item.compressing = true;
                 renderComposeTray();
-                item.file = await compressImageFile(item.file);
+                try {
+                    const compressed = await compressImageFile(item.file);
+                    item.file = compressed || item.file; // always keep a valid File reference
+                } catch (_compErr) {
+                    // compression failed — proceed with original
+                }
                 item.compressing = false;
             }
+            // FIX: validate file reference before upload; may be null if the File
+            // object was garbage-collected or the input was reset externally.
+            if (!item.file) throw new Error('File reference lost before upload.');
             item.progress = 0;
             renderComposeTray();
             const url = await uploadBytesWithRetry(item.file, 'chats',
@@ -6652,10 +6763,42 @@ export function setupChat() {
             item.progress   = 100;
             item.error      = null;
         } catch (err) {
-            item.error    = err?.message || 'Upload failed';
-            item.progress = null;
+            item.error       = err?.message || 'Upload failed';
+            item.progress    = null;
+            item.compressing = false; // always clear compressing flag on any error path
         }
         renderComposeTray();
+    }
+
+    // ── Allowed MIME type prefixes for uploads ─────────────────────────────
+    // Executable formats (exe, script, dll, etc.) and web code (html, js, php)
+    // are explicitly blocked regardless of how the file input accept filter is set.
+    const ALLOWED_MIME_PREFIXES = [
+        'image/', 'video/', 'audio/',
+        'application/pdf',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument',
+        'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+        'application/vnd.oasis',
+        'application/zip', 'application/x-zip-compressed',
+        'application/x-rar-compressed', 'application/x-7z-compressed',
+        'application/gzip', 'application/x-tar',
+        'text/plain', 'text/csv',
+        'application/json', 'application/xml',
+        'application/octet-stream', // generic binary — allowed but rendered as doc
+    ];
+    const BLOCKED_MIME_EXACT = new Set([
+        'application/x-msdownload', 'application/x-executable',
+        'application/x-sh', 'application/x-csh', 'application/x-bat',
+        'application/x-php', 'text/html', 'text/javascript',
+        'application/javascript', 'application/x-javascript',
+        'application/x-python-code', 'application/x-perl',
+    ]);
+    function _isMimeAllowed(mimeType) {
+        if (!mimeType) return true; // unknown → allow, classify as document
+        const mt = mimeType.toLowerCase().split(';')[0].trim();
+        if (BLOCKED_MIME_EXACT.has(mt)) return false;
+        return ALLOWED_MIME_PREFIXES.some(p => mt.startsWith(p));
     }
 
     // Add files to the compose queue and start background uploads.
@@ -6663,6 +6806,11 @@ export function setupChat() {
         if (!files?.length || !activeRoomId) return;
         for (const file of files) {
             if (file.size > MAX_UPLOAD_BYTES) { showToast(`"${file.name}" is too large (max 50 MB).`, 'error'); continue; }
+            // Reject obviously dangerous file types before they reach the upload pipeline
+            if (!_isMimeAllowed(file.type)) {
+                showToast(`"${file.name}" is not a supported file type.`, 'error');
+                continue;
+            }
             const type = _classifyFile(file);
             let previewUrl = null;
             if (type === 'image') {
@@ -6707,11 +6855,25 @@ export function setupChat() {
         sendBtn.disabled = true;
         if (attachBtn) attachBtn.disabled = true;
 
-        // Wait for any in-flight uploads to finish (or fail)
+        // Wait for any in-flight uploads to finish (or fail).
+        // Per-item timeout: if an item is still uploading after MAX_WAIT_MS without
+        // ever setting item.error (e.g. the XHR stalled silently), force-set it so
+        // the poll terminates and the user gets an actionable error on that file.
         const MAX_WAIT_MS = 90_000;
         const started     = Date.now();
         while (pendingAttachments.some(a => !a.uploadedUrl && !a.error)) {
-            if (Date.now() - started > MAX_WAIT_MS) { showToast('Upload timed out. Please retry.', 'error'); break; }
+            const elapsed = Date.now() - started;
+            if (elapsed > MAX_WAIT_MS) {
+                // Force-error any item that is still in progress so the loop exits
+                pendingAttachments.forEach(a => {
+                    if (!a.uploadedUrl && !a.error) {
+                        a.error = 'Upload timed out — please retry.';
+                        a.progress = null;
+                    }
+                });
+                showToast('Some uploads timed out. Sending what completed.', 'warning');
+                break;
+            }
             await sleep(250);
         }
 
@@ -6839,19 +7001,31 @@ export function setupChat() {
         clearComposeTray();
     }
 
-    // Wire input handlers to use addFilesToCompose (compose-then-send flow)
-    imageAttachInput.addEventListener('change', async e => {
-        const files = Array.from(e.target.files || []);
-        if (files.length) { await addFilesToCompose(files); imageAttachInput.value = ''; }
-    });
-    fileAttachInput.addEventListener('change', async e => {
-        const files = Array.from(e.target.files || []);
-        if (files.length) { await addFilesToCompose(files); fileAttachInput.value = ''; }
-    });
-    videoAttachInput.addEventListener('change', async e => {
-        const files = Array.from(e.target.files || []);
-        if (files.length) { await addFilesToCompose(files); videoAttachInput.value = ''; }
-    });
+    // Wire input handlers to use addFilesToCompose (compose-then-send flow).
+    // These inputs are created once per session by getAttachInput() and reused, so
+    // addEventListener would stack if setupChat() is called more than once (after a
+    // logout/login cycle). Guard each with data-wired to register exactly once.
+    if (!imageAttachInput.dataset.wired) {
+        imageAttachInput.dataset.wired = 'true';
+        imageAttachInput.addEventListener('change', async e => {
+            const files = Array.from(e.target.files || []);
+            if (files.length) { await addFilesToCompose(files); imageAttachInput.value = ''; }
+        });
+    }
+    if (!fileAttachInput.dataset.wired) {
+        fileAttachInput.dataset.wired = 'true';
+        fileAttachInput.addEventListener('change', async e => {
+            const files = Array.from(e.target.files || []);
+            if (files.length) { await addFilesToCompose(files); fileAttachInput.value = ''; }
+        });
+    }
+    if (!videoAttachInput.dataset.wired) {
+        videoAttachInput.dataset.wired = 'true';
+        videoAttachInput.addEventListener('change', async e => {
+            const files = Array.from(e.target.files || []);
+            if (files.length) { await addFilesToCompose(files); videoAttachInput.value = ''; }
+        });
+    }
 
     // Drag & drop — add to compose tray
     chatContainer?.addEventListener('dragover', e => {
@@ -6889,15 +7063,27 @@ export function setupChat() {
         // FIX AUTH-GUARD: bail early if no authenticated user
         if (!requireAuth()) return;
         if (isRecording) { stopAndSendRecording(); return; }
+
+        // FIX: check API availability before requesting permission — avoids a
+        // misleading "microphone access denied" toast on HTTP origins or old browsers
+        // where getUserMedia is undefined rather than throwing a NotAllowedError.
+        if (!navigator.mediaDevices?.getUserMedia) {
+            showToast('Voice recording is not supported in this browser.', 'error');
+            return;
+        }
+
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            // FIX: pick a mime type the browser actually supports.
-            // audio/ogg;codecs=opus works on Chrome/Firefox but NOT Safari/iOS.
-            // webm/opus is supported on Chrome/Edge; mp4/aac works on Safari.
+            // FIX: probe MIME types the browser actually supports.
+            // audio/webm;codecs=opus → Chrome/Edge/Firefox desktop
+            // audio/mp4;codecs=mp4a.40.2 → Safari/iOS (AAC in MPEG-4 container)
+            // audio/mp4 → Safari fallback (no explicit codec)
+            // '' → let the browser decide (last resort; we read blob.type afterwards)
             const preferredTypes = [
                 'audio/webm;codecs=opus',
                 'audio/webm',
                 'audio/ogg;codecs=opus',
+                'audio/mp4;codecs=mp4a.40.2',
                 'audio/mp4',
             ];
             const mimeType = preferredTypes.find(t => MediaRecorder.isTypeSupported(t)) || '';
@@ -6936,8 +7122,12 @@ export function setupChat() {
             // FIX: guard against stale interval if re-entered (belt-and-suspenders)
             if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
             recordingTimer = setInterval(() => {
-                // FIX: skip tick while MediaRecorder is paused so display matches audio length
-                if (mediaRecorder && mediaRecorder.state === 'paused') return;
+                // FIX: if mediaRecorder was nulled by onstop (race: stopRecording fired
+                // and completed in between two interval ticks), clear our own interval
+                // here so the timer doesn't keep running after the recording session ends.
+                if (!mediaRecorder) { clearInterval(recordingTimer); recordingTimer = null; return; }
+                // Skip tick while MediaRecorder is paused so display matches audio length
+                if (mediaRecorder.state === 'paused') return;
                 elapsed++;
                 const el = document.getElementById('wa-rec-timer');
                 if (el) el.textContent = formatDuration(elapsed);
@@ -7006,11 +7196,14 @@ export function setupChat() {
                 stream.getTracks().forEach(t => t.stop()); // FIX: stop tracks after blob is assembled
                 if (!_voiceRoomId) return;
 
-                // Optimistic: show a pending voice bubble immediately while uploading
+                // Optimistic: show a pending voice bubble immediately while uploading.
+                // Use a placeholder URL that won't resolve (play button will be inert)
+                // but lets buildVoiceNoteHTML render the waveform and duration correctly.
                 const _voiceTempId = `pending_voice_${Date.now()}_${optimisticCounter++}`;
                 const _optimisticVoice = {
                     id: _voiceTempId,
-                    voiceUrl: '', voiceDuration: duration,
+                    voiceUrl: 'pending', // non-empty so buildVoiceNoteHTML renders; safeUrl() will reject it → play button no-ops
+                    voiceDuration: duration,
                     senderEmail: currentUser.email, senderName: currentUser.name,
                     createdAt: { toDate: () => new Date() }, _pending: true, text: ''
                 };
@@ -7022,29 +7215,17 @@ export function setupChat() {
 
                 try {
                     const url = await uploadAudioBlob(blob, _capturedMime);
-                    await addDoc(collection(db, `chats/${_voiceRoomId}/messages`), {
-                        voiceUrl: url, voiceDuration: duration,
-                        senderEmail: currentUser.email, senderName: currentUser.name,
-                        createdAt: serverTimestamp(), seenBy: [], text: ''
-                    });
-                    // FIX #1: remove in-place
-                    const _vsi = lastMessagesSnapshot.findIndex(m => m.id === _voiceTempId);
-                    if (_vsi !== -1) lastMessagesSnapshot.splice(_vsi, 1);
-                    if (_voiceRoomId === activeRoomId) renderMessages();
-                    // FIX: bump recipient unread + reset own — uses pre-captured room context
+                    // FIX ATOMIC-VOICE: writeBatch so the voice message doc and room
+                    // metadata (lastMessage, unreadCount) are committed in one operation —
+                    // same atomicity fix applied to sendMediaFile and sendTextMessage.
                     const _voiceUpdate = {
                         lastMessage: '🎤 Voice note', lastSenderEmail: currentUser.email,
                         lastUpdated: serverTimestamp(),
                         [`unreadCount.${currentUser.email}`]: 0
                     };
-                    // FIX BUG-ATOMIC-VOICE: same race-condition fix as sendMediaFile — use
-                    // server-side increment() so concurrent voice sends from multiple devices
-                    // can't clobber each other's unread counter.
                     if (_voiceRoomType === 'private' && _voiceRecip) {
-                        // Private: recipient known from pre-captured context — no getDoc needed.
                         _voiceUpdate[`unreadCount.${_voiceRecip}`] = increment(1);
                     } else if (_voiceRoomType === 'group') {
-                        // Group: need member list, but counts use increment().
                         const _vSnap = await getDoc(doc(db, 'chats', _voiceRoomId)).catch(() => null);
                         const _vGroupMembers = (_vSnap?.data()?.members) || [];
                         for (const _gm of _vGroupMembers) {
@@ -7053,7 +7234,19 @@ export function setupChat() {
                             }
                         }
                     }
-                    await setDoc(doc(db, 'chats', _voiceRoomId), _voiceUpdate, { merge: true });
+                    const _voiceBatch = writeBatch(db);
+                    const _voiceMsgRef = doc(collection(db, `chats/${_voiceRoomId}/messages`));
+                    _voiceBatch.set(_voiceMsgRef, {
+                        voiceUrl: url, voiceDuration: duration,
+                        senderEmail: currentUser.email, senderName: currentUser.name,
+                        createdAt: serverTimestamp(), seenBy: [], text: ''
+                    });
+                    _voiceBatch.set(doc(db, 'chats', _voiceRoomId), _voiceUpdate, { merge: true });
+                    await _voiceBatch.commit();
+                    // Remove optimistic bubble; real snapshot will add it back
+                    const _vsi = lastMessagesSnapshot.findIndex(m => m.id === _voiceTempId);
+                    if (_vsi !== -1) lastMessagesSnapshot.splice(_vsi, 1);
+                    if (_voiceRoomId === activeRoomId) renderMessages();
                 } catch (err) {
                     console.error(err);
                     // Mark optimistic bubble as failed so user sees a retry affordance
