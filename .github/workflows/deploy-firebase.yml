@@ -18,6 +18,8 @@ jobs:
           sed -i "s|%%FIREBASE_API_KEY%%|${{ secrets.FIREBASE_API_KEY }}|g" src/config/firebase.js
           sed -i "s|%%FIREBASE_SENDER_ID%%|${{ secrets.FIREBASE_SENDER_ID }}|g" src/config/firebase.js
           sed -i "s|%%FIREBASE_APP_ID%%|${{ secrets.FIREBASE_APP_ID }}|g" src/config/firebase.js
+          sed -i "s|%%CLOUDINARY_CLOUD_NAME%%|${{ secrets.CLOUDINARY_CLOUD_NAME }}|g" src/utils/storage.js
+          sed -i "s|%%CLOUDINARY_UPLOAD_PRESET%%|${{ secrets.CLOUDINARY_UPLOAD_PRESET }}|g" src/utils/storage.js
 
       - name: Deploy to Firebase Hosting (live channel)
         uses: FirebaseExtended/action-hosting-deploy@v0

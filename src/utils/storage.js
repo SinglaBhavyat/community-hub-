@@ -1,7 +1,7 @@
 // src/utils/storage.js
 
-const CLOUD_NAME    = 'dqipn2dty';
-const UPLOAD_PRESET = 'app1234';
+const CLOUD_NAME    = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' ? 'dqipn2dty' : '%%CLOUDINARY_CLOUD_NAME%%';
+const UPLOAD_PRESET = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' ? 'app1234' : '%%CLOUDINARY_UPLOAD_PRESET%%';
 
 // ─── Resource type ────────────────────────────────────────────────────────────
 function resourceTypeFor(file) {

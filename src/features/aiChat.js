@@ -1517,7 +1517,7 @@ export function setupAiChat(config = {}) {
           <li>Copy and paste it below</li>
         </ol>
         <div class="echo-key-input-row">
-          <input type="password" id="echo-key-input" class="echo-key-input" placeholder="AIza..." autocomplete="off" spellcheck="false" />
+          <input type="password" id="echo-key-input" class="echo-key-input" placeholder="AQ. or AIza..." autocomplete="off" spellcheck="false" />
           <button id="echo-key-save-btn" class="echo-key-save-btn">Save &amp; Start</button>
         </div>
         <p class="echo-key-note">Stored locally in your browser only — never sent anywhere except Google.</p>
@@ -1525,7 +1525,7 @@ export function setupAiChat(config = {}) {
 
     document.getElementById('echo-key-save-btn')?.addEventListener('click', () => {
       const val = (document.getElementById('echo-key-input')?.value || '').trim();
-      if (!val || !val.startsWith('AI')) {
+      if (!val || (!val.startsWith('AI') && !val.startsWith('AQ.'))) {
         const input = document.getElementById('echo-key-input');
         if (input) { input.style.borderColor = '#ef4444'; input.focus(); }
         return;
@@ -2080,7 +2080,7 @@ export function setupAiChat(config = {}) {
       // Invalid or expired key — clear it and show setup UI
       localStorage.removeItem('echo_gemini_api_key');
       _configApiKey = null;
-      throw Object.assign(new Error('Invalid API key. Please enter a valid Gemini API key.'), { status: response.status, isAuthError: true });
+      throw Object.assign(new Error('Invalid or expired API key. Please enter a valid Gemini API key.'), { status: response.status, isAuthError: true });
     }
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
