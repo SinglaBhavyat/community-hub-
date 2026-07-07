@@ -490,6 +490,14 @@
   position: relative;
   /* Ensure the wrap itself clips its own corners so the black bg stays rounded */
   isolation: isolate;
+  /* FIX (controls/replay overlap): the controls bar is always two rows
+     (play/seek/time/mute, then volume/speed/pip/fullscreen/download) at
+     roughly 70-80px tall regardless of wrap width. The spinner and replay
+     overlays used inset:0 (full wrap height) and centered their content,
+     so on short wraps the centered icon/text landed on top of the controls
+     row instead of in the video area above it. This variable gives both
+     overlays a floor to stop at so they never draw over the controls. */
+  --lc-vp-ctrl-h: 80px;
 }
 /* Clip the wrap's own background to its rounded corners without hiding children */
 .lc-media-video-wrap::before {
@@ -504,8 +512,19 @@
   position: relative;
   z-index: 1;
   width: 100%;
-  /* Fill all space above the controls bar — controls are 44px tall (6px pad×2 + 28px btn + 4px wrap) */
-  height: calc(100% - 80px);
+  /* FIX (video-cropped-by-controls bug): height:100% made the video fill the
+     whole wrap, so the opaque controls bar (position:absolute; bottom:0;
+     ~80px tall) sat ON TOP of the bottom of the picture, hiding/"cropping"
+     it. We now reserve that 80px so controls sit below the picture instead
+     of over it. This is safe from the earlier "mobile no-video bug" (where
+     calc(100% - 80px) went negative on very short slides) because the
+     min-height rules for video slides were later bumped to 160px+ (see
+     .lc-gallery-slide:has(.lc-media-video-wrap) below and the standalone
+     wrap's max-height:260px), which always leaves positive room. The extra
+     min-height floor below is a second safety net for any container that
+     still ends up shorter than that. */
+  height: calc(100% - var(--lc-vp-ctrl-h, 80px));
+  min-height: 60px;
   max-width: 100%;
   border-radius: 10px 10px 0 0;
   display: block;
@@ -1205,7 +1224,12 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 .lc-vp-spinner {
   display: flex;
   position: absolute;
-  inset: 0;
+  /* FIX: was inset:0 (covered full wrap incl. controls); now stops above
+     the controls bar so the spinner centers over the visible video area. */
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: var(--lc-vp-ctrl-h, 80px);
   align-items: center;
   justify-content: center;
   pointer-events: none;
@@ -1228,7 +1252,14 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
    Shown when a video ends. Click → seeks to 0 and replays. */
 .lc-vp-replay {
   position: absolute;
-  inset: 0;
+  /* FIX (controls/replay overlap): was inset:0, so the centered icon/text
+     landed on top of the controls bar on short wraps (see screenshot report).
+     Stopping above the controls bar keeps the replay prompt inside the
+     visible video area, never overlapping the controls underneath it. */
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: var(--lc-vp-ctrl-h, 80px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1756,8 +1787,13 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 }
 .lc-gallery-slide .lc-media-video-wrap .lc-media-video {
   width: 100%;
-  /* leave room for the absolutely-positioned controls bar (~44px) */
-  height: calc(100% - 80px);
+  /* FIX (video-cropped-by-controls bug): see canonical .lc-media-video rule
+     above — height:100% let the controls bar overlay and hide the bottom of
+     the picture. Reserve space for it here too. The .lc-gallery-slide:has()
+     rule below already guarantees ≥160px for video slides, so this can't
+     go negative. */
+  height: calc(100% - var(--lc-vp-ctrl-h, 80px));
+  min-height: 60px;
   object-fit: contain;
   border-radius: 0;
 }
@@ -1766,6 +1802,13 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   .lc-media-gallery { min-width: 180px; min-height: 80px; }
   .lc-gallery-slide { max-height: min(200px, 40vh); min-height: 80px; aspect-ratio: unset; }
   .lc-gallery-slide .lc-media-img { max-height: min(200px, 40vh); min-height: 80px; }
+  /* FIX (controls/replay overlap on mobile): video slides need enough height
+     to show both the video content and the ~80px controls bar without the
+     two competing for space. Image slides are unaffected. */
+  .lc-gallery-slide:has(.lc-media-video-wrap) {
+    min-height: 160px;
+    max-height: min(280px, 45vh);
+  }
 }
 
 /* Gallery navigation arrows */
