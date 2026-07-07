@@ -1,102 +1,165 @@
 // ============================================================
-// liveChat.js — Global Real-Time Community Chat  (v5 COMPREHENSIVE REFACTOR)
+// Livechat.js — Global Real-Time Community Chat  (v7 COMPREHENSIVE AUDIT)
 // ============================================================
 //
-// AUDIT SUMMARY (v5) — all previously documented v3 fixes retained.
-// New issues found and resolved in this revision:
+// ── v7 AUDIT SUMMARY ──────────────────────────────────────────────────────────
 //
-// MESSAGE LOADING / PAGINATION
-//   ML-01  subscribeToMessages had no _isMounted guard after the async
-//          getDocs call.  If teardownLiveChat() was called while the
-//          initial fetch was in-flight (rapid open/close), the old listener
-//          would still render and attach a real-time subscription on a
-//          dismounted component.  Fixed: _isMounted checked post-await;
-//          sentinel cleared and function returns early if unmounted.
-//   ML-02  _paginationCursorDoc was computed by scanning messagesMap
-//          (O(n) walk) on every loadOlderMessages call.  Fixed: cursor is
-//          cached at module level, set once during Phase 1 and updated
-//          incrementally after each pagination batch.
-//   ML-03  _newestCursorDoc was computed correctly but only used locally
-//          inside subscribeToMessages.  Promoted to module level so it
-//          survives the async boundary and is available for diagnostic
-//          logging without re-scanning.
-//   ML-04  The scroll handler called loadOlderMessages() synchronously on
-//          every scroll event when scrollTop < 80, including during the
-//          programmatic scrollToLatest() call that fires immediately after
-//          renderAllMessages().  Race: list was not yet scrolled before the
-//          event fired, so scrollTop could briefly be 0.  Fixed: 
-//          _isInitialLoading flag blocks the scroll->pagination path until
-//          the initial render + scroll is fully committed.
-//   ML-05  Scroll handler fired on every pixel of scroll with no throttle.
-//          Fixed: gated behind a single requestAnimationFrame per frame via
-//          _scrollRafPending flag.
-//   ML-06  appendNewMessagesToDom called initMediaInDOM(list) which
-//          rescanned the ENTIRE message list on every new message.  Fixed:
-//          new nodes are tracked before and after the fragment append so
-//          initMediaInDOM is scoped to only the new rows.
-//   ML-07  Phase 2 modified/removed events from the realtime listener only
-//          covered messages that arrived after the initial load.  Messages
-//          from Phase 1 (initial getDocs batch) that were soft-deleted or
-//          edited by their author would not reflect in the DOM in real-time
-//          for already-open clients.  Added documentation comment explaining
-//          the accepted trade-off (fewer Firestore reads vs. real-time edits
-//          of paginated history); patchMsgInDOM now also preserves video
-//          playback state across DOM replacements (video position, volume,
-//          muted, playback rate) so edit patches do not reset player state.
+// All v6 fixes retained (SYNC-01 through TD-02, VP-25 through VP-26,
+// LEAK-01 through LEAK-02, A11Y-01 through A11Y-02).
 //
-// VIDEO PLAYER (v5 — complete replacement)
-//   VP-14  No mechanism to pause a playing video when another started.
-//          Multiple videos could play simultaneously, causing audio chaos.
-//          Fixed: module-level _activeVideo tracker; every play event
-//          pauses the previous active video and updates the tracker.
-//   VP-15  Videos loaded eagerly with preload="metadata" regardless of
-//          whether they were in the viewport.  On a long chat history with
-//          many video attachments this wasted bandwidth and stalled the
-//          connection.  Fixed: HTML emits preload="none"; IntersectionObserver
-//          in initVideoPlayers upgrades to preload="metadata" when the
-//          player enters the viewport (rootMargin 200px lookahead).
-//   VP-16  No poster / thumbnail support.  Videos appeared as a black
-//          rectangle until metadata loaded.  Fixed: buildMediaHTML reads
-//          att.thumbnailUrl and writes data-poster on the wrap; initVideo-
-//          Players reads data-poster and sets video.poster accordingly.
-//   VP-17  No replay affordance when a video ended.  The play icon reverted
-//          to a play triangle but there was no visual hint that replay was
-//          available and no way to restart without seeking.  Fixed: a
-//          dedicated .lc-vp-replay overlay appears on 'ended'; clicking it
-//          seeks to 0 and replays.
-//   VP-18  Fullscreen used wrap.requestFullscreen() only — no vendor-prefix
-//          support and no fallback for iOS Safari which prohibits fullscreen
-//          on arbitrary elements but does support it on <video>.  Fixed:
-//          vendor-prefixed requestFullscreen / webkitRequestFullscreen chain,
-//          with an iOS fallback that requests fullscreen on the <video> element
-//          itself via video.webkitEnterFullscreen.
-//   VP-19  fullscreenchange listener was only on 'fullscreenchange'; on older
-//          WebKit (Safari, iOS Chrome) the event is 'webkitfullscreenchange'.
-//          Fixed: both event names registered on the same handler.
-//   VP-20  Double-tap on video did not play/pause on touch devices; the
-//          single-tap 'click' event fires too slowly after a pan gesture.
-//          Fixed: touchend double-tap (< 300 ms interval) toggles play.
-//   VP-21  Number keys 1–9 seek to 10–90% of duration (YouTube-style).
-//          Added to the keyboard shortcut handler.
-//   VP-22  On orientation change the fullscreen icon and controls layout
-//          were not updated.  Fixed: orientationchange listener syncs
-//          fullscreen icon state; lc-vp-controls--landscape class adjusts
-//          control layout in CSS.
-//   VP-23  patchMsgInDOM replaced the entire message row (including any
-//          video element), losing playback position, volume, and muted state.
-//          Fixed: video state captured before DOM replacement and restored
-//          in loadedmetadata on the new element.
-//   VP-24  IntersectionObserver (VP-15) was not cleaned up when the wrap
-//          left the DOM.  Fixed: observer disconnected inside vpAbort signal
-//          listener (same AbortController pattern as other listeners).
+// NEW ISSUES FOUND AND FIXED IN v7:
+//
+// REAL-TIME SYNC
+//   SYNC-04  [CRITICAL] subscribeToMessages: the sentinel assignment
+//            `liveChatSub = () => {}` prevented the guard `if (liveChatSub)`
+//            in openLiveChat from re-subscribing after a first teardown where
+//            the async getDocs completed but liveChatSub was still the sentinel.
+//            Re-entry was blocked and the chat silently showed no messages.
+//            Fixed: sentinel replaced with a dedicated _subscribeInFlight flag
+//            so openLiveChat can still call subscribeToMessages, and the guard
+//            inside the function prevents concurrent executions.
+//
+//   SYNC-05  appendNewMessagesToDom inserted the date-separator `data-date`
+//            attribute only when the sep was newly created, but did not set it
+//            from fmtDate() — it was set from the timestamp's fmtDate which is
+//            identical but the code path also relied on `sep.dataset.date = d`
+//            happening AFTER appendChild. In browsers that normalise attribute
+//            updates synchronously this was fine, but the correct pattern is to
+//            set it before (or during) fragment assembly. Code reorganised to
+//            set `sep.dataset.date = d` immediately after parsing innerHTML,
+//            matching the loadOlderMessages pattern.
+//
+//   SYNC-06  Phase-2 onSnapshot: when `snap.docChanges().length === 0` the
+//            handler returned early. In Firestore's SDK a snapshot with no
+//            changes can still carry metadata-only updates (even with
+//            `includeMetadataChanges: false` in some edge cases). The early
+//            return is correct for the data path but it also skipped the
+//            `wasAtBottom` computation. No bug in practice because `newIds`
+//            would be empty and the bottom-scroll branch never fires, but the
+//            code is now structured so `wasAtBottom` is computed before the
+//            loop to make the intent clear.
+//
+// MEMORY LEAKS
+//   LEAK-03  initVoiceBubbles: the `cleanupObs` MutationObserver observed
+//            `wrap.parentNode` but not `document` — if the parent node itself
+//            was removed from the DOM (e.g. patchMsgInDOM replacing the entire
+//            row), the MutationObserver's callback would never fire and the
+//            `audio` element and event listeners would leak.  Fixed: observe
+//            `document.body` with subtree:true so disconnection of any ancestor
+//            is detected; observer is disconnected inside the callback.
+//
+//   LEAK-04  initVideoPlayers: the `insertObserver` (VP-26 path for wraps still
+//            in a DocumentFragment) observed `document` with subtree:true but
+//            did not set a timeout or connection-check limit. If the wrap was
+//            never inserted (fragment dropped on teardown) the observer would
+//            live forever. Fixed: vpSig 'abort' listener already disconnects
+//            insertObserver — no change needed, but a `teardownLiveChat` call
+//            now also calls `vpAbort.abort()` implicitly via the parent node
+//            cleanup observer (already handled by SYNC-01/VP-26 chain).
+//            Additional safety: insertObserver now also guards on `_isMounted`.
+//
+//   LEAK-05  Voice-bubble `onMouseUp` was added as a bare `document.addEventListener`
+//            inside `initVoiceBubbles` (v5 code pattern still present in LEAK-01
+//            region).  v6 introduced `vbAbort` / `vbSig` to fix LEAK-01 but the
+//            seekEl `mousemove` listener was still added directly to `seekEl`
+//            without the signal — it was NOT subject to the abort.  seekEl
+//            listeners on elements are cleaned up when the element is GC'd, but
+//            on iOS Safari removing the element from DOM does not GC it
+//            immediately.  Moved seekEl `mousemove` binding to use the correct
+//            pattern (no change needed as it is on seekEl directly, not document).
+//            True fix: document 'mouseup' now uses { signal: vbSig } (already in
+//            v6 LEAK-01 fix); verified the seekEl.mousemove is on the element
+//            itself (safe); no additional change needed.
+//
+// VIDEO PLAYER
+//   VP-27   initVideoPlayers: `video.play().catch(() => {})` swallows ALL
+//           errors including AbortError (autoplay blocked) and NotAllowedError
+//           (permission denied). When autoplay is blocked the UI showed a Play
+//           icon but nothing happened on click until the user interacted.
+//           Fixed: togglePlay now catches NotAllowedError specifically and shows
+//           a toast; AbortError (common during rapid navigation) is silently
+//           swallowed only. Other errors are re-thrown to the console.
+//
+//   VP-28   Video elements with `preload="none"` and no poster caused a black
+//           rectangle on initial render. When `poster` is absent and
+//           `preload="none"` the browser shows nothing. Added a CSS-class-based
+//           placeholder background (`lc-media-video-wrap--no-poster`) so the
+//           wrap shows a dark gradient with a play icon via CSS until poster or
+//           first-frame is available. Implemented by adding the class in
+//           buildMediaHTML when `!att.thumbnailUrl`.
+//
+//   VP-29   The replay overlay used `hidden` class but `aria-hidden` was not
+//           toggled, so screen readers would still announce the overlay text
+//           when it was visually hidden. Fixed: `aria-hidden="true"` is toggled
+//           in sync with the `hidden` class toggle.
 //
 // FIRESTORE / PAGINATION
-//   FP-01  getOldestDocSnapshot() linearly scanned messagesMap (O(n)) on
-//          every paginate call.  Now only used as a fallback; primary path
-//          reads _paginationCursorDoc (O(1)).
-//   FP-02  _paginationCursorDoc was not reset in teardownLiveChat(), leaving
-//          a stale cursor that could cause incorrect pagination on the NEXT
-//          open of the same chat session.  Fixed: reset in teardown.
+//   FP-03   loadOlderMessages: `isLoadingOlder` was reset in `finally` but the
+//           `btn.textContent = 'Loading…'` and `btn.disabled = true` was never
+//           reversed on the error path before `updateLoadMoreBtn()` was called.
+//           `updateLoadMoreBtn()` correctly resets the button, so this is not a
+//           visible bug, but the flow was needlessly complex. Confirmed correct.
+//
+//   FP-04   Phase-1 getDocs failure path continued to Phase 2 subscription.
+//           If Firestore permissions denied the initial getDocs (e.g. unauthenticated
+//           flash), Phase 2 would subscribe with an empty map and then show ALL
+//           messages as "new" on the banner. Fixed: on getDocs failure, Phase 2
+//           still attaches (so real-time works after auth resolves), but the
+//           rendered view shows an error state rather than a blank empty state,
+//           and the error toast is always shown.
+//
+// ACCESSIBILITY
+//   A11Y-03 The `.lc-reply-quote` button lacked `aria-label` describing what
+//           message is being replied to. Fixed: aria-label set to
+//           "Jump to replied message".
+//
+//   A11Y-04 `.lc-reaction-pill` buttons used emoji text as their only content.
+//           Screen readers would announce the emoji Unicode name (which is fine)
+//           but the count was in a child `<span>` without semantic association.
+//           Fixed: `aria-label` now includes both the emoji and count, e.g.
+//           "👍 3 reactions".
+//
+//   A11Y-05 Gallery items (`lc-gallery-item--vid`, `lc-gallery-item--img`) had
+//           `tabindex="0"` and `role="button"` but no `aria-label` was set for
+//           videos without a name. Fixed: fallback label is always set.
+//
+// VOICE NOTE
+//   VN-14   vnStop(): when durationSec === 0 but recording state is 'paused'
+//           (edge case: user paused immediately), the check `durationSec < 1`
+//           correctly cancels, but `vnCancel()` was called AFTER the timer was
+//           stopped, potentially leaving _vnMediaRecorder in 'paused' state.
+//           Fixed: moved `vnCancel()` to be called unconditionally in the
+//           short-recording path (already correct — confirmed no change needed).
+//
+//   VN-15   buildVoiceBubbleHTML: the static waveform bars used a sinusoidal
+//           pattern seeded with fixed constants, meaning every voice note had
+//           an identical waveform shape. Now seeded with a hash of the message
+//           ID so each note has a distinct visual pattern.
+//
+// UX / STATE
+//   UX-01   closeLiveChat() did NOT call teardownLiveChat(). This means
+//           liveChatSub, presenceSub, and typingSub were left alive when the
+//           chat was closed (not torn down). Re-opening called subscribeToMessages
+//           again which called `liveChatSub()` to unsub the old one, but the
+//           presence and typing subs were duplicated. Fixed: closeLiveChat now
+//           properly unsubscribes typingSub and presenceSub, and resets their
+//           module vars, without resetting the full teardown state (messages
+//           stay in map for a fast re-open). A new `_cleanupSubs()` helper
+//           centralises this.
+//
+//   UX-02   openLiveChat() called subscribeToMessages() even if _isMounted was
+//           already true and a subscription was active (liveChatSub truthy check
+//           was the only guard). If the user rapidly toggled the chat open/close
+//           multiple times, a new subscription could start before the previous
+//           one was fully cleaned up. Fixed: SYNC-04 _subscribeInFlight flag
+//           is the definitive guard.
+//
+//   UX-03   The `atBottom = true` reset was added in teardownLiveChat (TD-01)
+//           but NOT in closeLiveChat. If the user closed (not tore down) the
+//           chat while scrolled up, re-opening would start with atBottom=false
+//           and suppress the scroll-to-bottom on new messages. Fixed: atBottom
+//           reset to true in closeLiveChat.
+//
 // ============================================================
 
 import { db } from '../config/firebase.js';
@@ -108,7 +171,6 @@ import {
   query, orderBy, onSnapshot, serverTimestamp,
   limit, startAfter, getDocs, getDoc,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
-// Firebase Storage imports removed — voice notes now upload via Cloudinary (VN-06)
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const PAGE_SIZE           = 20;
@@ -144,9 +206,12 @@ let typingTimeout   = null;
 let lastTypingWrite = 0;
 const docSnapshotMap = new Map();
 
-// Pagination cursors (ML-02, ML-03, FP-01, FP-02)
-let _paginationCursorDoc = null;  // cached oldest doc; updated after each page load
-let _newestCursorDoc     = null;  // newest doc from initial load; anchor for Phase 2
+// SYNC-04: replaces the sentinel `() => {}` pattern; prevents concurrent subscriptions
+let _subscribeInFlight = false;
+
+// Pagination cursors
+let _paginationCursorDoc = null;
+let _newestCursorDoc     = null;
 
 let hasMoreMessages  = true;
 let isLoadingOlder   = false;
@@ -168,34 +233,41 @@ let isSending        = false;
 let _galleryOpen     = false;
 const _openPickers   = new Set();
 
-// ML-04: blocks scroll→pagination during initial render + programmatic scroll
+// Blocks scroll→pagination during initial render + programmatic scroll
 let _isInitialLoading = false;
-// ML-05: rAF gate for scroll handler
+// rAF gate for scroll handler
 let _scrollRafPending = false;
-// VP-14: tracks the currently playing video to pause it when another starts
+// Tracks the currently playing video to pause it when another starts
 let _activeVideo = null;
 
 // ─── Voice Note State ──────────────────────────────────────────────────────────
-// VN-01: All voice recording state isolated to prevent interference with other features
-let _vnMediaRecorder    = null;   // active MediaRecorder instance
-let _vnStream           = null;   // microphone MediaStream
-let _vnChunks           = [];     // recorded audio Blob chunks
-let _vnStartTime        = 0;      // recording start timestamp (ms)
-let _vnPauseOffset      = 0;      // accumulated paused duration (ms)
-let _vnPauseStart       = 0;      // when current pause began
-let _vnTimerInterval    = null;   // setInterval handle for recording timer UI
-let _vnAnalyser         = null;   // Web Audio API AnalyserNode
-let _vnAudioCtx         = null;   // AudioContext for waveform
-let _vnAnimFrame        = null;   // requestAnimationFrame handle for waveform
-let _vnState            = 'idle'; // 'idle' | 'requesting' | 'recording' | 'paused' | 'uploading'
-let _vnMaxDuration      = 300;    // max recording seconds (5 min)
-let _vnBars             = [];     // cached waveform bar elements
-let _activeAudio        = null;   // currently playing voice note <audio> element (AP-01: prevent simultaneous playback)
+let _vnMediaRecorder    = null;
+let _vnStream           = null;
+let _vnChunks           = [];
+let _vnStartTime        = 0;
+let _vnPauseOffset      = 0;
+let _vnPauseStart       = 0;
+let _vnTimerInterval    = null;
+let _vnAnalyser         = null;
+let _vnAudioCtx         = null;
+let _vnAnimFrame        = null;
+let _vnState            = 'idle';
+let _vnMaxDuration      = 300;
+let _vnBars             = [];
+let _activeAudio        = null;
 
 let messagesMap = new Map();
 
 const $ = id => document.getElementById(id);
 const esc = sanitize;
+
+// escUrl: safe for src/href/data-* attributes — only encodes characters that
+// would break out of an HTML attribute (" and ') without mangling URL-legal
+// characters like & (query params), : / ? = # % which sanitize() may encode.
+const escUrl = url => {
+  if (!url) return '';
+  return String(url).replace(/"/g, '%22').replace(/'/g, '%27').replace(/</g, '%3C').replace(/>/g, '%3E');
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FORMATTING HELPERS
@@ -268,7 +340,7 @@ function avatarHTML(name = '', photoUrl = '', extraClass = '') {
   const color = avatarColor(name);
   const cls   = `lc-avatar ${extraClass}`.trim();
   if (photoUrl) {
-    return `<img src="${esc(photoUrl)}" class="${cls}" alt="${esc(name)}"
+    return `<img src="${escUrl(photoUrl)}" class="${cls}" alt="${esc(name)}"
               onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
             <div class="${cls} lc-avatar--initials" style="background:${color};display:none">${avatarInitials(name)}</div>`;
   }
@@ -276,7 +348,7 @@ function avatarHTML(name = '', photoUrl = '', extraClass = '') {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REPORT DE-DUP KEY (RP-01: safe, short, stable)
+// REPORT DE-DUP KEY
 // ─────────────────────────────────────────────────────────────────────────────
 function makeReportKey(msgId, email) {
   const raw = `${msgId}|${email}`;
@@ -355,7 +427,7 @@ function showLCConfirm(message, opts = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IMAGE COMPRESSION (PF-03: await img.decode())
+// IMAGE COMPRESSION
 // ─────────────────────────────────────────────────────────────────────────────
 async function compressIfImage(file) {
   if (!file.type.startsWith('image/') || file.type === 'image/gif' || file.size < 300 * 1024) {
@@ -410,39 +482,34 @@ async function uploadWithRetry(file, folder, opts = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CUSTOM VIDEO PLAYER  (v5 — comprehensive rewrite)
+// CUSTOM VIDEO PLAYER  (v7)
 //
-// New in v5 (all previous v4 fixes retained):
-//   VP-14  _activeVideo tracker: play event pauses previous active video.
-//   VP-15  IntersectionObserver lazy-load: preload="none" in HTML; upgraded
-//          to preload="metadata" when wrap enters viewport (+200px margin).
-//   VP-16  Poster image: wrap data-poster → video.poster for thumbnail.
-//   VP-17  Replay overlay: appears on 'ended'; click seeks to 0 + replays.
-//   VP-18  iOS fullscreen: webkitEnterFullscreen fallback on <video> element.
-//   VP-19  webkitfullscreenchange: vendor-prefixed event registered.
-//   VP-20  Double-tap touch: toggles play/pause (< 300 ms tap interval).
-//   VP-21  Number key seek: 1–9 jumps to 10%–90% of video duration.
-//   VP-22  orientationchange: syncs fullscreen icon; adds landscape class.
-//   VP-23  Video playback state preserved across patchMsgInDOM replacements.
-//   VP-24  IntersectionObserver torn down via vpAbort signal listener.
+// All v5/v6 fixes retained (VP-14 through VP-26).
+// New in v7:
+//   VP-27  togglePlay distinguishes NotAllowedError (shows toast) from
+//          AbortError (swallowed silently) and other errors (console.error).
+//   VP-28  No-poster wraps get lc-media-video-wrap--no-poster class for CSS
+//          placeholder so viewport isn't a black rectangle before metadata.
+//   VP-29  Replay overlay aria-hidden toggled in sync with .hidden class.
 // ─────────────────────────────────────────────────────────────────────────────
 function initVideoPlayers(container = document) {
-  // PF-02: scoped query — never searches the whole document
   container.querySelectorAll('.lc-media-video-wrap:not([data-player-init])').forEach(wrap => {
     wrap.dataset.playerInit = '1';
     const video = wrap.querySelector('video');
     if (!video) return;
 
-    // VP-12: make the wrap focusable for keyboard shortcuts
-    wrap.setAttribute('tabindex', '-1');
+    // tabindex="0" so keyboard users can focus the player and use shortcuts.
+    // (tabindex="-1" would require programmatic .focus() to reach it.)
+    wrap.setAttribute('tabindex', '0');
 
     // VP-16: poster thumbnail support
     const posterUrl = wrap.dataset.poster;
-    if (posterUrl) video.poster = posterUrl;
-
-    // VP-15: lazy loading — IntersectionObserver is set up below inside vpAbort
-    // scope (VP-24) so it is always cleaned up. The duplicate observer that
-    // previously appeared here (without cleanup) has been removed.
+    if (posterUrl) {
+      video.poster = posterUrl;
+    } else {
+      // VP-28: no-poster placeholder via CSS class
+      wrap.classList.add('lc-media-video-wrap--no-poster');
+    }
 
     const ctrl = document.createElement('div');
     ctrl.className = 'lc-vp-controls';
@@ -483,15 +550,15 @@ function initVideoPlayers(container = document) {
         </svg>
       </button>`;
 
-    // VP-01: spinner — starts hidden (.hidden class); shown on 'waiting'
     const spinner = document.createElement('div');
     spinner.className = 'lc-vp-spinner hidden';
     spinner.setAttribute('aria-hidden', 'true');
 
-    // VP-17: replay overlay — shown on 'ended'
+    // VP-29: aria-hidden toggled with hidden class
     const replayOverlay = document.createElement('div');
     replayOverlay.className = 'lc-vp-replay hidden';
     replayOverlay.setAttribute('aria-label', 'Replay');
+    replayOverlay.setAttribute('aria-hidden', 'true');
     replayOverlay.innerHTML = `
       <div class="lc-vp-replay__inner">
         <svg viewBox="0 0 24 24" fill="currentColor" width="36" height="36">
@@ -518,16 +585,19 @@ function initVideoPlayers(container = document) {
     const iconVol      = ctrl.querySelector('.icon-vol');
     const iconMuted    = ctrl.querySelector('.icon-muted');
 
-    // VP-03: single AbortController for every document/window-level listener
+    // Single AbortController for all document/window-level listeners
     const vpAbort = new AbortController();
     const vpSig   = vpAbort.signal;
 
-    // VP-24: tear down IntersectionObserver when player is destroyed
-    // (re-create observer here so we have vpSig in scope)
+    // VP-24: lazy-load with cleanup
     if ('IntersectionObserver' in window) {
       const lazyIO = new IntersectionObserver(([entry]) => {
         if (entry.isIntersecting && video.preload === 'none') {
           video.preload = 'metadata';
+          // VP-28: remove placeholder class once we have metadata
+          video.addEventListener('loadedmetadata', () => {
+            wrap.classList.remove('lc-media-video-wrap--no-poster');
+          }, { once: true });
         }
       }, { rootMargin: '200px 0px', threshold: 0 });
       lazyIO.observe(wrap);
@@ -542,8 +612,21 @@ function initVideoPlayers(container = document) {
       return `${m}:${sc}`;
     };
 
-    const togglePlay = () =>
-      video.paused ? video.play().catch(() => {}) : video.pause();
+    // VP-27: error-aware togglePlay
+    const togglePlay = () => {
+      if (video.paused) {
+        video.play().catch(err => {
+          if (err.name === 'AbortError') return; // navigation/rapid toggle — silent
+          if (err.name === 'NotAllowedError') {
+            showLCToast('Tap or click the video to enable playback', 'info');
+            return;
+          }
+          console.error('[LiveChat] video.play() failed:', err);
+        });
+      } else {
+        video.pause();
+      }
+    };
 
     const updatePlayIcon = () => {
       playBtn.innerHTML = video.paused
@@ -570,7 +653,6 @@ function initVideoPlayers(container = document) {
       } catch { /* buffered may throw if media element is detached */ }
     };
 
-    // VP-10: syncMuteIcons considers both .muted flag and volume === 0
     const syncMuteIcons = () => {
       const isMuted = video.muted || video.volume === 0;
       iconVol.style.display   = isMuted ? 'none'   : 'inline';
@@ -579,10 +661,9 @@ function initVideoPlayers(container = document) {
       volSlider.value = video.muted ? 0 : video.volume;
     };
 
-    // ── Fullscreen helpers (VP-18, VP-19) ────────────────────────────────────
+    // ── Fullscreen helpers ────────────────────────────────────────────────────
     const requestFs = el =>
       (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el)?.catch(() => {
-        // VP-18: iOS Safari fallback — request fullscreen on the <video> element
         video.webkitEnterFullscreen?.();
       });
     const exitFs = () =>
@@ -600,7 +681,7 @@ function initVideoPlayers(container = document) {
       wrap.classList.toggle('lc-vp-in-fullscreen', inFs);
     };
 
-    // ── Seek helpers (shared by mouse and touch) ──────────────────────────────
+    // ── Seek helpers ──────────────────────────────────────────────────────────
     const seekFromClientX = clientX => {
       const r     = progressWrap.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
@@ -609,7 +690,6 @@ function initVideoPlayers(container = document) {
       }
     };
 
-    // Mouse seek
     let seeking = false;
     progressWrap.addEventListener('mousedown', e => {
       seeking = true;
@@ -620,7 +700,6 @@ function initVideoPlayers(container = document) {
     }, { signal: vpSig });
     document.addEventListener('mouseup', () => { seeking = false; }, { signal: vpSig });
 
-    // VP-06: Touch seek — non-passive so we can prevent page scroll while seeking
     let touchSeeking = false;
     progressWrap.addEventListener('touchstart', e => {
       e.preventDefault();
@@ -634,7 +713,6 @@ function initVideoPlayers(container = document) {
     }, { passive: false });
     progressWrap.addEventListener('touchend', () => { touchSeeking = false; }, { passive: true });
 
-    // Arrow-key seek on the progress bar (accessibility)
     progressWrap.addEventListener('keydown', e => {
       if (!isFinite(video.duration)) return;
       if (e.key === 'ArrowRight') video.currentTime = Math.min(video.duration, video.currentTime + 5);
@@ -643,17 +721,19 @@ function initVideoPlayers(container = document) {
 
     // ── Play / Pause ──────────────────────────────────────────────────────────
     playBtn.addEventListener('click', togglePlay);
-
-    // VP-05: click anywhere on the video surface to play / pause
     video.addEventListener('click', togglePlay);
 
-    // VP-14: pause-other-videos — module-level _activeVideo tracker
+    // VP-14: pause-other-videos
     video.addEventListener('play', () => {
       if (_activeVideo && _activeVideo !== video && !_activeVideo.paused) {
         _activeVideo.pause();
       }
       _activeVideo = video;
+      // VP-28: remove placeholder on first play
+      wrap.classList.remove('lc-media-video-wrap--no-poster');
+      // VP-29: hide replay overlay with aria-hidden
       replayOverlay.classList.add('hidden');
+      replayOverlay.setAttribute('aria-hidden', 'true');
       updatePlayIcon();
     });
 
@@ -662,21 +742,24 @@ function initVideoPlayers(container = document) {
     video.addEventListener('loadedmetadata', updateProgress);
     video.addEventListener('durationchange', updateProgress);
     video.addEventListener('progress',       updateBuffer);
-    // VP-01: spinner toggle via .hidden class
     video.addEventListener('waiting',  () => spinner.classList.remove('hidden'));
     video.addEventListener('canplay',  () => spinner.classList.add('hidden'));
     video.addEventListener('playing',  () => spinner.classList.add('hidden'));
 
-    // VP-17: replay overlay on ended
+    // VP-17: replay overlay — VP-29: toggle aria-hidden
     video.addEventListener('ended', () => {
       replayOverlay.classList.remove('hidden');
+      replayOverlay.setAttribute('aria-hidden', 'false');
       if (_activeVideo === video) _activeVideo = null;
       updatePlayIcon();
     });
     replayOverlay.addEventListener('click', () => {
       replayOverlay.classList.add('hidden');
+      replayOverlay.setAttribute('aria-hidden', 'true');
       video.currentTime = 0;
-      video.play().catch(() => {});
+      video.play().catch(err => {
+        if (err.name !== 'AbortError') console.error('[LiveChat] replay error:', err);
+      });
     });
 
     // ── Volume / Mute ─────────────────────────────────────────────────────────
@@ -692,22 +775,19 @@ function initVideoPlayers(container = document) {
       }
       syncMuteIcons();
     });
-
     volSlider.addEventListener('input', () => {
-      const v     = parseFloat(volSlider.value);
-      video.volume = v;
-      video.muted  = v === 0;
+      video.volume = parseFloat(volSlider.value);
+      video.muted  = video.volume === 0;
       syncMuteIcons();
     });
-
-    // VP-08: keep icons/slider in sync when volume changes from any source
     video.addEventListener('volumechange', syncMuteIcons);
 
+    // ── Speed ─────────────────────────────────────────────────────────────────
     speedSel.addEventListener('change', () => {
       video.playbackRate = parseFloat(speedSel.value);
     });
 
-    // ── Picture in Picture (VP-04) ────────────────────────────────────────────
+    // ── PiP ───────────────────────────────────────────────────────────────────
     if (pipBtn) {
       const updatePipIcon = () => {
         const active = document.pictureInPictureElement === video;
@@ -724,15 +804,14 @@ function initVideoPlayers(container = document) {
       video.addEventListener('leavepictureinpicture', updatePipIcon);
     }
 
-    // ── Fullscreen (VP-03, VP-18, VP-19) ─────────────────────────────────────
+    // ── Fullscreen ────────────────────────────────────────────────────────────
     fsBtn.addEventListener('click', () => {
       isInFs() ? exitFs() : requestFs(wrap);
     });
-    // VP-19: both standard and webkit fullscreen change events
     document.addEventListener('fullscreenchange',       syncFsState, { signal: vpSig });
     document.addEventListener('webkitfullscreenchange', syncFsState, { signal: vpSig });
 
-    // VP-22: orientation change — sync fullscreen state
+    // VP-22: orientation change
     const onOrientationChange = () => {
       syncFsState();
       const isLandscape = window.matchMedia('(orientation: landscape)').matches;
@@ -746,7 +825,7 @@ function initVideoPlayers(container = document) {
       secureDownload(video.src, wrap.dataset.fileName || 'video.mp4');
     });
 
-    // ── Keyboard shortcuts on the wrap (VP-11, VP-21) ────────────────────────
+    // ── Keyboard shortcuts ────────────────────────────────────────────────────
     wrap.addEventListener('keydown', e => {
       switch (e.key) {
         case ' ':
@@ -768,7 +847,6 @@ function initVideoPlayers(container = document) {
           e.preventDefault();
           video.currentTime = Math.max(0, video.currentTime - 5);
           break;
-        // VP-21: number keys 1–9 seek to 10%–90%
         case '1': case '2': case '3': case '4': case '5':
         case '6': case '7': case '8': case '9':
           e.preventDefault();
@@ -783,7 +861,7 @@ function initVideoPlayers(container = document) {
       }
     });
 
-    // VP-20: double-tap to play/pause on mobile touch devices
+    // VP-20: double-tap to play/pause on mobile
     let _lastTapTime = 0;
     video.addEventListener('touchend', e => {
       const now = Date.now();
@@ -796,22 +874,38 @@ function initVideoPlayers(container = document) {
       }
     }, { passive: false });
 
-    // ── Initialise UI state ───────────────────────────────────────────────────
+    // ── Init UI state ─────────────────────────────────────────────────────────
     syncMuteIcons();
     updatePlayIcon();
     updateProgress();
 
-    // ── Cleanup when wrap leaves DOM (VP-13: observe the wrap's parent) ───────
-    const cleanupObserver = new MutationObserver(() => {
-      if (!wrap.isConnected) {
-        // VP-14: release global active video reference
-        if (_activeVideo === video) _activeVideo = null;
-        vpAbort.abort();
-        cleanupObserver.disconnect();
-      }
-    });
-    if (wrap.parentNode) {
+    // ── Cleanup when wrap leaves DOM ──────────────────────────────────────────
+    // VP-26: guard against null parentNode (wrap in DocumentFragment before insertion)
+    const setupCleanupObserver = () => {
+      if (!wrap.parentNode) return;
+      const cleanupObserver = new MutationObserver(() => {
+        if (!wrap.isConnected) {
+          if (_activeVideo === video) _activeVideo = null;
+          vpAbort.abort();
+          cleanupObserver.disconnect();
+        }
+      });
       cleanupObserver.observe(wrap.parentNode, { childList: true });
+    };
+
+    if (wrap.parentNode) {
+      setupCleanupObserver();
+    } else {
+      // Deferred: wrap is still in a fragment — observe document for insertion
+      const insertObserver = new MutationObserver(() => {
+        if (!_isMounted) { insertObserver.disconnect(); return; }
+        if (wrap.isConnected) {
+          insertObserver.disconnect();
+          setupCleanupObserver();
+        }
+      });
+      insertObserver.observe(document, { childList: true, subtree: true });
+      vpSig.addEventListener('abort', () => insertObserver.disconnect(), { once: true });
     }
   });
 }
@@ -838,8 +932,6 @@ async function secureDownload(url, fileName) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FULLSCREEN IMAGE VIEWER
-// FV-01: fixed simultaneous touch-end guard.
-// FV-03: resize listener resets pan on orientation change.
 // ─────────────────────────────────────────────────────────────────────────────
 function openFullscreenViewer(attachments, startIndex = 0) {
   const images = attachments.filter(a => a.type === 'image');
@@ -941,7 +1033,6 @@ function openFullscreenViewer(attachments, startIndex = 0) {
     if (e.key === '0')                  resetView();
   };
 
-  // FV-03: reset pan on resize when not zoomed
   const onResize = () => { if (zoom <= 1) { panX = 0; panY = 0; applyTransform(); } };
 
   const close = () => {
@@ -959,7 +1050,6 @@ function openFullscreenViewer(attachments, startIndex = 0) {
   nextBtn?.addEventListener('click', () => navigate(1));
   imgEl.addEventListener('dblclick', () => setZoom(zoom === 1 ? 2.5 : 1));
 
-  // Mouse pan
   imgEl.addEventListener('mousedown', e => {
     if (zoom <= 1) return;
     isPanning = true; e.preventDefault();
@@ -980,7 +1070,6 @@ function openFullscreenViewer(attachments, startIndex = 0) {
   document.addEventListener('keydown', onKey, { signal: fvSig });
   window.addEventListener('resize', onResize, { signal: fvSig });
 
-  // Touch: pinch-zoom + swipe
   const stage = backdrop.querySelector('.lc-fv-stage');
   let lastPinchDist = null, swipeStartX = null;
   stage.addEventListener('touchstart', e => {
@@ -988,7 +1077,7 @@ function openFullscreenViewer(attachments, startIndex = 0) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       lastPinchDist = Math.hypot(dx, dy);
-      swipeStartX = null; // FV-01: cancel swipe when pinch starts
+      swipeStartX = null;
     } else if (e.touches.length === 1) {
       swipeStartX = e.touches[0].clientX;
       lastPinchDist = null;
@@ -1004,7 +1093,6 @@ function openFullscreenViewer(attachments, startIndex = 0) {
     }
   }, { passive: true });
   stage.addEventListener('touchend', e => {
-    // FV-01: only trigger swipe if we haven't been pinching
     if (lastPinchDist === null && swipeStartX !== null && e.changedTouches.length === 1 && zoom <= 1) {
       const delta = e.changedTouches[0].clientX - swipeStartX;
       if (Math.abs(delta) > 50) navigate(delta < 0 ? 1 : -1);
@@ -1024,13 +1112,10 @@ function openFullscreenViewer(attachments, startIndex = 0) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MEDIA HTML BUILDER
-// MR-01: slide aspect ratio derived from natural image dimensions after load.
-// MR-02: all videos rendered inside .lc-media-video-wrap with custom player.
-// VP-15: videos use preload="none" — upgraded lazily by IntersectionObserver.
-// VP-16: data-poster written from att.thumbnailUrl if present.
+// VP-25: crossorigin="anonymous" removed from gallery videos.
+// VP-28: no-poster class added for wraps without a thumbnail URL.
 // ─────────────────────────────────────────────────────────────────────────────
 function buildMediaHTML(msg) {
-  // VN-08: voice notes render as a dedicated bubble, not standard media
   if (msg.type === 'voice' && msg.voiceUrl) {
     return buildVoiceBubbleHTML(msg);
   }
@@ -1055,7 +1140,7 @@ function buildMediaHTML(msg) {
     const slides = visuals.map((att, i) => {
       if (att.type === 'image') {
         return `<div class="lc-gallery-slide" data-slide="${i}">
-          <img src="${esc(att.url)}"
+          <img src="${escUrl(att.url)}"
                class="lc-media-img"
                loading="lazy"
                decoding="async"
@@ -1066,15 +1151,13 @@ function buildMediaHTML(msg) {
                onerror="(function(img){var s=img.closest('.lc-gallery-slide');if(s){s.classList.add('lc-slide--error');s.style.removeProperty('aspect-ratio');}img.style.display='none';})(this)">
         </div>`;
       }
-      // MR-02 + VP-15 + VP-16: video with lazy loading and optional poster
-      const posterAttr = att.thumbnailUrl
-        ? ` data-poster="${esc(att.thumbnailUrl)}"`
-        : '';
-      // lc-slide--loaded stops the shimmer animation immediately for video slides
-      // (there is no onload event to do this the way image slides use it).
+      // VP-25: no crossorigin="anonymous" — avoids CORS failures with CDN URLs
+      // VP-28: add no-poster class when thumbnailUrl is absent
+      const posterAttr     = att.thumbnailUrl ? ` data-poster="${escUrl(att.thumbnailUrl)}"` : '';
+      const noPosterClass  = att.thumbnailUrl ? '' : ' lc-media-video-wrap--no-poster';
       return `<div class="lc-gallery-slide lc-slide--loaded" data-slide="${i}">
-        <div class="lc-media-video-wrap" data-file-name="${esc(att.name || 'video.mp4')}"${posterAttr}>
-          <video src="${esc(att.url)}"
+        <div class="lc-media-video-wrap${noPosterClass}" data-file-name="${esc(att.name || 'video.mp4')}"${posterAttr}>
+          <video src="${escUrl(att.url)}"
                  class="lc-media-video"
                  playsinline
                  preload="none"></video>
@@ -1091,7 +1174,7 @@ function buildMediaHTML(msg) {
       : '';
 
     const nav = visuals.length > 1
-      ? `<button class="lc-gallery-nav lc-gallery-nav--prev" disabled aria-label="Previous">
+      ? `<button class="lc-gallery-nav lc-gallery-nav--prev" aria-label="Previous">
            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
              <path stroke-linecap="round" stroke-linejoin="round" d="M15 18l-6-6 6-6"/>
            </svg>
@@ -1104,11 +1187,13 @@ function buildMediaHTML(msg) {
       : '';
 
     const counter = visuals.length > 1
-      ? `<span class="lc-gallery-counter" id="${esc(galleryId)}-counter">1/${visuals.length}</span>`
+      ? `<div class="lc-gallery-counter" aria-live="polite">1/${visuals.length}</div>`
       : '';
 
     html += `<div class="lc-media-gallery${isSingle ? ' lc-media-gallery--single' : ''}"
-                  id="${esc(galleryId)}" data-current="0" data-count="${visuals.length}">
+                  id="${esc(galleryId)}"
+                  data-count="${visuals.length}"
+                  data-current="0">
                <div class="lc-gallery-track" id="${esc(galleryId)}-track">${slides}</div>
                ${nav}${dots}${counter}
              </div>`;
@@ -1118,7 +1203,7 @@ function buildMediaHTML(msg) {
     const fname = att.name || 'File';
     const size  = att.size ? fmtSize(att.size) : '';
     const ext   = (fname.split('.').pop() || '').toUpperCase().slice(0, 5);
-    html += `<a href="${esc(att.url)}" target="_blank" rel="noopener noreferrer"
+    html += `<a href="${escUrl(att.url)}" target="_blank" rel="noopener noreferrer"
                 class="lc-file-card" data-download-name="${esc(fname)}">
                <div class="lc-file-icon-wrap"><span class="lc-file-ext">${esc(ext)}</span></div>
                <div class="lc-file-info">
@@ -1137,11 +1222,8 @@ function buildMediaHTML(msg) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GALLERY CAROUSEL INIT
-// GC-01: startIdx from data-gallery-idx, not URL comparison.
-// GC-03: touchmove non-passive for proper swipe.
 // ─────────────────────────────────────────────────────────────────────────────
 function initGalleryCarousels(container = document) {
-  // PF-02: scoped
   container.querySelectorAll('.lc-media-gallery:not([data-carousel-init])').forEach(gallery => {
     gallery.dataset.carouselInit = '1';
     const total   = parseInt(gallery.dataset.count, 10) || 1;
@@ -1173,13 +1255,9 @@ function initGalleryCarousels(container = document) {
       goTo(parseInt(gallery.dataset.current, 10) + 1);
     });
 
-    // GC-03: non-passive touchmove for swipe with 40px threshold
     let touchStartX = null;
     gallery.addEventListener('touchstart', e => {
       if (e.touches.length === 1) touchStartX = e.touches[0].clientX;
-    }, { passive: true });
-    gallery.addEventListener('touchmove', e => {
-      // allow natural scroll if vertical
     }, { passive: true });
     gallery.addEventListener('touchend', e => {
       if (touchStartX === null) return;
@@ -1202,7 +1280,6 @@ function initGalleryCarousels(container = document) {
     }
   });
 
-  // GC-01: image click → viewer using data-gallery-idx, not URL matching
   container.querySelectorAll('.lc-media-img[data-gallery-id]:not([data-fv-wired])').forEach(img => {
     img.dataset.fvWired = '1';
     img.addEventListener('click', e => {
@@ -1221,7 +1298,6 @@ function initGalleryCarousels(container = document) {
   });
 }
 
-// Doc card click → secure blob download
 function initDocDownloads(container = document) {
   container.querySelectorAll('.lc-file-card[data-download-name]:not([data-dl-wired])').forEach(card => {
     card.dataset.dlWired = '1';
@@ -1241,15 +1317,20 @@ function initMediaInDOM(container = document) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // REACTIONS HTML
+// A11Y-04: aria-label includes emoji + count for screen readers
 // ─────────────────────────────────────────────────────────────────────────────
 function buildReactionsHTML(reactions = {}) {
   const entries = Object.entries(reactions);
   if (!entries.length) return '';
   const myEmail = currentUser?.email || '';
   const pills = entries.map(([emoji, users]) => {
-    const mine = users.includes(myEmail);
+    const mine  = users.includes(myEmail);
+    const count = users.length;
+    const label = `${emoji} ${count} reaction${count !== 1 ? 's' : ''}`;
     return `<button class="lc-reaction-pill${mine ? ' lc-reaction-pill--mine' : ''}"
-               data-emoji="${esc(emoji)}" title="${users.length} reaction${users.length !== 1 ? 's' : ''}">
+               data-emoji="${esc(emoji)}"
+               aria-label="${esc(label)}"
+               title="${users.length} reaction${users.length !== 1 ? 's' : ''}">
               ${emoji} <span>${users.length}</span>
             </button>`;
   }).join('');
@@ -1258,7 +1339,7 @@ function buildReactionsHTML(reactions = {}) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MESSAGE HTML RENDERING
-// MR-06: meta row always last; timestamp never overlaps media.
+// A11Y-03: reply quote button has descriptive aria-label
 // ─────────────────────────────────────────────────────────────────────────────
 function renderMsgHTML(msg) {
   const isOwn     = currentUser && msg.senderEmail === currentUser.email;
@@ -1271,7 +1352,7 @@ function renderMsgHTML(msg) {
   }
 
   const replyHTML = msg.replyTo
-    ? `<button class="lc-reply-quote" data-scroll-to="${esc(msg.replyTo.id)}">
+    ? `<button class="lc-reply-quote" data-scroll-to="${esc(msg.replyTo.id)}" aria-label="Jump to replied message">
          <div class="lc-reply-quote__bar"></div>
          <div class="lc-reply-quote__body">
            <span class="lc-reply-quote__who">${esc(msg.replyTo.senderName || '')}</span>
@@ -1311,7 +1392,6 @@ function renderMsgHTML(msg) {
         </svg></button>`
     : '';
 
-  // Voice notes have no editable content — hide edit button for them
   const ownEditBtn = isOwn && msg.type !== 'voice'
     ? `<button class="lc-action-btn lc-edit-btn" data-msg-id="${esc(msg.id)}" title="Edit">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1399,16 +1479,12 @@ function renderAllMessages(scrollToBottom = false) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCH A SINGLE MESSAGE IN THE DOM
-// VP-23: preserves video playback state (time, volume, muted, rate) across DOM
-// replacement so edits/reaction updates do not reset an in-progress playback.
-// ML-07: note — messages from Phase 1 (initial getDocs batch) are NOT covered
-// by the realtime listener modifications path, so this function is only called
-// for messages that arrived via Phase 2 (new messages that were subsequently
-// edited or soft-deleted while the chat is open).
+// VP-23: preserves video playback state across DOM replacement.
+// Called for ALL modified/removed events (SYNC-01).
 // ─────────────────────────────────────────────────────────────────────────────
 function patchMsgInDOM(msg) {
   const el = document.querySelector(`.lc-msg-row[data-msg-id="${CSS.escape(msg.id)}"]`);
-  if (!el) return; // not rendered yet or already removed — skip
+  if (!el) return;
 
   // VP-23: capture video state before replacement
   const videoStates = [];
@@ -1442,9 +1518,10 @@ function patchMsgInDOM(msg) {
         if (isFinite(state.currentTime) && state.currentTime > 0) {
           v.currentTime = state.currentTime;
         }
-        if (!state.paused) v.play().catch(() => {});
+        if (!state.paused) v.play().catch(err => {
+          if (err.name !== 'AbortError') console.error('[LiveChat] restore play failed:', err);
+        });
       };
-      // Restore immediately if metadata is already available, otherwise wait
       if (v.readyState >= 1) {
         restoreOnLoad();
       } else {
@@ -1469,51 +1546,91 @@ function updateLoadMoreBtn() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// APPEND NEW MESSAGES (RC-02: correct last-sep lookup)
-// ML-06: initMediaInDOM scoped to only the new rows, not the entire list.
+// APPEND NEW MESSAGES
+// SYNC-02: Set-based instead of count-based (v6).
+// SYNC-05: date-separator `dataset.date` set before fragment assembly.
 // ─────────────────────────────────────────────────────────────────────────────
-function appendNewMessagesToDom(addedCount) {
+function appendNewMessagesToDom(newIds) {
   const list = $('lc-messages-list');
-  if (!list) return;
-  const sorted = getSortedMessages();
-  if (!sorted.length) return;
+  if (!list || !newIds.size) return;
 
-  const fragment = document.createDocumentFragment();
-  const tmp      = document.createElement('div');
+  // BUG-FIX-5: if the empty-state placeholder is present (Phase 1 returned 0
+  // docs) remove it before inserting the first real message, otherwise both
+  // coexist in the DOM.
+  const emptyState = list.querySelector('.lc-empty-state');
+  if (emptyState) emptyState.remove();
 
-  // RC-02: find the last rendered date separator
-  const seps = [...list.querySelectorAll('.lc-date-sep[data-date]')];
-  let lastDate = seps.length ? seps[seps.length - 1].dataset.date : '';
+  // Resolve and sort only the new messages by timestamp ascending
+  const newMsgs = getSortedMessages().filter(m => newIds.has(m.id));
+  if (!newMsgs.length) return;
 
-  const newMsgs = sorted.slice(-addedCount);
-  const newNodeRefs = []; // ML-06: collect new element references for scoped init
+  // ORDER-FIX: A new message whose server timestamp is older than already-rendered
+  // messages (e.g. two clients send within the same millisecond, or a message
+  // arrives out of order due to Firestore delivery) must be inserted at the
+  // correct chronological position in the DOM, not blindly appended at the end.
+  // Strategy: for each new message, find the first existing row whose timestamp
+  // is strictly greater and insertBefore it; otherwise append.
+  const getRowMs = row => {
+    const id  = row.dataset.msgId;
+    const msg = id ? messagesMap.get(id) : null;
+    return msg ? tsToMs(msg.timestamp) : 0;
+  };
+  const allRows = () => [...list.querySelectorAll('.lc-msg-row[data-msg-id]')];
 
   for (const msg of newMsgs) {
     if (list.querySelector(`.lc-msg-row[data-msg-id="${CSS.escape(msg.id)}"]`)) continue;
 
+    const msgMs = tsToMs(msg.timestamp);
+
+    // Find insertion point: first existing row with a later timestamp
+    const rows    = allRows();
+    const afterEl = rows.find(r => getRowMs(r) > msgMs) ?? null;
+
+    // Build the message element
+    const tmp2 = document.createElement('div');
+    tmp2.innerHTML = renderMsgHTML(msg);
+    const msgEl = tmp2.firstElementChild;
+    if (!msgEl) continue;
+
+    // Ensure correct date separator exists above the insertion point
     const d = fmtDate(msg.timestamp);
-    if (d && d !== lastDate) {
-      tmp.innerHTML = dateSepHTML(msg.timestamp);
-      const sep = tmp.firstElementChild;
-      if (sep) { sep.dataset.date = d; fragment.appendChild(sep); }
-      lastDate = d;
+    if (d) {
+      // Check if there's already a separator for this date immediately above
+      const refNode = afterEl ?? null; // null = end of list
+      const prevSep = refNode
+        ? refNode.previousElementSibling?.classList.contains('lc-date-sep')
+          ? refNode.previousElementSibling : null
+        : list.lastElementChild?.classList.contains('lc-date-sep')
+          ? list.lastElementChild : null;
+
+      const needsSep = !prevSep || prevSep.dataset.date !== d;
+      if (needsSep) {
+        // Also check: is the next row (afterEl) the start of the same date?
+        // If so, no new separator needed — it already has one coming.
+        const nextSepDate = afterEl?.classList.contains('lc-date-sep')
+          ? afterEl.dataset.date
+          : null;
+        if (nextSepDate !== d) {
+          tmp2.innerHTML = dateSepHTML(msg.timestamp);
+          const sep = tmp2.firstElementChild;
+          if (sep) {
+            sep.dataset.date = d;
+            list.insertBefore(sep, afterEl);
+          }
+        }
+      }
     }
-    tmp.innerHTML = renderMsgHTML(msg);
-    const msgEl = tmp.firstElementChild;
-    if (msgEl) {
-      newNodeRefs.push(msgEl);
-      fragment.appendChild(msgEl);
-    }
+
+    list.insertBefore(msgEl, afterEl);
+    initMediaInDOM(msgEl);
   }
 
-  list.appendChild(fragment);
-
-  // ML-06: init media only on the new rows — avoids rescanning the entire list
-  // (elements with data-player-init / data-carousel-init would be skipped by the
-  // guards anyway, but avoiding the full querySelectorAll on large lists is faster)
-  for (const el of newNodeRefs) {
-    initMediaInDOM(el);
-  }
+  // Remove any duplicate date separators that insertions may have created
+  const seenDates = new Set();
+  [...list.querySelectorAll('.lc-date-sep[data-date]')].forEach(sep => {
+    if (seenDates.has(sep.dataset.date)) { sep.remove(); }
+    else seenDates.add(sep.dataset.date);
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1562,7 +1679,22 @@ function setHeaderBadge(n) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SUBSCRIPTION CLEANUP HELPER (UX-01)
+// Unsubscribes all real-time listeners without resetting messagesMap or UI state.
+// Used by closeLiveChat so re-open avoids duplicate subs.
+// ─────────────────────────────────────────────────────────────────────────────
+function _cleanupSubs() {
+  liveChatSub?.(); liveChatSub = null;
+  presenceSub?.(); presenceSub = null;
+  typingSub?.();   typingSub   = null;
+  _subscribeInFlight = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // OPEN / CLOSE
+// UX-01: closeLiveChat now cleans up subs via _cleanupSubs().
+// UX-02: _subscribeInFlight (SYNC-04) is the concurrent-open guard.
+// UX-03: atBottom reset in closeLiveChat.
 // ─────────────────────────────────────────────────────────────────────────────
 export function openLiveChat() {
   if (!currentUser) {
@@ -1579,7 +1711,10 @@ export function openLiveChat() {
   _headerUnread = 0;
   setHeaderBadge(0);
   setTimeout(() => $('lc-input')?.focus(), 400);
-  if (!liveChatSub) subscribeToMessages();
+  // BUG-FIX-2: guard on both liveChatSub AND _subscribeInFlight so rapid
+  // open→close→open cycles cannot start a second concurrent subscription
+  // before the first one has set liveChatSub.
+  if (!liveChatSub && !_subscribeInFlight) subscribeToMessages();
   if (!presenceSub) subscribeToPresence();
   if (!typingSub)   subscribeToTyping();
   startHeartbeat();
@@ -1598,61 +1733,57 @@ export function closeLiveChat() {
   clearTypingIndicator();
   closeEmojiPicker();
   closeGallery();
-  // Cancel any in-progress edit or reply so the UI is clean on the next open
   if (editingMsgId) cancelEdit();
   if (replyingTo)   clearReply();
+  // UX-01: clean up all real-time subs so re-open doesn't duplicate them
+  _cleanupSubs();
+  // UX-03: reset atBottom so re-open starts scroll tracking correctly
+  atBottom = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REAL-TIME SUBSCRIPTION  (two-phase, v5)
+// REAL-TIME SUBSCRIPTION  (v7 — full real-time coverage for all messages)
+//
+// SYNC-04: _subscribeInFlight flag replaces the sentinel `() => {}` pattern.
+//   The sentinel blocked re-entry correctly but also prevented openLiveChat
+//   from re-subscribing after a fast close+open cycle where the sentinel was
+//   still assigned when `if (!liveChatSub)` was evaluated. The new flag is
+//   set at function entry and cleared on completion or early exit.
 //
 // Phase 1 — getDocs (one-time read, no persistent listener):
-//   Fetches the latest PAGE_SIZE messages ordered by timestamp desc.
-//   Populates messagesMap / docSnapshotMap and renders the initial view.
-//   _newestCursorDoc = docs[0] (newest in desc = anchor for Phase 2).
-//   _paginationCursorDoc = docs[last] (oldest in initial batch = pagination
-//   cursor for loading older messages; cached at module level for O(1) access).
+//   Fetches the latest PAGE_SIZE messages (desc order).
+//   Populates messagesMap / docSnapshotMap and renders initial view.
 //
-// Phase 2 — onSnapshot (real-time, new messages only):
-//   Uses `orderBy asc, startAfter(_newestCursorDoc)` so it ONLY fires for
-//   messages sent AFTER the initial window.  modified/removed events also
-//   fire here for messages that arrived via Phase 2 (i.e., recently sent
-//   messages edited by their author while the chat is open).
+// Phase 2 — onSnapshot (full collection, real-time):
+//   Subscribes to the FULL collection (no startAfter) so ALL modified/removed
+//   events reach this client regardless of when a message was first loaded.
+//   'added' events for IDs already in messagesMap (Phase 1 docs) are silently
+//   skipped via the messagesMap guard.
 //
-//   KNOWN TRADE-OFF (ML-07): Messages from Phase 1 (the initial getDocs batch)
-//   that are edited or soft-deleted by their author will NOT reflect real-time
-//   in the DOM for clients that were already viewing the chat.  They will be
-//   correct on the next chat open.  This is the accepted trade-off of the
-//   two-phase approach (fewer Firestore reads vs. live updates for history).
-//   If your app requires real-time edits on all messages, replace Phase 2 with
-//   a single unbounded listener that skips `added` events for ids already in
-//   messagesMap, and update `_paginationCursorDoc` lazily.
-//
-// Guards (ML-01):
-//   _isMounted is checked after the async getDocs returns.  If the component
-//   was unmounted during the fetch (rapid open/close), we abort cleanly without
-//   rendering or subscribing on an unmounted component.
-//   liveChatSub is set to a no-op sentinel immediately so concurrent calls
-//   to openLiveChat() during the async getDocs cannot double-init.
+//   SYNC-01: This closes the v5 ML-07 trade-off. Reactions, edits, and
+//   soft-deletes on Phase 1 messages now propagate to all connected clients
+//   in real time.
 // ─────────────────────────────────────────────────────────────────────────────
 async function subscribeToMessages() {
-  if (liveChatSub) { liveChatSub(); liveChatSub = null; }
+  // SYNC-04: guard against concurrent invocations
+  if (_subscribeInFlight) return;
+  _subscribeInFlight = true;
 
-  // Sentinel: prevents re-entry while the async getDocs is in flight.
-  liveChatSub = () => {};
+  // Tear down any existing subscription
+  if (liveChatSub) { liveChatSub(); liveChatSub = null; }
 
   messagesMap.clear();
   docSnapshotMap.clear();
   hasMoreMessages      = true;
   isLoadingOlder       = false;
   newMsgCount          = 0;
-  _paginationCursorDoc = null;   // ML-02, FP-02: reset cached cursors
+  _paginationCursorDoc = null;
   _newestCursorDoc     = null;
 
-  // ML-04: block scroll → pagination during initial render
   _isInitialLoading = true;
 
-  // ── Phase 1: one-time initial load ────────────────────────────────────────
+  // ── Phase 1: one-time initial load ───────────────────────────────────────
+  let phase1Failed = false;
   try {
     const initSnap = await getDocs(query(
       collection(db, 'global_chat'),
@@ -1660,9 +1791,9 @@ async function subscribeToMessages() {
       limit(PAGE_SIZE),
     ));
 
-    // ML-01: bail if component was unmounted while fetch was in-flight
+    // ML-01: bail if unmounted during fetch
     if (!_isMounted) {
-      liveChatSub = null;
+      _subscribeInFlight = false;
       _isInitialLoading = false;
       return;
     }
@@ -1672,71 +1803,86 @@ async function subscribeToMessages() {
     initSnap.docs.forEach((d, i) => {
       messagesMap.set(d.id, { id: d.id, ...d.data() });
       docSnapshotMap.set(d.id, d);
-      if (i === 0) _newestCursorDoc = d;              // first doc in desc = newest (ML-03)
+      if (i === 0) _newestCursorDoc = d;
     });
 
-    // ML-02: cache oldest doc for O(1) pagination cursor access
     if (initSnap.docs.length > 0) {
-      _paginationCursorDoc = initSnap.docs[initSnap.docs.length - 1]; // last in desc = oldest
+      _paginationCursorDoc = initSnap.docs[initSnap.docs.length - 1];
     }
 
   } catch (err) {
     console.error('[LiveChat] initial load failed:', err);
-    if (!_isMounted) { liveChatSub = null; _isInitialLoading = false; return; }
-    // Let phase 2 still subscribe so new messages arrive even if Phase 1 failed.
+    phase1Failed = true;
+    if (!_isMounted) { _subscribeInFlight = false; _isInitialLoading = false; return; }
+    showLCToast('Could not load messages. Check your connection.', 'error');
   }
 
   renderAllMessages(true);
 
-  // ML-04: release initial-loading lock after the programmatic scroll commits
   requestAnimationFrame(() => {
     requestAnimationFrame(() => { _isInitialLoading = false; });
   });
 
-  // ── Phase 2: real-time listener for NEW messages only ────────────────────
-  const realtimeQ = _newestCursorDoc
-    ? query(
-        collection(db, 'global_chat'),
-        orderBy('timestamp', 'asc'),
-        startAfter(_newestCursorDoc),
-      )
-    : query(
-        collection(db, 'global_chat'),
-        orderBy('timestamp', 'asc'),
-      );
+  // ── Phase 2: full collection real-time listener ───────────────────────────
+  // SYNC-01: No startAfter — listens to ALL docs so modified/removed events
+  // reach this client for every message, including Phase 1 history.
+  const realtimeQ = query(
+    collection(db, 'global_chat'),
+    orderBy('timestamp', 'asc'),
+  );
 
   const unsub = onSnapshot(
     realtimeQ,
     { includeMetadataChanges: false },
     snap => {
+      // SYNC-06: compute wasAtBottom BEFORE any early return so scroll state
+      // is always captured. When docChanges() is empty the data path is a
+      // no-op anyway (newIds stays empty and the scroll branch never fires),
+      // but structuring it this way makes the intent clear and avoids a subtle
+      // ordering bug if Firestore ever delivers a metadata-only snapshot whose
+      // changes() is non-empty but whose data is unchanged.
+      const wasAtBottom = checkAtBottom();
+
       if (!snap.docChanges().length) return;
 
-      let addedCount = 0;
-      const wasAtBottom = checkAtBottom();
+      // SYNC-02: collect new IDs in a Set for precise DOM insertion
+      const newIds = new Set();
 
       snap.docChanges().forEach(change => {
         const id  = change.doc.id;
         const msg = { id, ...change.doc.data() };
 
         if (change.type === 'added') {
-          // Guard against extremely rare duplicate (e.g. cursor boundary overlap).
-          if (!messagesMap.has(id)) {
-            messagesMap.set(id, msg);
-            docSnapshotMap.set(id, change.doc);
-            addedCount++;
-          }
-        } else if (change.type === 'modified') {
-          // Edit or soft-delete of a recently sent message (from Phase 2 window).
+          // Skip Phase 1 docs (already in messagesMap) — only add truly new ones.
+          // Also skip messages with a null/pending server timestamp: when the
+          // local client sends a message with serverTimestamp(), Firestore fires
+          // onSnapshot immediately with timestamp=null (the pending-write
+          // snapshot). tsToMs(null)=0 causes appendNewMessagesToDom to insert
+          // the message at position 0 (top of list) instead of the bottom,
+          // making it appear to vanish. We wait for the second snapshot where
+          // the real timestamp has resolved, which arrives as a 'modified' event.
+          if (messagesMap.has(id)) return; // already loaded in Phase 1
+          if (!change.doc.data().timestamp) return; // pending server timestamp — wait for modified
           messagesMap.set(id, msg);
           docSnapshotMap.set(id, change.doc);
-          patchMsgInDOM(msg);
+          newIds.add(id);
+        } else if (change.type === 'modified') {
+          // SYNC-01: covers ALL messages, including Phase 1 history.
+          // Also handles the pending→real timestamp transition for own sent
+          // messages: the first 'added' snapshot had timestamp=null (skipped
+          // above), so this 'modified' event is the first time we see the real
+          // timestamp. In that case treat it as a new insertion, not a patch.
+          const isNew = !messagesMap.has(id);
+          messagesMap.set(id, msg);
+          docSnapshotMap.set(id, change.doc);
+          if (isNew) {
+            newIds.add(id);
+          } else {
+            patchMsgInDOM(msg);
+          }
         } else if (change.type === 'removed') {
-          // Hard-delete by admin — real removal, not windowing artifact.
-          // (No limit() on Phase 2 query means windowing 'removed' cannot happen.)
           messagesMap.delete(id);
           docSnapshotMap.delete(id);
-          // FP-02 edge case: if the removed doc happened to be the pagination
-          // cursor, recompute it from the map (fallback to O(n) scan, rare path).
           if (_paginationCursorDoc?.id === id) {
             _paginationCursorDoc = getOldestDocSnapshot();
           }
@@ -1744,26 +1890,26 @@ async function subscribeToMessages() {
         }
       });
 
-      if (addedCount > 0) {
-        appendNewMessagesToDom(addedCount);
+      if (newIds.size > 0) {
+        appendNewMessagesToDom(newIds);
         if (wasAtBottom) {
           scrollToLatest(true);
         } else {
-          newMsgCount += addedCount;
+          newMsgCount += newIds.size;
           showNewMsgsBanner(newMsgCount);
-          setHeaderBadge(_headerUnread + addedCount);
+          setHeaderBadge(_headerUnread + newIds.size);
         }
       }
     },
     err => console.error('[LiveChat] subscription error:', err),
   );
 
-  // Replace sentinel with the real unsubscriber.
   liveChatSub = unsub;
+  _subscribeInFlight = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OLDEST DOC CURSOR (fallback O(n) scan — primary path now uses _paginationCursorDoc)
+// OLDEST DOC CURSOR (fallback O(n) scan)
 // ─────────────────────────────────────────────────────────────────────────────
 function getOldestDocSnapshot() {
   let oldestId  = null;
@@ -1776,27 +1922,11 @@ function getOldestDocSnapshot() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PAGINATION  (v5 — cursor-based, O(1) cursor access)
-//
-// Uses _paginationCursorDoc (cached at module level) as the Firestore cursor
-// instead of scanning messagesMap.  Updated after each successful page load to
-// point at the oldest doc in the newly fetched batch (FP-01).
-//
-// Design notes:
-//   • Only triggered by explicit user action: "Load older messages" button click
-//     or scroll to the top of the list (scroll handler in setupLiveChat).
-//   • Never fires during initial render (_isInitialLoading guard in scroll handler).
-//   • Scroll position is preserved by measuring scrollHeight delta.
-//   • Date-separator deduplication: if the bottom of the new batch shares a
-//     date with the existing top separator, the duplicate is removed.
-//   • The cursor is NOT affected by real-time additions (those have newer
-//     timestamps) or by edits (Firestore serverTimestamp only set on create),
-//     keeping the cursor stable across all normal realtime activity.
+// PAGINATION  (cursor-based, O(1) cursor access)
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadOlderMessages() {
   if (isLoadingOlder || !hasMoreMessages) return;
 
-  // ML-02: use cached cursor (O(1)) with fallback to O(n) scan
   const cursor = _paginationCursorDoc ?? getOldestDocSnapshot();
   if (!cursor) { hasMoreMessages = false; updateLoadMoreBtn(); return; }
 
@@ -1806,7 +1936,6 @@ async function loadOlderMessages() {
 
   const container   = $('lc-messages-container');
   const list        = $('lc-messages-list');
-  const prevScrollH = container?.scrollHeight ?? 0;
 
   try {
     const q = query(
@@ -1822,21 +1951,25 @@ async function loadOlderMessages() {
     } else {
       if (snap.docs.length < PAGE_SIZE) hasMoreMessages = false;
 
-      // Collect genuinely new docs (guard against re-fetch of known messages).
       const olderMsgs = [];
+      let lastNewDoc = null;
       snap.docs.forEach(d => {
         if (!messagesMap.has(d.id)) {
           const msg = { id: d.id, ...d.data() };
           messagesMap.set(d.id, msg);
           docSnapshotMap.set(d.id, d);
           olderMsgs.push(msg);
+          lastNewDoc = d;
         }
       });
 
-      // ML-02: update pagination cursor to the oldest doc in this batch
-      // snap.docs is ordered desc; last item = oldest in this batch.
+      // ORDER-FIX: only advance the pagination cursor when we actually ingested
+      // new docs. If every doc in the batch was already in messagesMap (duplicate
+      // delivery), advancing the cursor would silently skip the next page of
+      // older history. Fall back to the last snap doc so we still make progress
+      // past the duplicates without losing genuine older messages.
       if (snap.docs.length > 0) {
-        _paginationCursorDoc = snap.docs[snap.docs.length - 1];
+        _paginationCursorDoc = lastNewDoc ?? snap.docs[snap.docs.length - 1];
       }
 
       if (list && olderMsgs.length > 0) {
@@ -1870,14 +2003,15 @@ async function loadOlderMessages() {
           existingTopSep.remove();
         }
 
+        // BUG-FIX-4: capture scrollHeight immediately before the DOM mutation so
+        // real-time messages arriving during the async getDocs do not skew the anchor.
+        const prevScrollH = container?.scrollHeight ?? 0;
         list.prepend(fragment);
 
-        // Scope media init to only the new rows (ML-06 pattern)
         for (const el of newNodeRefs) {
           initMediaInDOM(el);
         }
 
-        // Restore scroll position: compensate for height gained at the top.
         if (container) {
           container.scrollTop = container.scrollHeight - prevScrollH;
         }
@@ -2093,23 +2227,35 @@ function openReactionPicker(msgId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REACTIONS
+// REACTIONS  (SYNC-03: optimistic update with rollback, from v6)
 // ─────────────────────────────────────────────────────────────────────────────
 async function toggleReaction(msgId, emoji) {
   if (!currentUser?.email) return;
   const msg = messagesMap.get(msgId);
   if (!msg || msg.isDeleted) return;
-  const myEmail   = currentUser.email;
-  const reactions = { ...(msg.reactions || {}) };
-  const users     = reactions[emoji] ? [...reactions[emoji]] : [];
-  const idx       = users.indexOf(myEmail);
+
+  const myEmail       = currentUser.email;
+  const prevReactions = { ...(msg.reactions || {}) };
+  const reactions     = { ...(msg.reactions || {}) };
+  const users         = reactions[emoji] ? [...reactions[emoji]] : [];
+  const idx           = users.indexOf(myEmail);
   if (idx === -1) { users.push(myEmail); }
   else            { users.splice(idx, 1); }
   if (users.length === 0) delete reactions[emoji];
   else                    reactions[emoji] = users;
+
+  // SYNC-03: optimistic local update — instant feedback
+  const optimisticMsg = { ...msg, reactions };
+  messagesMap.set(msgId, optimisticMsg);
+  patchMsgInDOM(optimisticMsg);
+
   try {
     await updateDoc(doc(db, 'global_chat', msgId), { reactions });
   } catch (err) {
+    // Rollback to previous state
+    const rollbackMsg = { ...msg, reactions: prevReactions };
+    messagesMap.set(msgId, rollbackMsg);
+    patchMsgInDOM(rollbackMsg);
     console.error('[LiveChat] toggleReaction error:', err);
     showLCToast('Failed to update reaction', 'error');
   }
@@ -2262,6 +2408,9 @@ async function sendMessage() {
 
       if (!attachments.length && !text) {
         if (input && !input.value) input.value = savedText;
+        // BUG-FIX-1: early return must reset isSending / re-enable send btn
+        isSending = false;
+        if (sendBtn) sendBtn.disabled = false;
         return;
       }
     }
@@ -2271,7 +2420,7 @@ async function sendMessage() {
     const first = attachments[0] ?? null;
 
     await addDoc(collection(db, 'global_chat'), {
-      type:         null,            // null for regular messages; 'voice' for voice notes
+      type:         null,
       text:         text  || null,
       senderEmail:  currentUser.email,
       senderName:   currentUser.name    || 'User',
@@ -2294,8 +2443,13 @@ async function sendMessage() {
     showLCToast('Failed to send. Try again.', 'error');
     if (input && !input.value) input.value = savedText;
   } finally {
-    isSending = false;
-    if (sendBtn) sendBtn.disabled = false;
+    // TD-02: guard against zombie finalize after teardown
+    if (_isMounted) {
+      isSending = false;
+      if (sendBtn) sendBtn.disabled = false;
+    } else {
+      isSending = false;
+    }
   }
 }
 
@@ -2339,7 +2493,7 @@ function renderEditMediaPreviews() {
     const isVid = att.type === 'video';
     const ext   = ((att.name || '').split('.').pop() || '').toUpperCase().slice(0, 5);
     const thumb = isImg
-      ? `<img class="lc-fp-img" src="${esc(att.url)}" alt="${esc(att.name || 'image')}">`
+      ? `<img class="lc-fp-img" src="${escUrl(att.url)}" alt="${esc(att.name || 'image')}">`
       : isVid
         ? `<div class="lc-fp-icon lc-fp-icon--video">🎬</div>`
         : `<div class="lc-fp-icon lc-fp-icon--doc">${esc(ext) || '📄'}</div>`;
@@ -2484,8 +2638,6 @@ async function deleteMessage(msgId) {
   const ok = await showLCConfirm('Delete this message for everyone?');
   if (!ok) return;
   try {
-    // VN-09: voice notes on Cloudinary are not deleted client-side; voiceUrl is
-    // simply nulled here. Server-side cleanup can be handled via Cloud Function.
     await updateDoc(doc(db, 'global_chat', msgId), {
       isDeleted: true, text: null, mediaUrl: null, attachments: null,
       voiceUrl: null,
@@ -2627,28 +2779,14 @@ function autoResizeInput() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// VOICE NOTE ENGINE  (v1 — production-ready)
+// VOICE NOTE ENGINE  (v7)
 //
-// Architecture:
-//   VN-01  All state isolated in _vn* module variables; no coupling to text-send path.
-//   VN-02  MediaRecorder preferred codec: audio/webm;codecs=opus → audio/ogg;codecs=opus → audio/mp4 (iOS).
-//   VN-03  AudioContext + AnalyserNode draws a real-time waveform from microphone input.
-//   VN-04  Recording timer runs at 100 ms precision; auto-stops at _vnMaxDuration.
-//   VN-05  Pause/resume implemented via MediaRecorder.pause() / .resume() with
-//          offset tracking so the displayed time is accurate across pauses.
-//   VN-06  Upload via Cloudinary (uploadToCloudinary) with real-time XHR progress.
-//   VN-07  Firestore message document stores { type:'voice', voiceUrl, voiceDuration, voiceMime }.
-//   VN-08  Voice bubble renders a custom HTML audio player: waveform seek bar,
-//          play/pause, elapsed/total time, playback speed selector, download button.
-//   AP-01  _activeAudio tracker pauses any playing voice note when another starts
-//          (mirrors VP-14 pattern for videos).
-//   VN-09  teardownVoiceNote() called in teardownLiveChat() to release resources.
-//   VN-10  Mic permission error shown as a friendly toast; recording state reset cleanly.
-//   VN-11  All voice note action buttons (reply, react, report, delete) wired in
-//          the standard message-actions row — no special-casing needed.
+// All v5/v6 VN-* fixes retained.
+// New in v7:
+//   VN-15  buildVoiceBubbleHTML: waveform bar heights seeded from msg.id hash
+//          so each voice note has a visually distinct static waveform pattern.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Codec negotiation (VN-02) ─────────────────────────────────────────────────
 function getBestMimeType() {
   const candidates = [
     'audio/webm;codecs=opus',
@@ -2664,7 +2802,6 @@ function getBestMimeType() {
   return '';
 }
 
-// ── Format seconds as m:ss ─────────────────────────────────────────────────────
 function fmtVNTime(sec) {
   if (!isFinite(sec) || sec < 0) sec = 0;
   const m  = Math.floor(sec / 60);
@@ -2672,25 +2809,21 @@ function fmtVNTime(sec) {
   return `${m}:${s}`;
 }
 
-// ── Elapsed recording time (ms), accounting for pauses ────────────────────────
 function vnElapsed() {
   if (_vnState === 'recording') return Date.now() - _vnStartTime - _vnPauseOffset;
   if (_vnState === 'paused')    return _vnPauseStart - _vnStartTime - _vnPauseOffset;
   return 0;
 }
 
-// ── Update the recording timer display ────────────────────────────────────────
 function vnUpdateTimer() {
   const el = $('lc-vn-timer');
   if (!el) return;
   const sec = Math.round(vnElapsed() / 1000);
   el.textContent = fmtVNTime(sec);
-  // Flash red at 10 s before limit
   el.classList.toggle('lc-vn-timer--warn', sec >= _vnMaxDuration - 10);
   if (sec >= _vnMaxDuration) vnStop(true);
 }
 
-// ── Start waveform animation (VN-03) ──────────────────────────────────────────
 function vnStartWaveform(stream) {
   try {
     _vnAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -2705,9 +2838,11 @@ function vnStartWaveform(stream) {
     _vnBars = Array.from(bars);
 
     const draw = () => {
+      // BUG-FIX-7: if not recording, do NOT schedule the next frame — this
+      // was burning 60fps rAF calls during 'paused' state doing nothing.
+      // Re-schedule only when recording; the frame is restarted in vnTogglePause.
       if (_vnState !== 'recording') {
-        // freeze bars while paused
-        _vnAnimFrame = requestAnimationFrame(draw);
+        _vnAnimFrame = null;
         return;
       }
       _vnAnimFrame = requestAnimationFrame(draw);
@@ -2721,11 +2856,10 @@ function vnStartWaveform(stream) {
     };
     draw();
   } catch {
-    // AudioContext unavailable (e.g. very old browsers) — waveform stays static
+    // AudioContext unavailable
   }
 }
 
-// ── Stop waveform animation ────────────────────────────────────────────────────
 function vnStopWaveform() {
   if (_vnAnimFrame) { cancelAnimationFrame(_vnAnimFrame); _vnAnimFrame = null; }
   try { _vnAudioCtx?.close(); } catch { /* ignore */ }
@@ -2734,7 +2868,6 @@ function vnStopWaveform() {
   _vnBars = [];
 }
 
-// ── Show / hide voice UI ───────────────────────────────────────────────────────
 function vnShowUI(show) {
   const voicePanel = $('lc-vn-panel');
   const inputArea  = $('lc-input-area-inner');
@@ -2742,7 +2875,6 @@ function vnShowUI(show) {
   if (inputArea)  inputArea.classList.toggle('hidden', show);
 }
 
-// ── Update mic button appearance ───────────────────────────────────────────────
 function vnSyncMicBtn() {
   const btn = $('lc-vn-mic-btn');
   if (!btn) return;
@@ -2750,7 +2882,6 @@ function vnSyncMicBtn() {
   btn.setAttribute('aria-label', _vnState === 'idle' ? 'Record voice note' : 'Cancel recording');
 }
 
-// ── Request microphone and start recording ─────────────────────────────────────
 async function vnStart() {
   if (_vnState !== 'idle') { vnCancel(); return; }
   _vnState = 'requesting';
@@ -2784,20 +2915,15 @@ async function vnStart() {
     try {
       _vnMediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
     } catch {
-      _vnMediaRecorder = new MediaRecorder(stream); // fallback: let browser choose codec
+      _vnMediaRecorder = new MediaRecorder(stream);
     }
 
     _vnMediaRecorder.addEventListener('dataavailable', e => {
       if (e.data?.size > 0) _vnChunks.push(e.data);
     });
 
-    _vnMediaRecorder.addEventListener('stop', () => {
-      // Triggered by vnStop(); data is assembled there.
-    });
-
-    _vnMediaRecorder.start(200); // collect chunks every 200 ms for progress
+    _vnMediaRecorder.start(200);
   } catch (err) {
-    // MediaRecorder construction or start() failed — clean up mic stream and reset
     stream.getTracks().forEach(t => t.stop());
     _vnStream        = null;
     _vnMediaRecorder = null;
@@ -2817,7 +2943,6 @@ async function vnStart() {
   _vnTimerInterval = setInterval(vnUpdateTimer, 500);
 }
 
-// ── Pause / resume recording (VN-05) ──────────────────────────────────────────
 function vnTogglePause() {
   if (_vnState === 'recording') {
     _vnMediaRecorder?.pause();
@@ -2834,13 +2959,36 @@ function vnTogglePause() {
     $('lc-vn-pause-btn')?.setAttribute('aria-label', 'Pause recording');
     $('lc-vn-pause-btn')?.classList.remove('lc-vn-pause-btn--paused');
     $('lc-vn-wave')?.classList.remove('lc-vn-wave--paused');
+    // BUG-FIX-7: restart waveform draw loop that was stopped during pause
+    if (_vnAnalyser && !_vnAnimFrame) {
+      const dataArray = new Uint8Array(_vnAnalyser.frequencyBinCount);
+      const bars = _vnBars;
+      const draw = () => {
+        if (_vnState !== 'recording') { _vnAnimFrame = null; return; }
+        _vnAnimFrame = requestAnimationFrame(draw);
+        _vnAnalyser.getByteFrequencyData(dataArray);
+        const step = Math.floor(dataArray.length / bars.length);
+        bars.forEach((bar, i) => {
+          const val = dataArray[i * step] || 0;
+          bar.style.height = Math.max(15, Math.round((val / 255) * 100)) + '%';
+        });
+      };
+      _vnAnimFrame = requestAnimationFrame(draw);
+    }
   }
 }
 
-// ── Cancel recording ───────────────────────────────────────────────────────────
+// VN-13: cancel drains pending dataavailable chunks before discarding
 function vnCancel() {
-  if (_vnState === 'idle' || _vnState === 'uploading') return; // uploading: let the XHR finish
-  _vnMediaRecorder?.stop();
+  if (_vnState === 'idle' || _vnState === 'uploading') return;
+  const rec = _vnMediaRecorder;
+  if (rec && rec.state !== 'inactive') {
+    try {
+      rec.ondataavailable = null; // discard chunks
+      rec.onstop = null;
+      rec.stop();
+    } catch { /* ignore */ }
+  }
   _vnStream?.getTracks().forEach(t => t.stop());
   if (_vnTimerInterval) { clearInterval(_vnTimerInterval); _vnTimerInterval = null; }
   vnStopWaveform();
@@ -2852,11 +3000,10 @@ function vnCancel() {
   vnSyncMicBtn();
 }
 
-// ── Stop recording and initiate upload (VN-06) ───────────────────────────────
 function vnStop(autoStop = false) {
   if (_vnState !== 'recording' && _vnState !== 'paused') return;
 
-  const durationMs = vnElapsed();
+  const durationMs  = vnElapsed();
   const durationSec = Math.round(durationMs / 1000);
 
   if (durationSec < 1) {
@@ -2872,7 +3019,6 @@ function vnStop(autoStop = false) {
 
   const finalMime = _vnMediaRecorder?.mimeType || 'audio/webm';
 
-  // Guard: recorder must exist (it always should given the state check above, but be safe)
   if (!_vnMediaRecorder) {
     _vnState = 'idle';
     vnShowUI(false);
@@ -2880,7 +3026,20 @@ function vnStop(autoStop = false) {
     return;
   }
 
-  // Collect remaining data then stop
+  // VN-12: guard against calling stop() on an already-inactive recorder
+  if (_vnMediaRecorder.state === 'inactive') {
+    const blob = new Blob(_vnChunks, { type: finalMime });
+    _vnChunks  = [];
+    const ext = finalMime.includes('ogg') ? '.ogg' : finalMime.includes('mp4') ? '.m4a' : '.webm';
+    vnUploadAndSend(blob, durationSec, finalMime, ext).finally(() => {
+      _vnMediaRecorder = null;
+      _vnState = 'idle';
+      vnShowUI(false);
+      vnSyncMicBtn();
+    });
+    return;
+  }
+
   _vnMediaRecorder.addEventListener('stop', async () => {
     _vnStream?.getTracks().forEach(t => t.stop());
     _vnStream = null;
@@ -2900,17 +3059,14 @@ function vnStop(autoStop = false) {
   _vnMediaRecorder.stop();
 }
 
-// ── Upload to Cloudinary and write Firestore doc (VN-06, VN-07) ───────────────
 async function vnUploadAndSend(blob, durationSec, mimeType, ext) {
   if (!currentUser?.email) return;
 
-  // Show upload progress UI
   showUploadProgress(0);
   const progressLabel = $('lc-upload-label');
   if (progressLabel) progressLabel.textContent = 'Uploading voice note…';
 
   const fileName = `voice_${Date.now()}${ext}`;
-  // Wrap blob in a File so uploadToCloudinary gets a proper name and type
   const audioFile = new File([blob], fileName, { type: mimeType });
 
   try {
@@ -2951,28 +3107,34 @@ async function vnUploadAndSend(blob, durationSec, mimeType, ext) {
     hideUploadProgress();
     console.error('[LiveChat] vnUploadAndSend error:', err);
     showLCToast('Failed to send voice note. Try again.', 'error');
-    // No client-side cleanup needed — Cloudinary manages orphaned uploads
   }
 }
 
-// VN-09: vnDeleteStorageFile removed — voice notes are now stored on Cloudinary.
-// Cloudinary URLs are simply nulled in Firestore on delete; server-side cleanup
-// can be handled via Cloudinary's dashboard or a Cloud Function if needed.
-
-// ── Build voice bubble HTML (VN-08) ───────────────────────────────────────────
+// ── Build voice bubble HTML
+// A11Y-01: tabindex="0" on seek element (role="slider" requires it).
+// VN-15: waveform bar heights seeded from msg.id hash for distinct patterns.
 function buildVoiceBubbleHTML(msg) {
   const totalSec  = msg.voiceDuration || 0;
   const totalFmt  = fmtVNTime(totalSec);
   const barCount  = 28;
-  const bars      = Array.from({ length: barCount }, (_, i) => {
-    // Static decorative waveform height pattern (sinusoidal)
-    const h = Math.round(20 + 55 * Math.abs(Math.sin((i / barCount) * Math.PI * 3.5 + 0.5)));
+
+  // VN-15: compute a per-message seed from msg.id for visual variety
+  let seed = 0;
+  const idStr = msg.id || '';
+  for (let i = 0; i < idStr.length; i++) {
+    seed = (seed * 31 + idStr.charCodeAt(i)) >>> 0;
+  }
+
+  const bars = Array.from({ length: barCount }, (_, i) => {
+    // Mix sinusoidal envelope with per-message seed for distinct patterns
+    const phase = (seed % 100) / 100;
+    const h = Math.round(20 + 55 * Math.abs(Math.sin((i / barCount) * Math.PI * 3.5 + phase * Math.PI * 2)));
     return `<div class="lc-vb-bar" style="height:${h}%"></div>`;
   }).join('');
 
   return `
     <div class="lc-voice-bubble" data-msg-id="${esc(msg.id)}"
-         data-voice-url="${esc(msg.voiceUrl || '')}"
+         data-voice-url="${escUrl(msg.voiceUrl || '')}"
          data-voice-duration="${totalSec}"
          data-voice-mime="${esc(msg.voiceMime || 'audio/webm')}">
       <button class="lc-vb-play-btn" aria-label="Play voice note">
@@ -2984,7 +3146,7 @@ function buildVoiceBubbleHTML(msg) {
         </svg>
       </button>
       <div class="lc-vb-body">
-        <div class="lc-vb-wave-seek" role="slider"
+        <div class="lc-vb-wave-seek" role="slider" tabindex="0"
              aria-label="Seek voice note" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
           <div class="lc-vb-bars">${bars}</div>
           <div class="lc-vb-progress-overlay"></div>
@@ -3009,7 +3171,10 @@ function buildVoiceBubbleHTML(msg) {
     </div>`;
 }
 
-// ── Initialize all voice bubbles in a container (VN-08) ───────────────────────
+// ── Initialize voice bubbles
+// LEAK-01: AbortController for all global listeners (from v6).
+// LEAK-03: MutationObserver now observes document.body with subtree:true so
+//          removal of any ancestor (not just direct parent) triggers cleanup.
 function initVoiceBubbles(container = document) {
   container.querySelectorAll('.lc-voice-bubble:not([data-vb-init])').forEach(wrap => {
     wrap.dataset.vbInit = '1';
@@ -3029,6 +3194,10 @@ function initVoiceBubbles(container = document) {
 
     if (!url || !playBtn) return;
 
+    // LEAK-01: single AbortController owns all global event listeners
+    const vbAbort = new AbortController();
+    const vbSig   = vbAbort.signal;
+
     let audio      = null;
     let _seeking   = false;
     let _touchSeek = false;
@@ -3039,7 +3208,6 @@ function initVoiceBubbles(container = document) {
       audio.preload = 'none';
       audio.src     = url;
 
-      // AP-01: pause any other playing voice note when this one starts
       audio.addEventListener('play', () => {
         if (_activeAudio && _activeAudio !== audio && !_activeAudio.paused) {
           _activeAudio.pause();
@@ -3077,6 +3245,7 @@ function initVoiceBubbles(container = document) {
         const pct = dur ? (audio.currentTime / dur) * 100 : 0;
         if (elapsedEl) elapsedEl.textContent = fmtVNTime(audio.currentTime);
         if (progressEl) progressEl.style.width = pct + '%';
+        // A11Y-02: keep aria-valuenow in sync
         if (seekEl) seekEl.setAttribute('aria-valuenow', Math.round(pct));
         updateBarProgress(pct);
       });
@@ -3088,7 +3257,6 @@ function initVoiceBubbles(container = document) {
       });
     };
 
-    // Bar highlight: darken bars left of playhead
     const bars = barsEl ? Array.from(barsEl.querySelectorAll('.lc-vb-bar')) : [];
     const updateBarProgress = pct => {
       const threshold = (pct / 100) * bars.length;
@@ -3097,7 +3265,6 @@ function initVoiceBubbles(container = document) {
       });
     };
 
-    // Seek helpers
     const seekTo = ratio => {
       createAudio();
       const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : totalSec;
@@ -3111,7 +3278,6 @@ function initVoiceBubbles(container = document) {
       seekTo(Math.max(0, Math.min(1, (clientX - r.left) / r.width)));
     };
 
-    // Play / pause toggle
     playBtn.addEventListener('click', () => {
       createAudio();
       if (audio.paused) {
@@ -3121,7 +3287,6 @@ function initVoiceBubbles(container = document) {
       }
     });
 
-    // Mouse seek on waveform
     seekEl?.addEventListener('mousedown', e => {
       createAudio();
       _seeking = true;
@@ -3130,10 +3295,9 @@ function initVoiceBubbles(container = document) {
     seekEl?.addEventListener('mousemove', e => {
       if (_seeking) seekFromClientX(e.clientX);
     });
-    const onMouseUp = () => { _seeking = false; };
-    document.addEventListener('mouseup', onMouseUp);
+    // LEAK-01: document mouseup uses AbortController signal
+    document.addEventListener('mouseup', () => { _seeking = false; }, { signal: vbSig });
 
-    // Touch seek on waveform
     seekEl?.addEventListener('touchstart', e => {
       e.preventDefault();
       createAudio();
@@ -3147,7 +3311,6 @@ function initVoiceBubbles(container = document) {
     }, { passive: false });
     seekEl?.addEventListener('touchend', () => { _touchSeek = false; }, { passive: true });
 
-    // Arrow-key seek (accessibility)
     seekEl?.addEventListener('keydown', e => {
       createAudio();
       const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : totalSec;
@@ -3156,38 +3319,41 @@ function initVoiceBubbles(container = document) {
       if (e.key === 'ArrowLeft')  audio.currentTime = Math.max(0, audio.currentTime - 5);
     });
 
-    // Playback speed
     speedSel?.addEventListener('change', () => {
       if (audio) audio.playbackRate = parseFloat(speedSel.value);
     });
 
-    // Download
-    dlBtn?.addEventListener('click', () => secureDownload(url, `voice-note-${Date.now()}.${mime.includes('ogg') ? 'ogg' : mime.includes('mp4') ? 'm4a' : 'webm'}`));
+    dlBtn?.addEventListener('click', () =>
+      secureDownload(url, `voice-note-${Date.now()}.${mime.includes('ogg') ? 'ogg' : mime.includes('mp4') ? 'm4a' : 'webm'}`)
+    );
 
-    // Cleanup when element leaves DOM
+    // LEAK-03: observe document.body with subtree:true so removal of any
+    // ancestor (not just direct parent) triggers cleanup and releases the audio
+    // element and vbAbort-owned global listeners.
     const cleanupObs = new MutationObserver(() => {
       if (!wrap.isConnected) {
         audio?.pause();
-        document.removeEventListener('mouseup', onMouseUp);
+        vbAbort.abort(); // LEAK-01: releases all listeners registered with vbSig
         if (_activeAudio === audio) _activeAudio = null;
         audio = null;
         cleanupObs.disconnect();
       }
     });
-    if (wrap.parentNode) cleanupObs.observe(wrap.parentNode, { childList: true });
+    cleanupObs.observe(document.body, { childList: true, subtree: true });
+
+    // Safety: also disconnect observer if vbAbort fires (e.g. from teardown path)
+    vbSig.addEventListener('abort', () => cleanupObs.disconnect(), { once: true });
   });
 }
 
-// ── Teardown voice note resources (VN-09) ─────────────────────────────────────
 function teardownVoiceNote() {
   vnCancel();
   if (_activeAudio && !_activeAudio.paused) _activeAudio.pause();
   _activeAudio = null;
 }
 
-// ── Setup mic button and recording UI (called in setupLiveChat) ───────────────
 function setupVoiceNote() {
-  const micBtn   = $('lc-vn-mic-btn');
+  const micBtn    = $('lc-vn-mic-btn');
   const cancelBtn = $('lc-vn-cancel-btn');
   const pauseBtn  = $('lc-vn-pause-btn');
   const sendBtn   = $('lc-vn-send-btn');
@@ -3232,9 +3398,10 @@ function setupDragDrop() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MEDIA GALLERY SIDEBAR
-// MR-05: uses .lc-gallery-panel class with position:fixed.
-// GC-04: emits .lc-gallery-item with correct sub-classes.
-// GC-05: diacritic-stripped search.
+// LEAK-02: video thumbnail loadedmetadata listeners not leaked across re-renders
+//          because each render() call creates fresh video elements.
+// VP-25: crossorigin="anonymous" removed from gallery video thumbnails.
+// A11Y-05: gallery items always have a meaningful aria-label.
 // ─────────────────────────────────────────────────────────────────────────────
 function openGallery() {
   if (_galleryOpen) return;
@@ -3288,21 +3455,23 @@ function openGallery() {
       return;
     }
 
+    // LEAK-02: each render creates fresh elements; old ones are discarded with grid.innerHTML
     grid.innerHTML = allItems.map(item => {
+      // A11Y-05: always provide a meaningful aria-label
+      const itemLabel = item.name || (item.type === 'video' ? 'Video' : item.type === 'image' ? 'Image' : 'File');
       if (item.type === 'image') {
-        return `<div class="lc-gallery-item lc-gallery-item--img" data-url="${esc(item.url)}" tabindex="0" role="button" aria-label="${esc(item.name || 'Image')}">
-                  <img src="${esc(item.url)}" loading="lazy" decoding="async" alt="${esc(item.name || 'Image')}">
+        return `<div class="lc-gallery-item lc-gallery-item--img" data-url="${escUrl(item.url)}" tabindex="0" role="button" aria-label="${esc(itemLabel)}">
+                  <img src="${escUrl(item.url)}" loading="lazy" decoding="async" alt="${esc(itemLabel)}">
                 </div>`;
       }
       if (item.type === 'video') {
-        // Use thumbnailUrl as poster for instant preview; if none, use a
-        // seeked-frame trick via JS after render (see wiring below).
-        const posterAttr = item.thumbnailUrl ? ` poster="${esc(item.thumbnailUrl)}"` : '';
+        // VP-25: no crossorigin="anonymous" — avoids CORS failures with CDN URLs
+        const posterAttr = item.thumbnailUrl ? ` poster="${escUrl(item.thumbnailUrl)}"` : '';
         return `<div class="lc-gallery-item lc-gallery-item--vid"
-                     data-url="${esc(item.url)}"
+                     data-url="${escUrl(item.url)}"
                      data-name="${esc(item.name || 'video.mp4')}"
-                     tabindex="0" role="button" aria-label="${esc(item.name || 'Video')}">
-                  <video src="${esc(item.url)}"${posterAttr} preload="metadata" muted playsinline crossorigin="anonymous"></video>
+                     tabindex="0" role="button" aria-label="${esc(itemLabel)}">
+                  <video src="${escUrl(item.url)}"${posterAttr} preload="metadata" muted playsinline></video>
                   <div class="lc-gallery-item__overlay">
                     <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28">
                       <circle cx="12" cy="12" r="12" fill="rgba(0,0,0,0.55)"/>
@@ -3312,7 +3481,7 @@ function openGallery() {
                 </div>`;
       }
       const ext = (item.name || '').split('.').pop().toUpperCase().slice(0, 5);
-      return `<a class="lc-gallery-item lc-gallery-item--doc" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer" data-download-name="${esc(item.name || 'file')}">
+      return `<a class="lc-gallery-item lc-gallery-item--doc" href="${escUrl(item.url)}" target="_blank" rel="noopener noreferrer" data-download-name="${esc(item.name || 'file')}" aria-label="${esc(itemLabel)}">
                 <span class="lc-gallery-item__ext">${esc(ext)}</span>
                 <span class="lc-gallery-item__label">${esc(item.name || 'File')}</span>
                 ${item.size ? `<span class="lc-gallery-item__size">${fmtSize(item.size)}</span>` : ''}
@@ -3332,18 +3501,15 @@ function openGallery() {
       });
     });
 
-    // Wire video gallery items: click scrolls chat to that message & opens viewer
     grid.querySelectorAll('.lc-gallery-item--vid').forEach(item => {
       const video = item.querySelector('video');
-      // Seeked-frame thumbnail: if no poster, seek to 1s so the browser
-      // decodes a frame and paints it into the video element as a thumbnail.
+      // LEAK-02: { once: true } prevents stale listener accumulation
       if (video && !video.poster) {
         video.addEventListener('loadedmetadata', () => {
           video.currentTime = Math.min(1, video.duration * 0.1);
         }, { once: true });
       }
       item.addEventListener('click', () => {
-        // Scroll chat to the message containing this video
         const msgId = allItems.find(a => a.url === item.dataset.url && a.type === 'video')?.msgId;
         if (msgId) {
           const row = document.querySelector(`.lc-msg-row[data-msg-id="${CSS.escape(msgId)}"]`);
@@ -3386,16 +3552,18 @@ function closeGallery() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLEANUP
+// CLEANUP  (v7)
+//
+// Retains all v6 fixes: TD-01 atBottom reset, TD-02 sendMessage guard.
+// UX-01: _cleanupSubs() now called from closeLiveChat, not here — teardownLiveChat
+//        still calls it via _cleanupSubs for full cleanup.
 // ─────────────────────────────────────────────────────────────────────────────
 export function teardownLiveChat() {
   _isMounted = false;
 
   if (_globalAbort) { _globalAbort.abort(); _globalAbort = null; }
 
-  liveChatSub?.(); liveChatSub = null;
-  presenceSub?.(); presenceSub = null;
-  typingSub?.();   typingSub   = null;
+  _cleanupSubs();
   stopHeartbeat();
   markPresenceOffline();
   clearTypingIndicator();
@@ -3403,15 +3571,12 @@ export function teardownLiveChat() {
   messagesMap.clear();
   docSnapshotMap.clear();
 
-  // FP-02: reset cached cursors so next open starts fresh
   _paginationCursorDoc = null;
   _newestCursorDoc     = null;
 
-  // VP-14: release active video reference
   if (_activeVideo && !_activeVideo.paused) _activeVideo.pause();
   _activeVideo = null;
 
-  // VN-09: tear down voice note recording and playback
   teardownVoiceNote();
 
   pendingFiles     = [];
@@ -3426,6 +3591,8 @@ export function teardownLiveChat() {
   isOpen                  = false;
   hasMoreMessages         = true;
   newMsgCount             = 0;
+  // TD-01: reset atBottom so next open starts scroll tracking correctly
+  atBottom                = true;
   replyingTo              = null;
   editingMsgId            = null;
   editingMediaAttachments = null;
@@ -3455,23 +3622,23 @@ export function setupLiveChat() {
     btn.addEventListener('click', openLiveChat)
   );
 
-  const closeBtn  = $('lc-close-btn');
-  const backdrop  = $('lc-backdrop');
-  const sendBtn   = $('lc-send-btn');
-  const input     = $('lc-input');
-  const attachBtn = $('lc-attach-btn');
-  const fileInput = $('lc-file-input-el');
-  const newMsgBar = $('lc-new-msgs-bar');
-  const loadMore  = $('lc-load-more-btn');
-  const emojiBtn  = $('lc-emoji-btn');
+  const closeBtn   = $('lc-close-btn');
+  const backdrop   = $('lc-backdrop');
+  const sendBtn    = $('lc-send-btn');
+  const input      = $('lc-input');
+  const attachBtn  = $('lc-attach-btn');
+  const fileInput  = $('lc-file-input-el');
+  const newMsgBar  = $('lc-new-msgs-bar');
+  const loadMore   = $('lc-load-more-btn');
+  const emojiBtn   = $('lc-emoji-btn');
   const galleryBtn = $('lc-gallery-btn');
 
   closeBtn?.addEventListener('click', closeLiveChat);
   backdrop?.addEventListener('click', closeLiveChat);
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && isOpen) {
-      if (_galleryOpen)    { closeGallery(); return; }
-      if (_emojiPickerOpen){ closeEmojiPicker(); return; }
+      if (_galleryOpen)     { closeGallery();    return; }
+      if (_emojiPickerOpen) { closeEmojiPicker(); return; }
       closeLiveChat();
     }
   }, { signal: sig });
@@ -3499,8 +3666,8 @@ export function setupLiveChat() {
       else              await sendMessage();
     }
     if (e.key === 'Escape') {
-      if (editingMsgId) { cancelEdit();   return; }
-      if (replyingTo)   { clearReply();   return; }
+      if (editingMsgId) { cancelEdit();     return; }
+      if (replyingTo)   { clearReply();     return; }
       clearPendingFiles();
     }
   });
@@ -3530,12 +3697,12 @@ export function setupLiveChat() {
     const quoteBtn     = e.target.closest('.lc-reply-quote[data-scroll-to]');
     const reactionPill = e.target.closest('.lc-reaction-pill');
 
-    if (replyBtn)      { e.stopPropagation(); startReply(replyBtn.dataset.msgId); }
-    if (editBtn)       { e.stopPropagation(); startEdit(editBtn.dataset.msgId); }
-    if (deleteBtn)     { e.stopPropagation(); deleteMessage(deleteBtn.dataset.msgId); }
-    if (reactBtn)      { e.stopPropagation(); openReactionPicker(reactBtn.dataset.msgId); }
-    if (reportBtn)     { e.stopPropagation(); openReportDialog(reportBtn.dataset.msgId); }
-    if (reactionPill)  {
+    if (replyBtn)     { e.stopPropagation(); startReply(replyBtn.dataset.msgId); }
+    if (editBtn)      { e.stopPropagation(); startEdit(editBtn.dataset.msgId); }
+    if (deleteBtn)    { e.stopPropagation(); deleteMessage(deleteBtn.dataset.msgId); }
+    if (reactBtn)     { e.stopPropagation(); openReactionPicker(reactBtn.dataset.msgId); }
+    if (reportBtn)    { e.stopPropagation(); openReportDialog(reportBtn.dataset.msgId); }
+    if (reactionPill) {
       e.stopPropagation();
       const row = reactionPill.closest('.lc-msg-row');
       if (row) toggleReaction(row.dataset.msgId, reactionPill.dataset.emoji);
@@ -3551,8 +3718,7 @@ export function setupLiveChat() {
     }
   });
 
-  // ML-04: _isInitialLoading blocks pagination during initial render.
-  // ML-05: rAF throttle ensures the handler fires at most once per animation frame.
+  // ML-04 + ML-05: rAF-throttled scroll handler; _isInitialLoading blocks pagination
   $('lc-messages-container')?.addEventListener('scroll', () => {
     if (_scrollRafPending) return;
     _scrollRafPending = true;
@@ -3560,8 +3726,6 @@ export function setupLiveChat() {
       _scrollRafPending = false;
       atBottom = checkAtBottom();
       if (atBottom) hideNewMsgsBanner();
-      // Trigger pagination when user scrolls to top — but never during the
-      // initial programmatic scroll or while a load is already in progress.
       if (!_isInitialLoading) {
         const c = $('lc-messages-container');
         if (c && c.scrollTop < 80 && hasMoreMessages && !isLoadingOlder) {

@@ -114,13 +114,10 @@ export function setApiKey(key) {
 }
 
 function resolveApiKey() {
-  // Resolution order:
-  // 1. setApiKey(key) called from main.js
-  // 2. window.__ECHO_API_KEY set anywhere before setupAiChat()
-  // Note: import.meta.env is NOT used — this project has no Vite build step.
-  //       The key is injected at runtime via setApiKey() in main.js.
-  const key = _configApiKey || window.__ECHO_API_KEY || 'AQ.Ab8RN6Klhov6IgGsFx1iYHKaCOs6jUMrfWsJUSqAzottSOfe7g';
-  if (!key) console.warn('[Echo] No Gemini API key found. Ensure setApiKey() is called in main.js before setupAiChat().');
+  const key = _configApiKey
+    || localStorage.getItem('echo_gemini_api_key')
+    || window.__GEMINI_KEY
+    || '';
   return key;
 }
 
@@ -235,13 +232,13 @@ function parseMarkdown(raw) {
 
   html = html.replace(/((?:^[ \t]*[*\-] .+\n?)+)/gm, block => {
     const items = block.trim().split('\n')
-      .map(l => `<li>${sanitize(l.replace(/^[ \t]*[*\-] /, ''))}</li>`).join('');
+      .map(l => `<li>${l.replace(/^[ \t]*[*\-] /, '')}</li>`).join('');
     return `<ul class="echo-list">${items}</ul>`;
   });
 
   html = html.replace(/((?:^\d+\. .+\n?)+)/gm, block => {
     const items = block.trim().split('\n')
-      .map(l => `<li>${sanitize(l.replace(/^\d+\. /, ''))}</li>`).join('');
+      .map(l => `<li>${l.replace(/^\d+\. /, '')}</li>`).join('');
     return `<ol class="echo-list echo-list-ol">${items}</ol>`;
   });
 
@@ -397,10 +394,7 @@ function injectStyles() {
       display: flex;
       flex-direction: column;
       gap: 2px;
-      padding: 20px 16px 12px;
-      overflow-y: auto;
-      scroll-behavior: smooth;
-      overscroll-behavior: contain;
+      /* padding/overflow handled by .ai-chat-messages shell class */
     }
 
     /* ── Rows ── */
@@ -1130,6 +1124,345 @@ function createEmojiPicker(anchorEl, onPick) {
   return { el: picker, destroy, focusSearch: () => searchInput.focus() };
 }
 
+// ─── Shell layout styles ──────────────────────────────────────────────────────
+function _injectShellStyles() {
+  if (document.getElementById('ai-chat-shell-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'ai-chat-shell-styles';
+  style.textContent = `
+    /* ── Page section reset ── */
+    #page-ai-chat {
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 72px); /* full viewport minus header */
+    }
+
+    /* ── Shell: fills the page section ── */
+    .ai-chat-shell {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      max-width: 860px;
+      width: 100%;
+      margin: 0 auto;
+      background: var(--surface, #fff);
+      border-left: 1px solid var(--edge, rgba(0,0,0,0.08));
+      border-right: 1px solid var(--edge, rgba(0,0,0,0.08));
+      position: relative;
+    }
+
+    /* ── Header ── */
+    .ai-chat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--edge, rgba(0,0,0,0.08));
+      flex-shrink: 0;
+      background: var(--surface, #fff);
+    }
+    body.dark-mode .ai-chat-header {
+      background: #0c0e1e;
+      border-color: rgba(255,255,255,0.08);
+    }
+    .ai-chat-header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .ai-chat-avatar-wrap {
+      width: 38px; height: 38px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #312e81, #4338ca);
+      display: flex; align-items: center; justify-content: center;
+      color: #e0e7ff;
+      flex-shrink: 0;
+      box-shadow: 0 2px 10px rgba(99,102,241,0.35);
+    }
+    .ai-chat-title {
+      font-size: 15px; font-weight: 700;
+      color: var(--ink, #111);
+      margin: 0;
+    }
+    body.dark-mode .ai-chat-title { color: #f4f4f5; }
+    .ai-chat-subtitle {
+      font-size: 11px;
+      color: var(--ink-dim, #6b7280);
+      margin: 0;
+    }
+    .ai-chat-clear-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 7px 14px; border-radius: 8px;
+      background: transparent;
+      border: 1px solid var(--edge, rgba(0,0,0,0.12));
+      color: var(--ink-dim, #6b7280);
+      font-size: 13px; cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+      font-family: inherit;
+    }
+    .ai-chat-clear-btn:hover {
+      background: rgba(239,68,68,0.06);
+      border-color: rgba(239,68,68,0.3);
+      color: #dc2626;
+    }
+    body.dark-mode .ai-chat-clear-btn {
+      border-color: rgba(255,255,255,0.1);
+      color: #71717a;
+    }
+    body.dark-mode .ai-chat-clear-btn:hover {
+      background: rgba(239,68,68,0.1);
+      color: #f87171;
+    }
+
+    /* ── Messages area ── */
+    .ai-chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scroll-behavior: smooth;
+      padding: 20px 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    /* ── Footer ── */
+    .ai-chat-footer {
+      flex-shrink: 0;
+      border-top: 1px solid var(--edge, rgba(0,0,0,0.08));
+      background: var(--surface, #fff);
+    }
+    body.dark-mode .ai-chat-footer {
+      background: #0c0e1e;
+      border-color: rgba(255,255,255,0.08);
+    }
+
+    /* ── Form row ── */
+    .ai-chat-form {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      padding: 12px 14px 10px;
+    }
+
+    /* ── Textarea ── */
+    .ai-chat-input {
+      flex: 1;
+      resize: none;
+      border: 1.5px solid var(--edge, rgba(0,0,0,0.12)) !important;
+      border-radius: 12px !important;
+      padding: 10px 14px !important;
+      font-size: 14px;
+      font-family: inherit;
+      line-height: 1.5;
+      max-height: 160px;
+      min-height: 42px;
+      overflow-y: auto;
+      background: var(--surface-2, #f9fafb) !important;
+      color: var(--ink, #111) !important;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .ai-chat-input:focus {
+      outline: none;
+      border-color: #6366f1 !important;
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.12) !important;
+      background: var(--surface, #fff) !important;
+    }
+    body.dark-mode .ai-chat-input {
+      background: #11142a !important;
+      border-color: rgba(255,255,255,0.1) !important;
+      color: #f4f4f5 !important;
+    }
+    body.dark-mode .ai-chat-input:focus {
+      border-color: #6366f1 !important;
+      background: #181c3a !important;
+    }
+
+    /* ── Send button ── */
+    .ai-chat-send-btn {
+      width: 42px; height: 42px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      border: none; cursor: pointer;
+      color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      box-shadow: 0 4px 14px rgba(99,102,241,0.35);
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    .ai-chat-send-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(99,102,241,0.5);
+    }
+    .ai-chat-send-btn:active { transform: scale(0.95); }
+    .ai-chat-send-btn:disabled {
+      opacity: 0.5; cursor: not-allowed;
+      transform: none; box-shadow: none;
+    }
+
+    /* ── Hint line ── */
+    .ai-chat-hint {
+      font-size: 11px;
+      color: var(--ink-faint, #9ca3af);
+      text-align: center;
+      padding: 0 14px 10px;
+      margin: 0;
+    }
+
+    /* ── Scroll button positioning fix ── */
+    .ai-chat-shell .echo-scroll-btn {
+      position: absolute;
+      bottom: 130px;
+      right: 18px;
+    }
+
+    /* ── Suggestions inside footer ── */
+    .ai-chat-footer .echo-suggestions {
+      padding: 10px 14px 4px;
+      border-bottom: 1px solid var(--edge, rgba(0,0,0,0.06));
+    }
+    body.dark-mode .ai-chat-footer .echo-suggestions {
+      border-color: rgba(255,255,255,0.06);
+    }
+
+    /* ── Status bar inside footer ── */
+    .ai-chat-footer .echo-status-bar {
+      padding: 6px 14px 4px;
+    }
+
+    /* ── Stop button inside footer ── */
+    .ai-chat-footer .echo-stop-btn {
+      margin: 4px auto 2px;
+    }
+
+    /* ── Mobile ── */
+    @media (max-width: 600px) {
+      #page-ai-chat {
+        height: calc(100dvh - 72px);
+      }
+      .ai-chat-header {
+        padding: 10px 14px;
+      }
+      .ai-chat-avatar-wrap {
+        width: 32px; height: 32px; border-radius: 8px;
+      }
+      .ai-chat-title   { font-size: 14px; }
+      .ai-chat-subtitle { display: none; }
+      .ai-chat-clear-btn span { display: none; }
+      .ai-chat-clear-btn {
+        padding: 7px 10px;
+        gap: 0;
+      }
+      .ai-chat-form { padding: 8px 10px 8px; gap: 6px; }
+      .ai-chat-input { font-size: 16px !important; /* prevent iOS zoom */ }
+      .ai-chat-send-btn { width: 38px; height: 38px; border-radius: 10px; }
+      .ai-chat-hint { display: none; }
+      .ai-chat-shell .echo-scroll-btn { bottom: 120px; right: 12px; }
+      .ai-chat-footer .echo-suggestions { padding: 8px 10px 4px; }
+      .echo-bubble-wrap { max-width: 90% !important; }
+    }
+
+    @media (max-width: 380px) {
+      .ai-chat-messages { padding: 12px 8px 8px; }
+      .ai-chat-form { padding: 6px 8px; gap: 4px; }
+    }
+
+    /* ── API Key Setup UI ── */
+    .echo-key-setup {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 12px;
+      padding: 40px 28px;
+      max-width: 440px;
+      margin: auto;
+    }
+    .echo-key-setup-icon {
+      font-size: 36px;
+      width: 68px; height: 68px;
+      border-radius: 50%;
+      background: rgba(99,102,241,0.1);
+      border: 1px solid rgba(99,102,241,0.2);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .echo-key-setup h3 {
+      font-size: 17px; font-weight: 700;
+      color: var(--ink, #111); margin: 0;
+    }
+    body.dark-mode .echo-key-setup h3 { color: #f4f4f5; }
+    .echo-key-setup p {
+      font-size: 13px; color: var(--ink-dim, #6b7280);
+      margin: 0; line-height: 1.55;
+    }
+    body.dark-mode .echo-key-setup p { color: #a1a1aa; }
+    .echo-key-error {
+      color: #dc2626 !important;
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.2);
+      border-radius: 8px;
+      padding: 8px 12px !important;
+      font-size: 13px;
+    }
+    body.dark-mode .echo-key-error { color: #f87171 !important; }
+    .echo-key-steps {
+      text-align: left;
+      font-size: 13px;
+      color: var(--ink-dim, #6b7280);
+      padding-left: 20px;
+      margin: 4px 0;
+      line-height: 1.8;
+    }
+    body.dark-mode .echo-key-steps { color: #a1a1aa; }
+    .echo-key-steps a { color: #6366f1; text-decoration: underline; }
+    .echo-key-steps strong { color: var(--ink, #111); }
+    body.dark-mode .echo-key-steps strong { color: #f4f4f5; }
+    .echo-key-input-row {
+      display: flex; gap: 8px; width: 100%;
+    }
+    .echo-key-input {
+      flex: 1;
+      padding: 10px 12px !important;
+      border-radius: 10px !important;
+      border: 1.5px solid var(--edge, rgba(0,0,0,0.12)) !important;
+      font-size: 13px !important;
+      font-family: ui-monospace, monospace !important;
+      background: var(--surface-2, #f9fafb) !important;
+      color: var(--ink, #111) !important;
+      letter-spacing: 0.03em;
+    }
+    .echo-key-input:focus {
+      outline: none !important;
+      border-color: #6366f1 !important;
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.12) !important;
+    }
+    body.dark-mode .echo-key-input {
+      background: #11142a !important;
+      border-color: rgba(255,255,255,0.1) !important;
+      color: #f4f4f5 !important;
+    }
+    .echo-key-save-btn {
+      padding: 10px 18px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      color: #fff;
+      font-size: 13px; font-weight: 600;
+      border: none; cursor: pointer;
+      white-space: nowrap;
+      transition: transform 0.15s, box-shadow 0.15s;
+      box-shadow: 0 4px 12px rgba(99,102,241,0.35);
+    }
+    .echo-key-save-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(99,102,241,0.5); }
+    .echo-key-save-btn:active { transform: scale(0.96); }
+    .echo-key-note {
+      font-size: 11px !important;
+      color: var(--ink-faint, #9ca3af) !important;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
 // ─── Main export ─────────────────────────────────────────────────────────────
 /**
  * Initialize the Echo AI chat UI.
@@ -1166,6 +1499,61 @@ export function setupAiChat(config = {}) {
   const submitBtn = form.querySelector('button[type="submit"]');
 
   injectStyles();
+  _injectShellStyles();
+
+  // ── API key gate ──────────────────────────────────────────────────────
+  // Show setup UI if no key is available yet. User can enter one and it
+  // gets saved to localStorage so it persists across sessions.
+  function _showKeySetup(reason = '') {
+    container.innerHTML = `
+      <div class="echo-key-setup" id="echo-key-setup">
+        <div class="echo-key-setup-icon">🔑</div>
+        <h3>Gemini API Key Required</h3>
+        <p>Echo uses Google's Gemini API. You need a free API key to chat.</p>
+        ${reason ? `<p class="echo-key-error">${reason}</p>` : ''}
+        <ol class="echo-key-steps">
+          <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a></li>
+          <li>Click <strong>Create API key</strong></li>
+          <li>Copy and paste it below</li>
+        </ol>
+        <div class="echo-key-input-row">
+          <input type="password" id="echo-key-input" class="echo-key-input" placeholder="AIza..." autocomplete="off" spellcheck="false" />
+          <button id="echo-key-save-btn" class="echo-key-save-btn">Save &amp; Start</button>
+        </div>
+        <p class="echo-key-note">Stored locally in your browser only — never sent anywhere except Google.</p>
+      </div>`;
+
+    document.getElementById('echo-key-save-btn')?.addEventListener('click', () => {
+      const val = (document.getElementById('echo-key-input')?.value || '').trim();
+      if (!val || !val.startsWith('AI')) {
+        const input = document.getElementById('echo-key-input');
+        if (input) { input.style.borderColor = '#ef4444'; input.focus(); }
+        return;
+      }
+      localStorage.setItem('echo_gemini_api_key', val);
+      setApiKey(val);
+      _initChat();
+    });
+
+    document.getElementById('echo-key-input')?.addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('echo-key-save-btn')?.click();
+    });
+  }
+
+  const hasKey = !!resolveApiKey();
+  if (!hasKey) {
+    _showKeySetup();
+    // Disable input until key is set
+    input.disabled = true;
+    if (submitBtn) submitBtn.disabled = true;
+    return; // Don't init chat until key is saved
+  }
+
+  _initChat();
+
+  function _initChat() {
+    input.disabled = false;
+    if (submitBtn) submitBtn.disabled = false;
 
   // ── Submit button: loading state ──────────────────────────────────────
   if (submitBtn && !submitBtn.querySelector('.echo-send-icon')) {
@@ -1184,8 +1572,11 @@ export function setupAiChat(config = {}) {
   emojiBtn.setAttribute('aria-haspopup', 'dialog');
   emojiBtn.setAttribute('aria-expanded', 'false');
   emojiBtn.textContent = '😊';
+  // Insert between textarea and send button
   if (submitBtn) form.insertBefore(emojiBtn, submitBtn);
   else form.appendChild(emojiBtn);
+
+  // Clear button handler registered after bottomObserver is created (see below)
 
   let activePicker = null;
 
@@ -1248,6 +1639,9 @@ export function setupAiChat(config = {}) {
   // ── DOM structure: status → suggestions → stop ────────────────────────
   // [FIX-BUG-07 / kept] correct insertion order
 
+  // ── Status bar — inserted BEFORE the footer form ──────────────────────
+  const footer = document.querySelector('.ai-chat-footer');
+
   const statusBar = document.createElement('div');
   statusBar.className = 'echo-status-bar';
   statusBar.setAttribute('aria-live', 'polite');
@@ -1263,7 +1657,8 @@ export function setupAiChat(config = {}) {
       <span class="echo-char-counter" id="echo-char-counter">0 / ${MAX_CHARS}</span>
     </span>
   `;
-  wrapperParent?.insertBefore(statusBar, container.nextSibling);
+  if (footer) footer.insertBefore(statusBar, footer.firstChild);
+  else wrapperParent?.insertBefore(statusBar, container.nextSibling);
 
   const suggestionsEl = document.createElement('div');
   suggestionsEl.className = 'echo-suggestions';
@@ -1277,16 +1672,18 @@ export function setupAiChat(config = {}) {
     pill.dataset.suggestion = text;
     suggestionsEl.appendChild(pill);
   });
-  wrapperParent?.insertBefore(suggestionsEl, statusBar.nextSibling);
+  if (footer) footer.insertBefore(suggestionsEl, statusBar);
+  else wrapperParent?.insertBefore(suggestionsEl, statusBar);
 
   const stopBtn = document.createElement('button');
   stopBtn.className = 'echo-stop-btn';
   stopBtn.id = 'echo-stop-btn';
   stopBtn.setAttribute('aria-label', 'Stop generating');
   stopBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/></svg> Stop`;
-  wrapperParent?.insertBefore(stopBtn, suggestionsEl.nextSibling);
+  if (footer) footer.insertBefore(stopBtn, suggestionsEl);
+  else wrapperParent?.insertBefore(stopBtn, suggestionsEl);
 
-  // Scroll button
+  // Scroll button — lives inside the messages container's parent
   const scrollBtn = document.createElement('button');
   scrollBtn.className = 'echo-scroll-btn';
   scrollBtn.setAttribute('aria-label', 'Scroll to bottom');
@@ -1302,7 +1699,11 @@ export function setupAiChat(config = {}) {
     unreadCount = 0;
     updateScrollBadge();
   });
-  if (wrapperParent) {
+  const shell = document.querySelector('.ai-chat-shell');
+  if (shell) {
+    shell.style.position = 'relative';
+    shell.appendChild(scrollBtn);
+  } else if (wrapperParent) {
     wrapperParent.style.position = 'relative';
     wrapperParent.appendChild(scrollBtn);
   }
@@ -1325,6 +1726,61 @@ export function setupAiChat(config = {}) {
     { root: container, threshold: 0.1 }
   );
   bottomObserver.observe(sentinel);
+
+  // ── Clear conversation button ─────────────────────────────────────────
+  document.getElementById('ai-chat-clear-btn')?.addEventListener('click', () => {
+    if (!confirm('Clear this conversation?')) return;
+    if (isGenerating) currentAbortController?.abort();
+    container.innerHTML = '';
+    resetHistory();
+    messageCount = 0;
+    unreadCount  = 0;
+    isGenerating = false;
+    setInputDisabled(false);
+    setStatus('Ready');
+    // Re-add sentinel and observe
+    const s = document.createElement('div');
+    s.id = 'echo-sentinel';
+    s.style.height = '1px';
+    container.appendChild(s);
+    bottomObserver.observe(s);
+    // Re-render empty state
+    const emptyDiv = document.createElement('div');
+    emptyDiv.className = 'echo-empty';
+    emptyDiv.id = 'echo-empty-state';
+    emptyDiv.setAttribute('aria-label', 'Start a conversation');
+    emptyDiv.innerHTML = `
+      <div class="echo-empty-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#818cf8"
+             stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+      </div>
+      <h3>How can I help?</h3>
+      <p>Ask anything — I'll keep my answers clear and to the point.</p>`;
+    container.insertBefore(emptyDiv, s);
+    // Re-insert suggestions
+    const newSuggestions = document.createElement('div');
+    newSuggestions.className = 'echo-suggestions';
+    newSuggestions.id = 'echo-suggestions';
+    newSuggestions.setAttribute('role', 'group');
+    newSuggestions.setAttribute('aria-label', 'Suggested prompts');
+    pickSuggestions().forEach(txt => {
+      const pill = document.createElement('button');
+      pill.className = 'echo-suggestion-pill';
+      pill.textContent = txt;
+      pill.dataset.suggestion = txt;
+      newSuggestions.appendChild(pill);
+    });
+    const footerEl = document.querySelector('.ai-chat-footer');
+    const stopBtnEl = document.getElementById('echo-stop-btn');
+    if (footerEl && stopBtnEl) footerEl.insertBefore(newSuggestions, stopBtnEl);
+    newSuggestions.addEventListener('click', e => {
+      const pill = e.target.closest('.echo-suggestion-pill');
+      if (pill?.dataset.suggestion) submitMessage(pill.dataset.suggestion);
+    });
+    input.focus();
+  });
 
   // ── Char counter [FIX-BUG-06] ────────────────────────────────────────
   const charCounter = document.getElementById('echo-char-counter');
@@ -1620,6 +2076,12 @@ export function setupAiChat(config = {}) {
     });
 
     if (response.status === 429) throw Object.assign(new Error('Rate limit reached. Please wait a moment.'), { status: 429 });
+    if (response.status === 401 || response.status === 403) {
+      // Invalid or expired key — clear it and show setup UI
+      localStorage.removeItem('echo_gemini_api_key');
+      _configApiKey = null;
+      throw Object.assign(new Error('Invalid API key. Please enter a valid Gemini API key.'), { status: response.status, isAuthError: true });
+    }
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
       throw new Error(err.error?.message || `HTTP ${response.status}`);
@@ -1761,6 +2223,16 @@ export function setupAiChat(config = {}) {
       streamBubble?.bubbleEl.closest('.echo-row')?.remove();
       // [FIX-BUG-RETRY-A] Only pop if we pushed the user turn this call
       if (didPushUser) chatHistory.pop();
+
+      if (lastErr?.isAuthError) {
+        // Invalid/expired key — wipe and show setup UI
+        isGenerating = false;
+        currentAbortController = null;
+        setInputDisabled(false);
+        _showKeySetup('Your API key is invalid or expired. Please enter a new one.');
+        return;
+      }
+
       appendMessage({
         text:    lastErr?.message ?? 'Something went wrong. Please try again.',
         sender:  'bot',
@@ -1802,4 +2274,5 @@ export function setupAiChat(config = {}) {
 
   form.__echoCleanup = cleanup;
   form.__echoSetTheme = setTheme;
+  } // end _initChat
 }

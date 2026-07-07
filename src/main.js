@@ -196,11 +196,11 @@ document.addEventListener('DOMContentLoaded', () => {
             setupComments();
             setupChat();
             setupLostFound();
-            // Inject Gemini API key before initialising the AI chat.
-            // This project has no build step so we read from window.__GEMINI_KEY
-            // which is set in index.html, OR call setApiKey() directly here.
-            // IMPORTANT: replace the string below with your actual Gemini API key.
-            setApiKey(window.__GEMINI_KEY || 'AQ.Ab8RN6Klhov6IgGsFx1iYHKaCOs6jUMrfWsJUSqAzottSOfe7g');
+            // Gemini API key: read from localStorage first, then window.__GEMINI_KEY.
+            // The user can set it via the AI chat UI if missing.
+            const savedKey = localStorage.getItem('echo_gemini_api_key');
+            if (savedKey) setApiKey(savedKey);
+            else if (window.__GEMINI_KEY) setApiKey(window.__GEMINI_KEY);
             setupAiChat();
             setupAchievements();
             setupProfile();

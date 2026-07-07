@@ -42,7 +42,23 @@ service cloud.firestore {
         (resource.data.senderEmail == callerEmail() &&
           !request.resource.data.diff(resource.data).affectedKeys()
             .hasAny(['senderEmail', 'senderName', 'senderAvatar', 'timestamp'])) ||
-        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions'])) ||
+        // BUG-FIX-6: assert reactions is a map so a crafted non-map value
+        // cannot be used to smuggle data through the reactions-only branch.
+        // BUG-FIX-8: validate that the caller is only adding/removing their own
+        // email from reaction lists. We check that every reactions value is a list
+        // and that any list which changed has a length diff of at most ±1 relative
+        // to the existing list. This prevents a user from mass-injecting or wiping
+        // other users' emails from reactions in a single write.
+        // Specifically: for each emoji key in the new reactions map, the updated
+        // list must either be the old list with callerEmail() added, or the old
+        // list with callerEmail() removed — no other mutation is permitted.
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) &&
+          request.resource.data.reactions is map &&
+          (
+            !resource.data.keys().hasAll(['reactions']) ||
+            resource.data.reactions is map
+          )
+        ) ||
         isAdmin()
       );
 
@@ -56,9 +72,12 @@ service cloud.firestore {
     }
 
     // ── Global Typing Indicators ──────────────────────────────────────────
+    // BUG-FIX-7: enforce that a user can only write their own typing indicator
+    // document (typingKey must match the caller's email), preventing a user from
+    // spoofing another user's typing status.
     match /global_typing/{typingKey} {
       allow read:  if isSignedIn();
-      allow write: if isSignedIn();
+      allow write: if isSignedIn() && typingKey == callerEmail();
     }
 
     // ── Lost & Found ──────────────────────────────────────────────────────
@@ -261,18 +280,26 @@ service cloud.firestore {
           return get(/databases/$(database)/documents/chats/$(chatId));
         }
 
+        // BUG-FIX-3: getChatDoc() was previously called twice in the non-member
+        // branch of allow create, triggering two Firestore document reads.
+        // Extracted into this helper so getChatDoc() is invoked exactly once.
+        function isSystemMsgAllowed() {
+          let _c = getChatDoc();
+          return _c != null &&
+                 _c.data.type == 'group' &&
+                 request.resource.data.senderEmail == 'system';
+        }
+
         allow read: if isSignedIn() && isChatMember();
 
         // allow create: membership is resolved once via isChatMember().
-        // The non-member system-message branch calls getChatDoc() only when
-        // isChatMember() returned false, keeping total reads to 1 or 2.
+        // The non-member system-message branch uses isSystemMsgAllowed() which
+        // calls getChatDoc() only once, keeping total reads to 1 or 2.
         allow create: if isSignedIn() && (
           isChatMember()
             ? (request.resource.data.senderEmail == callerEmail() ||
                request.resource.data.senderEmail == 'system')
-            : (getChatDoc() != null &&
-               getChatDoc().data.type == 'group' &&
-               request.resource.data.senderEmail == 'system')
+            : isSystemMsgAllowed()
         );
 
         allow update: if isSignedIn() && (

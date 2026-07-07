@@ -446,10 +446,10 @@ function writeTypingStateThrottled(roomId, typing) {
 }
 
 export function teardownChat() {
-    unsubscribeRoomListeners();
+    unsubscribeRoomListeners(); // also tears down typingSub internally
     _rcm.teardown();
     stopRecording(true);
-    typingSub?.();     typingSub   = null;
+    // Note: typingSub is already unsubscribed + nulled by unsubscribeRoomListeners() above.
     // Cancel any pending nav-badge RAF so a stale count doesn't paint after
     // logout (the frame would fire after resetUnreadState() has hidden the dot,
     // potentially un-hiding it with a ghost total from a previous session).
@@ -1058,9 +1058,10 @@ function buildMessageHTML(msg, index, messages, chatType) {
     } else if (msg.voiceUrl) {
         contentHTML = buildVoiceNoteHTML(msg, isMe);
     } else if (msg.imageUrl) {
-        // Fix #9 (High): validate imageUrl through safeUrl() before injecting into src/data-full
-        const _safeImg = safeUrl(msg.imageUrl) || encodeURI(msg.imageUrl);
-        contentHTML = `<div class="wa-att-block"><div class="wa-att-grid wa-att-grid--1"><div class="wa-att-image-wrap"><img src="${_safeImg}" class="wa-att-image msg-image" data-full="${_safeImg}" loading="lazy" alt="Image"></div></div></div>`;
+        // Fix #9 (High): validate imageUrl through safeUrl() before injecting into src/data-full.
+        // Do NOT fall back to encodeURI — that lets javascript: / data: schemes through unchanged.
+        const _safeImg = safeUrl(msg.imageUrl);
+        if (_safeImg) contentHTML = `<div class="wa-att-block"><div class="wa-att-grid wa-att-grid--1"><div class="wa-att-image-wrap"><img src="${_safeImg}" class="wa-att-image msg-image" data-full="${_safeImg}" loading="lazy" alt="Image"></div></div></div>`;
     } else if (msg.fileUrl && msg.fileMime?.startsWith('video/')) {
         // FIXED: render video files as an inline <video> player, not a raw file link
         const _safeVid = safeUrl(msg.fileUrl) || '';
@@ -1084,7 +1085,8 @@ function buildMessageHTML(msg, index, messages, chatType) {
         const textClass = hasMedia ? 'wa-att-caption' : 'wa-msg-text';
         textHTML = `<span class="${textClass}">${linkedText}</span>`;
         const firstUrl = extractFirstUrl(msg.text);
-        if (firstUrl && !msg.attachments?.length && !msg.imageUrl && !msg.fileUrl) {
+        // Skip link preview when the message already has a media attachment of any kind
+        if (firstUrl && !msg.attachments?.length && !msg.imageUrl && !msg.fileUrl && !msg.voiceUrl) {
             textHTML += buildLinkPreviewHTML(firstUrl);
         }
     }
@@ -1268,7 +1270,7 @@ function renderPinnedBar(chatHeader) {
         <div class="wa-pin-icon">📌</div>
         <div class="wa-pin-content">
             <span class="wa-pin-label">Pinned message</span>
-            <span class="wa-pin-text">${sanitize(msg.text || (msg.imageUrl ? '📷 Photo' : (msg.voiceUrl ? '🎤 Voice' : '📎 File')))}</span>
+            <span class="wa-pin-text">${sanitize(msg.text || (msg.attachments?.[0]?.type === 'image' ? '📷 Photo' : msg.attachments?.[0]?.type === 'video' ? '🎥 Video' : msg.attachments?.[0]?.type === 'audio' ? '🎤 Voice' : msg.attachments?.length ? `📎 ${msg.attachments[0].name || 'File'}` : msg.imageUrl ? '📷 Photo' : msg.voiceUrl ? '🎤 Voice' : '📎 File'))}</span>
         </div>
         <button class="wa-pin-close" id="wa-pin-close-btn" aria-label="Dismiss pinned">
             <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
@@ -1700,7 +1702,12 @@ function ensureChatStyles() {
             border-radius: 20px;
             border: 1px solid var(--wa-border);
             box-shadow: var(--wa-shadow-lg);
-            overflow: clip; /* FIX Bug 1: was overflow:hidden which clipped absolutely-positioned dropdowns (forward/delete/pin). overflow:clip preserves the border-radius crop on layout content without creating a new clipping rect for absolute descendants. */
+            /* overflow:clip preserves border-radius rounding for in-flow content
+               without creating a scroll port — position:absolute children (dropdowns,
+               overlays) can still extend beyond the box on desktop.
+               The mobile CSS overrides this to overflow:hidden so border-radius
+               clips the slide-in panels correctly on narrow viewports. */
+            overflow: clip;
             height: 100%;
             display: flex;
         }
@@ -2578,7 +2585,11 @@ function ensureChatStyles() {
                 overflow: hidden !important;
                 /* Switch from flex-row to a stacked single-panel layout */
                 display: block !important;
-                position: relative;
+                position: relative !important;
+                /* CRITICAL: height must be explicit so position:absolute children
+                   (sidebar + chat-window) have a non-zero bounding box.
+                   Without this the panels are invisible even when visible:visible. */
+                height: 100% !important;
             }
 
             /* ─── Sidebar panel ─── */
@@ -2851,10 +2862,13 @@ function _getChatWrapper() {
 function _mobileShowConversation() {
     const wrapper = _getChatWrapper();
     if (!wrapper) return;
-    // Safety: don't set the attribute if the chat page is currently hidden,
-    // as it would persist and confuse the layout when the page becomes visible.
-    // The onPageVisit handler will set it correctly when the user navigates to chat.
-    if (wrapper.classList.contains('hidden')) return;
+    // If the page is still hidden (mid-transition in the SPA router), defer one
+    // animation frame so the router can finish showing it before we set the attribute.
+    // Previously this returned early and the conversation panel never became visible.
+    if (wrapper.classList.contains('hidden')) {
+        requestAnimationFrame(() => _mobileShowConversation());
+        return;
+    }
     wrapper.setAttribute('data-mobile-view', 'conversation');
     // Push a history entry so the browser Back button returns to the list.
     // Use replaceState if we're already in conversation state (e.g. switching rooms)
@@ -3124,14 +3138,17 @@ function openGallery(items, startIndex = 0) {
             });
         }
 
-        // Background click closes (but not when zoomed into image)
-        box.addEventListener('click', e => {
-            if (e.target === box || e.target.id === 'wa-lb-media-wrap') {
-                if (_zoomed) { _zoomed = false; _zoomScale = 1; const el = document.getElementById('wa-lb-img'); if (el) { el.style.transform = ''; el.classList.remove('zoomed'); } }
-                else closeLightbox();
-            }
-        }, { once: false });
     }
+
+    // Background click closes (but not when zoomed into image).
+    // Registered ONCE on box — outside renderSlide so it doesn't accumulate
+    // a new copy on every prev/next navigation.
+    box.addEventListener('click', e => {
+        if (e.target === box || e.target.id === 'wa-lb-media-wrap') {
+            if (_zoomed) { _zoomed = false; _zoomScale = 1; const el = document.getElementById('wa-lb-img'); if (el) { el.style.transform = ''; el.classList.remove('zoomed'); } }
+            else closeLightbox();
+        }
+    });
 
     function closeLightbox() {
         box.remove();
@@ -3365,9 +3382,14 @@ function openStarredPanel() {
         starred.forEach(m => {
             const isMe = m.senderEmail === currentUser.email;
             const name = isMe ? 'You' : sanitize(m.senderName || '');
-            const text = m.text     ? sanitize(m.text)
-                       : m.imageUrl ? '📷 Photo'
-                       : m.voiceUrl ? '🎤 Voice note'
+            const _firstAtt = m.attachments?.[0];
+            const text = m.text        ? sanitize(m.text)
+                       : _firstAtt?.type === 'image' ? `📷 Photo${m.attachments.length > 1 ? ` ×${m.attachments.length}` : ''}`
+                       : _firstAtt?.type === 'video' ? '🎥 Video'
+                       : _firstAtt?.type === 'audio' ? '🎤 Voice note'
+                       : _firstAtt            ? `📎 ${sanitize(_firstAtt.name || 'File')}`
+                       : m.imageUrl           ? '📷 Photo'
+                       : m.voiceUrl           ? '🎤 Voice note'
                        : '📎 File';
             innerHTML += `<div class="wa-starred-item">
                 <span style="font-size:16px">⭐</span>
@@ -3596,9 +3618,14 @@ function showReplyPreview(msg, chatHeader, input) {
     };
     const isMe  = msg.senderEmail === currentUser.email;
     const label = isMe ? 'You' : sanitize(msg.senderName || 'Someone');
-    const text  = msg.imageUrl  ? '📷 Photo'
-                : msg.voiceUrl  ? '🎤 Voice note'
-                : msg.fileUrl   ? `📎 ${sanitize(msg.fileName || 'File')}`
+    const _rAtt = msg.attachments?.[0];
+    const text  = msg.imageUrl          ? '📷 Photo'
+                : msg.voiceUrl          ? '🎤 Voice note'
+                : msg.fileUrl           ? `📎 ${sanitize(msg.fileName || 'File')}`
+                : _rAtt?.type === 'image' ? `📷 Photo${msg.attachments.length > 1 ? ` ×${msg.attachments.length}` : ''}`
+                : _rAtt?.type === 'video' ? '🎥 Video'
+                : _rAtt?.type === 'audio' ? '🎤 Voice note'
+                : _rAtt                   ? `📎 ${sanitize(_rAtt.name || 'File')}`
                 : sanitize(msg.text || '');
     const bar = document.createElement('div');
     bar.id = 'wa-reply-preview';
@@ -3846,13 +3873,8 @@ export function setupChat() {
         }
     }, { once: true });
 
-// ── Recent chats ────────────────────────────
-// (Constructed after openChatRoom is defined below so onOpenRoom is valid)
-
-    // ── Recent chats ────────────────────────────
-    // Track which user's recent-chats subscription is currently live.
-    // email of the user whose sub is active
-       // ── Recent chats manager ────────────────────
+    // ── Recent chats manager ────────────────────
+    // Constructed here so the onOpenRoom callback can close over openChatRoom.
     const _rcm = new RecentChatsManager({
         db,
         auth,
@@ -5414,7 +5436,6 @@ export function setupChat() {
             const resolved = _resolveAttachment(attReplyBtn.dataset.msgId, attReplyBtn.dataset.attIdx);
             if (!resolved) return true;
             const { msg: rMsg, att: rAtt, idx: rIdx } = resolved;
-            const isMe   = rMsg.senderEmail === currentUser.email;
             // Build a synthetic replyTo that points to the specific attachment.
             // attIdx is stored so the reply bubble renderer can highlight the right cell.
             replyingTo = {
@@ -6707,7 +6728,12 @@ export function setupChat() {
         'application/x-python-code', 'application/x-perl',
     ]);
     function _isMimeAllowed(mimeType) {
-        if (!mimeType) return true; // unknown → allow, classify as document
+        // Treat blank MIME as blocked rather than silently allowing it —
+        // a renamed executable often has no reported type, and defaulting to
+        // allow would let it through as a "document". Callers that genuinely
+        // need to accept unknown types (e.g. drag-drop from some browsers)
+        // should resolve the type via the File extension before calling here.
+        if (!mimeType) return false;
         const mt = mimeType.toLowerCase().split(';')[0].trim();
         if (BLOCKED_MIME_EXACT.has(mt)) return false;
         return ALLOWED_MIME_PREFIXES.some(p => mt.startsWith(p));

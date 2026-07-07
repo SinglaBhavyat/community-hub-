@@ -476,63 +476,56 @@
   margin-bottom: 4px;
   width: 100%;
   max-width: 100%;
-  /* Default 16:9 aspect-ratio so unknown-ratio videos render at a sensible
-     height before metadata loads; portrait videos get letterboxed, not stretched */
-  aspect-ratio: 16 / 9;
-  max-height: 260px;
+  /* Total wrap height = video area + controls bar.
+     We use min-height so the wrap always has room for both the video
+     (at 16:9 of its width) and the ~80px controls panel below it.
+     max-height caps the whole block so a very wide bubble doesn't
+     produce a massive player. */
+  min-height: 140px;
+  max-height: 340px; /* 260px video + 80px controls */
   background: #000;
   border-radius: 10px;
-  /* FIXED: was overflow:hidden which clipped the absolutely-positioned controls
-     bar. Changed to overflow:visible so controls show, while the video itself
-     clips via border-radius on .lc-media-video. The spinner and replay overlays
-     use position:absolute within the wrap and are unaffected. */
-  overflow: visible;
+  /* overflow:hidden clips all absolutely-positioned children (controls,
+     spinner, replay) to the rounded-corner boundary — no ::before hack needed. */
+  overflow: hidden;
   position: relative;
-  /* Ensure the wrap itself clips its own corners so the black bg stays rounded */
-  isolation: isolate;
-  /* FIX (controls/replay overlap): the controls bar is always two rows
-     (play/seek/time/mute, then volume/speed/pip/fullscreen/download) at
-     roughly 70-80px tall regardless of wrap width. The spinner and replay
-     overlays used inset:0 (full wrap height) and centered their content,
-     so on short wraps the centered icon/text landed on top of the controls
-     row instead of in the video area above it. This variable gives both
-     overlays a floor to stop at so they never draw over the controls. */
+  /* CSS custom property used by .lc-media-video, .lc-vp-spinner, .lc-vp-replay
+     to reserve space at the bottom for the controls bar. */
   --lc-vp-ctrl-h: 80px;
 }
-/* Clip the wrap's own background to its rounded corners without hiding children */
-.lc-media-video-wrap::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: #000;
-  border-radius: 10px;
-  z-index: 0;
-}
 .lc-media-video {
-  position: relative;
-  z-index: 1;
+  display: block;
   width: 100%;
-  /* FIX (video-cropped-by-controls bug): height:100% made the video fill the
-     whole wrap, so the opaque controls bar (position:absolute; bottom:0;
-     ~80px tall) sat ON TOP of the bottom of the picture, hiding/"cropping"
-     it. We now reserve that 80px so controls sit below the picture instead
-     of over it. This is safe from the earlier "mobile no-video bug" (where
-     calc(100% - 80px) went negative on very short slides) because the
-     min-height rules for video slides were later bumped to 160px+ (see
-     .lc-gallery-slide:has(.lc-media-video-wrap) below and the standalone
-     wrap's max-height:260px), which always leaves positive room. The extra
-     min-height floor below is a second safety net for any container that
-     still ends up shorter than that. */
+  /* Reserve the controls bar height at the bottom so the video picture
+     never gets hidden behind the overlay panel. calc() is safe here
+     because the wrap's min-height (140px) always leaves positive room. */
   height: calc(100% - var(--lc-vp-ctrl-h, 80px));
   min-height: 60px;
   max-width: 100%;
+  /* Top corners match the wrap; bottom corners are square because the
+     controls panel sits flush below the video without a gap. */
   border-radius: 10px 10px 0 0;
-  display: block;
-  /* contain within the aspect-ratio box; letterboxes portrait videos */
   object-fit: contain;
   object-position: center;
   background: #000;
 }
+
+/* VP-28: shown while a video has no poster/thumbnail (preload="none").
+   A subtle play-icon overlay prevents the wrap being a plain black box.
+   The ::after pseudo sits in the video area (above the controls bar).
+   JS removes .lc-media-video-wrap--no-poster once loadedmetadata fires. */
+.lc-media-video-wrap--no-poster::after {
+  content: '▶';
+  position: absolute;
+  top: calc(50% - var(--lc-vp-ctrl-h, 80px) / 2);
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 28px;
+  color: rgba(255, 255, 255, 0.45);
+  pointer-events: none;
+  z-index: 1;
+}
+
 .lc-file-card {
   display: flex;
   align-items: center;
@@ -1218,14 +1211,11 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   -webkit-appearance: auto;
 }
 /* VP-01: spinner is visible (display:flex) by default; JS adds .hidden to hide it.
-   The old pattern (display:none + --active class) conflicted with the JS that
-   toggles .hidden. Now JS does: spinner.classList.remove('hidden') to show,
-   spinner.classList.add('hidden') to hide. */
+   Positioned over the video-only area (above the controls bar) so the
+   spinner never covers the seek bar or buttons. */
 .lc-vp-spinner {
   display: flex;
   position: absolute;
-  /* FIX: was inset:0 (covered full wrap incl. controls); now stops above
-     the controls bar so the spinner centers over the visible video area. */
   top: 0;
   left: 0;
   right: 0;
@@ -1233,6 +1223,7 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   align-items: center;
   justify-content: center;
   pointer-events: none;
+  z-index: 2;
 }
 .lc-vp-spinner.hidden {
   display: none;
@@ -1249,13 +1240,12 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 @keyframes lcSpin { to { transform: rotate(360deg); } }
 
 /* ─── VP-17: Replay overlay ───────────────────────────────────────────────────
-   Shown when a video ends. Click → seeks to 0 and replays. */
+   Shown when a video ends. Click → seeks to 0 and replays.
+   Covers only the video area (top 0 → bottom: ctrl-h) so it never
+   overlaps the controls bar below it. border-radius is not needed because
+   the parent overflow:hidden already clips to rounded corners. */
 .lc-vp-replay {
   position: absolute;
-  /* FIX (controls/replay overlap): was inset:0, so the centered icon/text
-     landed on top of the controls bar on short wraps (see screenshot report).
-     Stopping above the controls bar keeps the replay prompt inside the
-     visible video area, never overlapping the controls underneath it. */
   top: 0;
   left: 0;
   right: 0;
@@ -1265,8 +1255,7 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   justify-content: center;
   background: rgba(0, 0, 0, 0.55);
   cursor: pointer;
-  z-index: 5;
-  border-radius: inherit;
+  z-index: 3;
 }
 .lc-vp-replay.hidden { display: none; }
 .lc-vp-replay__inner {
@@ -1295,7 +1284,10 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   aspect-ratio: unset;
 }
 .lc-media-video-wrap.lc-vp-in-fullscreen .lc-media-video {
-  /* In fullscreen the video fills the whole wrap; controls overlay at bottom */
+  /* In fullscreen the controls bar overlays the video (not below it),
+     so the video fills the full wrap height. The dark controls bg is
+     semi-transparent enough that the video shows behind it.
+     calc() subtraction is intentionally not used here. */
   height: 100%;
   border-radius: 0;
   object-fit: contain;
@@ -1776,22 +1768,22 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   min-height: 120px;
 }
 .lc-gallery-slide .lc-media-video-wrap {
-  position: absolute;
-  inset: 0;
+  /* Inside the slide the wrap is a normal block child — the slide's
+     min/max-height rules control overall size. We reset properties that
+     were inherited from the standalone-wrap rule. */
+  position: relative;
   width: 100%;
   height: 100%;
   max-height: none;
-  aspect-ratio: unset;   /* slide container already controls the shape */
+  min-height: inherit;
   border-radius: 0;
   margin-bottom: 0;
 }
 .lc-gallery-slide .lc-media-video-wrap .lc-media-video {
   width: 100%;
-  /* FIX (video-cropped-by-controls bug): see canonical .lc-media-video rule
-     above — height:100% let the controls bar overlay and hide the bottom of
-     the picture. Reserve space for it here too. The .lc-gallery-slide:has()
-     rule below already guarantees ≥160px for video slides, so this can't
-     go negative. */
+  /* Same formula as standalone: reserve controls height so video picture
+     is never hidden behind the controls panel. The :has() rule below
+     enforces a min-height of 160px on video slides so this can't go negative. */
   height: calc(100% - var(--lc-vp-ctrl-h, 80px));
   min-height: 60px;
   object-fit: contain;
@@ -1811,9 +1803,12 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   }
 }
 
-/* Gallery navigation arrows */
+/* Gallery navigation arrows — centered in the visible media area only.
+   For video slides the bottom var(--lc-vp-ctrl-h) is occupied by controls,
+   so we center in the space above that: top = 50% of (100% - ctrl-h). */
 .lc-gallery-nav {
   position: absolute;
+  /* Default: center in the full slide height (image slides have no ctrl bar) */
   top: 50%;
   transform: translateY(-50%);
   width: 28px;
@@ -1838,15 +1833,27 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 .lc-gallery-nav--prev { left: 6px; }
 .lc-gallery-nav--next { right: 6px; }
 
-/* Dot indicators */
+/* On video slides re-center the nav arrows in the video area only
+   (above the controls bar) by using a calc position. */
+.lc-gallery-slide:has(.lc-media-video-wrap) .lc-gallery-nav {
+  top: calc(50% - var(--lc-vp-ctrl-h, 80px) / 2);
+}
+
+/* Dot indicators — for image slides sit above the bottom edge.
+   For video slides offset upward by the controls bar height so
+   they remain in the visible media area and don't overlap controls. */
 .lc-gallery-dots {
   position: absolute;
-  bottom: 6px;
+  bottom: 10px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   gap: 4px;
   z-index: 3;
+}
+.lc-gallery-slide:has(.lc-media-video-wrap) ~ .lc-gallery-dots,
+.lc-media-gallery:has(.lc-media-video-wrap) .lc-gallery-dots {
+  bottom: calc(var(--lc-vp-ctrl-h, 80px) + 8px);
 }
 .lc-gallery-dot {
   width: 5px;
@@ -2455,3 +2462,48 @@ body.dark-mode .lc-vb-speed { background: var(--surface-2); }
     padding: 40px 0;
     font-size: 14px; color: #9ca3af;
 }
+/* ==========================================================================
+   LIVECHAT AUDIT FIX — Missing CSS classes (fix pass, July 2026)
+   All classes below are referenced in Livechat.js but were absent from CSS,
+   causing either broken styles or hidden elements.
+   ========================================================================== */
+
+/* ─── CSS-FIX-01: Video player mute icon toggles ────────────────────────── */
+/* JS calls  iconVol.style.display / iconMuted.style.display to toggle these.
+   No rule is needed for the toggle itself (it's inline-style driven), but we
+   set a sane default so the correct icon shows on first render before any
+   volumechange event fires. */
+.lc-vp-mute .icon-vol   { display: inline; }
+.lc-vp-mute .icon-muted { display: none;   }
+
+/* ─── CSS-FIX-02: Voice-bubble play/pause icon toggles ──────────────────── */
+/* JS sets style.display directly; these rules establish initial visibility
+   so the play icon shows and pause icon is hidden before the first interaction.
+   (The HTML also sets style="display:none" on .lc-vb-pause-icon inline, but
+   explicit CSS makes the intent self-documenting and survives innerHTML reuse.) */
+.lc-vb-play-icon  { display: block; }
+.lc-vb-pause-icon { display: none;  }
+
+/* ─── CSS-FIX-03: Voice-bubble elapsed time span ────────────────────────── */
+/* .lc-vb-elapsed is a <span> inside .lc-vb-time updated by JS (timeupdate).
+   No CSS rule needed — it fully inherits from .lc-vb-time. */
+
+/* ─── CSS-FIX-04: File-preview "new upload" item variant ────────────────── */
+/* Used in renderEditMediaPreviews() for freshly-added files, distinguished
+   from .lc-fp-item--existing (already-saved attachments).
+   Existing items are 85% opacity; new items are full opacity + a subtle
+   violet left-border to signal "pending upload". */
+.lc-fp-item--new {
+  opacity: 1;
+  border-left: 2px solid var(--signal-violet, #7c5cff);
+  padding-left: 8px;
+}
+
+/* ─── CSS-FIX-05: Fullscreen viewer zoom buttons ────────────────────────── */
+/* .lc-fv-zoom-in and .lc-fv-zoom-out are used as .querySelector() targets
+   and inherit all styles from .lc-fv-btn — no additional rules needed. */
+
+/* ─── CSS-FIX-06: Reply / React action button semantic aliases ───────────── */
+/* .lc-reply-btn and .lc-react-btn are .closest() targets in JS event
+   delegation. Both inherit all styles from .lc-action-btn — no additional
+   rules needed. Only .lc-report-btn and .lc-edit-btn have hover overrides. */

@@ -91,6 +91,8 @@ function relativeTime(timestamp) {
 
 // ─── In-memory post cache ─────────────────────────────────────────────────────
 const _postCache = new Map();
+// Expose cache setter so profile.js can populate it when rendering profile posts
+window.__postCacheSet = (id, post) => _postCache.set(id, post);
 
 // ─── Video Player ─────────────────────────────────────────────────────────────
 function initVideoPlayer(wrapper) {
@@ -931,6 +933,14 @@ function renderPost(post) {
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="${isSaved ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
                     <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
                 </svg>
+            </button>
+            <button class="action-btn share-btn" aria-label="Share post">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+                    <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                    <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+                </svg>
+                Share
             </button>
             <button class="action-btn ai-summarize-btn" aria-label="AI summary" title="AI summary">✦ Summary</button>
         </div>
@@ -1773,6 +1783,19 @@ export function setupPosts() {
     feed?.addEventListener('click', handleFeedClick);
     document.getElementById('bookmarked-posts-feed')?.addEventListener('click', handleFeedClick);
     document.getElementById('my-posts-feed')?.addEventListener('click', handleFeedClick);
+
+    // Register renderPost + handleFeedClick with profile.js so that
+    // user-profile-posts-feed gets fully working post cards.
+    window.__registerPostRenderer?.(renderPost, handleFeedClick);
+
+    // Also handle clicks on user-profile-posts-feed via delegation on document,
+    // since the feed is recreated each time a profile is visited.
+    document.addEventListener('click', (e) => {
+        const feed = document.getElementById('user-profile-posts-feed');
+        if (feed && feed.contains(e.target)) {
+            handleFeedClick(e);
+        }
+    });
 
     // Global report delegation
     document.addEventListener('click', (e) => {

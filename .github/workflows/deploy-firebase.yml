@@ -1,9 +1,5 @@
 name: Deploy to Firebase Hosting
 
-# Requires a repo secret named FIREBASE_SERVICE_ACCOUNT containing the JSON
-# key of a Firebase service account with the "Firebase Hosting Admin" role.
-# See README.md for setup steps.
-
 on:
   push:
     branches: ["main"]
@@ -15,6 +11,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Inject API key
+        run: sed -i "s|%%GEMINI_KEY%%|${{ secrets.GEMINI_API_KEY }}|g" index.html
 
       - name: Deploy to Firebase Hosting (live channel)
         uses: FirebaseExtended/action-hosting-deploy@v0
