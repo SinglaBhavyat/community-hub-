@@ -17,16 +17,7 @@ service cloud.firestore {
       return request.auth.token.email;
     }
 
-    // Collapsed to a single get() call.
-    // exists() + get() = 2 external reads — Firestore aggregation queries
-    // (count()) only allow 1 external read per rule evaluation, so the old
-    // pattern caused permission-denied on every RunAggregationQuery call
-    // from admin.js. A single get() returns null if the doc is missing, and
-    // null != 'admin', so the exists() guard is not needed.
     function isAdmin() {
-      // BUG FIX: get() on a missing document returns a resource with null data,
-      // which causes .data.role to throw a NullPointerException in Rules, producing
-      // permission-denied instead of false. Guard with an explicit null check first.
       let _doc = get(/databases/$(database)/documents/users/$(callerEmail()));
       return isSignedIn() && _doc != null && _doc.data.role == 'admin';
     }
@@ -39,27 +30,14 @@ service cloud.firestore {
     }
 
     // ── Global Live Chat ──────────────────────────────────────────────────
-    // All authenticated users can read and create messages.
-    // Users may only edit/delete their own messages (soft-delete via isDeleted
-    // flag; mediaUrl and text are nulled). Admins can hard-delete any message.
-    // Reactions (a map field) may be updated by any signed-in user.
     match /global_chat/{messageId} {
       allow read: if isSignedIn();
 
-      // FIX 1: operator-precedence bug — the original `||` between the two
-      // text checks made the entire `allow create` condition always-true for
-      // any signed-in user, because `text == null` is a top-level OR clause.
-      // Wrapping both alternatives in parentheses fixes the precedence so
-      // senderEmail and isDeleted are always enforced.
       allow create: if isSignedIn() &&
         request.resource.data.senderEmail == callerEmail() &&
         request.resource.data.isDeleted   == false &&
         (request.resource.data.text is string || request.resource.data.text == null);
 
-      // Own update: author may edit text/editedAt or soft-delete (isDeleted,
-      // mediaUrl, text set to null). Immutable fields are explicitly blocked.
-      // Reactions-only update: any signed-in user may toggle their reaction.
-      // Admins: unrestricted updates.
       allow update: if isSignedIn() && (
         (resource.data.senderEmail == callerEmail() &&
           !request.resource.data.diff(resource.data).affectedKeys()
@@ -68,40 +46,16 @@ service cloud.firestore {
         isAdmin()
       );
 
-      // FIX 2: hard deletes were blocked for the message author (only admins
-      // could delete). Live chat uses soft-delete (isDeleted flag), but a
-      // hard delete rule matching the author prevents Firestore from returning
-      // permission-denied if the client ever calls deleteDoc directly.
-      // Keeping hard-delete admin-only is the correct policy; soft-delete via
-      // updateDoc is the author path — no change needed, documented clearly.
       allow delete: if isAdmin();
     }
 
     // ── Global Presence ───────────────────────────────────────────────────
-    // Each user writes only their own presence document (keyed by email).
-    // Dots in email addresses are valid Firestore document IDs; no escaping
-    // needed at the rules level — callerEmail() is matched verbatim.
     match /global_presence/{userEmail} {
       allow read:  if isSignedIn();
       allow write: if isSignedIn() && callerEmail() == userEmail;
     }
 
     // ── Global Typing Indicators ──────────────────────────────────────────
-    // Document key is derived from the caller's email by typingDocKey() in JS:
-    //   email.replace(/[^a-zA-Z0-9]/g, c => 'x' + c.charCodeAt(0).toString(16).padStart(2,'0'))
-    //
-    // FIX-3: replaceAll() is NOT available in Firestore Rules despite being
-    // listed in some docs — the emulator rejects it. replace() only replaces
-    // the FIRST occurrence, so we cannot reconstruct the full key in Rules for
-    // emails with multiple dots/special chars.
-    //
-    // Solution: the typing collection is low-sensitivity ephemeral data (TTL
-    // ~5 s). We allow any signed-in user to write any key. The JS always
-    // derives the key deterministically from the caller's own email, so
-    // cross-user key pollution is only possible if a user deliberately crafts
-    // a collision — harmless since typing indicators auto-expire and carry no
-    // private data. Reads are also open to signed-in users (needed to show
-    // "X is typing…" to all participants).
     match /global_typing/{typingKey} {
       allow read:  if isSignedIn();
       allow write: if isSignedIn();
@@ -118,19 +72,12 @@ service cloud.firestore {
     }
 
     // ── Reports (moderation queue) ────────────────────────────────────────
-    // allow read covers get, list, AND count() aggregation queries.
     match /reports/{reportId} {
       allow read: if isAdmin();
 
-      // RP-02: Livechat.js submitReport() writes status:'pending' (lowercase).
-      // The old rule checked == 'Pending' (capital-P) causing every create to
-      // be denied with a silent permission error. Accept both casings so
-      // legacy reports (if any) also validate, but the canonical value is now
-      // lowercase 'pending' in the JS writer.
       allow create: if isSignedIn() &&
         request.resource.data.reporterEmail == callerEmail() &&
-        (request.resource.data.status == 'pending' ||
-         request.resource.data.status == 'Pending');
+        request.resource.data.status == 'pending';
 
       allow update, delete: if isAdmin();
     }
@@ -149,12 +96,9 @@ service cloud.firestore {
 
       allow delete: if isAdmin();
 
-      // ── Achievements subcollection ────────────────────────────────────
-      // Carried over from production rules — was missing from the live-chat
-      // output file (FIX 4: re-added).
       match /achievements/{achievementId} {
         allow read:  if isSignedIn();
-        allow write: if isSignedIn() && callerEmail() == userEmail;
+        allow write: if isAdmin();
       }
     }
 
@@ -166,7 +110,13 @@ service cloud.firestore {
       );
       allow create: if isSignedIn() &&
         request.resource.data.from == callerEmail();
-      allow update, delete: if isSignedIn() && (
+      allow update: if isSignedIn() && (
+        (resource.data.from == callerEmail() &&
+          !request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['from', 'to'])
+        ) || isAdmin()
+      );
+      allow delete: if isSignedIn() && (
         resource.data.from == callerEmail() || isAdmin()
       );
     }
@@ -178,53 +128,36 @@ service cloud.firestore {
     }
 
     // ── Media cleanup queue ───────────────────────────────────────────────
-    // When a message is deleted-for-everyone or its media is replaced, the
-    // client writes the old Cloudinary URL(s) here so a Cloud Function can
-    // call Cloudinary's authenticated destroy endpoint server-side.
-    // Only the message owner may create a cleanup record; only admins and
-    // Cloud Functions (via the Admin SDK, which bypasses rules) may delete.
     match /media_cleanup/{cleanupId} {
       allow create: if isSignedIn() &&
-        request.resource.data.requestedBy == callerEmail();
+        request.resource.data.requestedBy == callerEmail() &&
+        request.resource.data.keys().hasAll(['requestedBy', 'publicIds']) &&
+        request.resource.data.publicIds is list;
       allow read, delete: if isAdmin();
       allow update: if false;
     }
 
     // ── Platform settings ─────────────────────────────────────────────────
     match /platform_settings/{settingId} {
-      allow read: if true;
+      allow read: if isSignedIn();
       allow write: if isAdmin();
     }
 
     // ── Posts ─────────────────────────────────────────────────────────────
-    // Broadcast posts (isBroadcast == true) are admin-only writes.
-    // Regular users must not set isBroadcast, broadcastCategory,
-    // broadcastTitle, pinned, or status — those fields are reserved for the
-    // admin broadcast system. Non-owner reactions/votes may update upvotedBy
-    // and upvoteCount but cannot touch any broadcast or authorship fields.
     match /posts/{postId} {
       allow read: if isSignedIn();
 
       allow create: if isSignedIn() && (
-        // Admin path: can create any post including broadcasts (isBroadcast:true).
-        // authorEmail must still match the caller so broadcasts are attributable.
         (isAdmin() && request.resource.data.authorEmail == callerEmail()) ||
-        // Regular user path: must own the post and must NOT set any
-        // broadcast-reserved fields that could spoof a system announcement.
         (request.resource.data.authorEmail == callerEmail() &&
          !request.resource.data.keys().hasAny(
            ['isBroadcast', 'broadcastCategory', 'broadcastTitle']))
       );
 
       allow update: if isOwner(resource.data) || isAdmin() ||
-        // Non-owner signed-in users (e.g. voting, bookmarking) may update
-        // reaction/engagement fields but are blocked from touching content,
-        // authorship, or any broadcast control field.
         (isSignedIn() &&
-          !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['authorEmail', 'authorUid', 'content', 'title',
-                     'isBroadcast', 'broadcastCategory', 'broadcastTitle',
-                     'pinned', 'status']));
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['reactions', 'likes', 'likeCount', 'views', 'viewCount']));
 
       allow delete: if isOwner(resource.data) || isAdmin();
 
@@ -236,8 +169,8 @@ service cloud.firestore {
 
         allow update: if isOwner(resource.data) || isAdmin() ||
           (isSignedIn() &&
-            !request.resource.data.diff(resource.data).affectedKeys()
-              .hasAny(['authorEmail', 'authorUid', 'text', 'author']));
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['reactions', 'likes', 'likeCount']));
 
         allow delete: if isOwner(resource.data) || isAdmin();
       }
@@ -252,18 +185,15 @@ service cloud.firestore {
 
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
-          !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['authorEmail', 'authorUid', 'content', 'title']));
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['reactions', 'likes', 'likeCount', 'attendees', 'attendeeCount',
+                      'rsvps', 'pollVotes']));
 
       allow delete: if isOwner(resource.data) || isAdmin();
     }
 
     // ── Chats ─────────────────────────────────────────────────────────────
     match /chats/{chatId} {
-      // SECURITY FIX: removed `resource.data.type == 'group'` blanket read
-      // permission that allowed any signed-in user to read any group chat,
-      // exposing message previews and member lists to non-members.
-      // Now only members (or admins) may read a chat document.
       allow read: if isSignedIn() && (
         resource == null ||
         resource.data.members.hasAny([callerEmail()]) ||
@@ -271,77 +201,88 @@ service cloud.firestore {
       );
 
       allow create: if isSignedIn() &&
-        request.resource.data.members.hasAny([callerEmail()]);
+        request.resource.data.members.hasAny([callerEmail()]) &&
+        request.resource.data.members.size() <= 200;
 
       allow update: if isSignedIn() && (
-        // Admins: unrestricted.
         isAdmin() ||
-        // Members may update anything except admin-controlled fields.
+
         (resource.data.members.hasAny([callerEmail()]) &&
           !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['type', 'createdBy', 'admins', 'inviteCode'])) ||
-        // Non-members submitting a join request may only touch these two fields.
+            .hasAny(['type', 'createdBy', 'admins', 'inviteCode', 'members']) &&
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['lastRead']) ||
+            (resource.data.lastRead != null &&
+              request.resource.data.lastRead
+                .diff(resource.data.lastRead).affectedKeys()
+                .hasOnly([callerEmail()])
+            ) ||
+            (resource.data.lastRead == null &&
+              request.resource.data.lastRead.keys().hasOnly([callerEmail()])
+            )
+          ) &&
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['unreadCount']) ||
+            (resource.data.unreadCount != null &&
+              request.resource.data.unreadCount
+                .diff(resource.data.unreadCount).affectedKeys()
+                .hasOnly([callerEmail()])
+            ) ||
+            (resource.data.unreadCount == null &&
+              request.resource.data.unreadCount.keys().hasOnly([callerEmail()])
+            )
+          )
+        ) ||
+
         (resource.data.type == 'group' &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['pendingRequests', 'dismissedRequests']))
       );
 
       allow delete: if isSignedIn() && (
-        // BUG FIX: private chat delete was restricted to members only — admins
-        // could not remove a private chat that violated policy. Added isAdmin().
         resource.data.type == 'private'
           ? (resource.data.members.hasAny([callerEmail()]) || isAdmin())
-          : (resource.data.createdBy == callerEmail() || isAdmin())
+          : ((resource.data.keys().hasAll(['createdBy']) &&
+               resource.data.createdBy == callerEmail()) || isAdmin())
       );
 
       // ── Messages subcollection ─────────────────────────────────────────
       match /messages/{messageId} {
+        // Resolves membership with a single get() to avoid double-read cost
+        // and to stay within the 1-read limit for aggregation queries.
         function isChatMember() {
-          let chatRef = /databases/$(database)/documents/chats/$(chatId);
-          return exists(chatRef) &&
-                 get(chatRef).data.members.hasAny([callerEmail()]);
+          let _chat = get(/databases/$(database)/documents/chats/$(chatId));
+          return _chat != null && _chat.data.members.hasAny([callerEmail()]);
+        }
+
+        // Returns the parent chat document (used where we need both membership
+        // and other fields, avoiding a second get() call).
+        function getChatDoc() {
+          return get(/databases/$(database)/documents/chats/$(chatId));
         }
 
         allow read: if isSignedIn() && isChatMember();
 
+        // allow create: membership is resolved once via isChatMember().
+        // The non-member system-message branch calls getChatDoc() only when
+        // isChatMember() returned false, keeping total reads to 1 or 2.
         allow create: if isSignedIn() && (
-          (isChatMember() && (
-            request.resource.data.senderEmail == callerEmail() ||
-            request.resource.data.senderEmail == 'system'
-          )) ||
-          (!isChatMember() &&
-            exists(/databases/$(database)/documents/chats/$(chatId)) &&
-            get(/databases/$(database)/documents/chats/$(chatId)).data.type == 'group' &&
-            request.resource.data.senderEmail == 'system')
+          isChatMember()
+            ? (request.resource.data.senderEmail == callerEmail() ||
+               request.resource.data.senderEmail == 'system')
+            : (getChatDoc() != null &&
+               getChatDoc().data.type == 'group' &&
+               request.resource.data.senderEmail == 'system')
         );
 
         allow update: if isSignedIn() && (
-          // ── Admin: unrestricted ──────────────────────────────────────────
           isAdmin() ||
 
-          // ── Message owner: may edit text, replace media, soft-delete.
-          // Immutable fields (senderEmail, senderName, createdAt, replyTo,
-          // forwarded) are blocked so an owner cannot impersonate another
-          // sender or rewrite the message history.
-          // seenBy and deletedFor are member-controlled fields — the owner
-          // must not be able to forge read receipts or hide messages from
-          // specific members.
           (resource.data.senderEmail == callerEmail() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['senderEmail', 'senderName', 'createdAt',
                        'replyTo', 'forwarded', 'seenBy', 'deletedFor'])) ||
 
-          // ── Any chat member: may update only seenBy, deletedFor, reactions.
-          // Content-bearing and metadata fields remain locked so members
-          // cannot edit or delete each other's messages through this path.
-          // FIX #7: _deletedMediaUrls added to the blocked list — only the
-          // message owner (handled by the owner path above) may write this
-          // field. Without this guard any member could write arbitrary
-          // Cloudinary URLs to trigger server-side cleanup of assets they
-          // don't own, potentially deleting another user's media.
-          // Per-attachment actions (replace/delete) write to 'attachments'.
-          // Only the message owner may modify that field (owner path above).
-          // Lock it here so other members cannot remove or swap someone else's files.
           (isChatMember() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['text', 'imageUrl', 'voiceUrl', 'fileUrl',
@@ -358,23 +299,28 @@ service cloud.firestore {
 
       // ── Typing indicators subcollection ───────────────────────────────
       match /typing/{typingUserEmail} {
-        // FIX: exists() guard prevents throw when parent chat doc is missing.
-        allow read: if isSignedIn() &&
-          exists(/databases/$(database)/documents/chats/$(chatId)) &&
-          get(/databases/$(database)/documents/chats/$(chatId))
-            .data.members.hasAny([callerEmail()]);
+        function callerIsTypingMember() {
+          let _c = get(/databases/$(database)/documents/chats/$(chatId));
+          return _c != null && _c.data.members.hasAny([callerEmail()]);
+        }
 
-        allow write: if isSignedIn() && callerEmail() == typingUserEmail;
+        allow read:  if isSignedIn() && callerIsTypingMember();
+        allow write: if isSignedIn() &&
+                        callerEmail() == typingUserEmail &&
+                        callerIsTypingMember();
       }
 
       // ── Starred messages subcollection ────────────────────────────────
       match /starred/{starredUserEmail} {
-        allow read: if isSignedIn() && callerEmail() == starredUserEmail;
+        function callerIsStarredMember() {
+          let _c = get(/databases/$(database)/documents/chats/$(chatId));
+          return _c != null && _c.data.members.hasAny([callerEmail()]);
+        }
 
+        allow read:  if isSignedIn() && callerEmail() == starredUserEmail;
         allow write: if isSignedIn() &&
-          callerEmail() == starredUserEmail &&
-          get(/databases/$(database)/documents/chats/$(chatId))
-            .data.members.hasAny([callerEmail()]);
+                        callerEmail() == starredUserEmail &&
+                        callerIsStarredMember();
       }
     }
   }

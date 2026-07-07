@@ -842,9 +842,9 @@ function renderPost(post) {
     card.innerHTML = `
         <div class="post-header">
             <div class="post-author-info">
-                <div class="author-avatar" aria-hidden="true">${(post.author || 'A').charAt(0).toUpperCase()}</div>
+                <div class="author-avatar view-user-profile-btn" role="button" tabindex="0" title="View profile" data-user-email="${post.authorEmail || ''}">${(post.author || 'A').charAt(0).toUpperCase()}</div>
                 <div>
-                    <span class="post-author-name">${post.author || 'Anonymous'}</span>
+                    <span class="post-author-name view-user-profile-btn" role="button" tabindex="0" title="View profile" data-user-email="${post.authorEmail || ''}" style="cursor:pointer;">${post.author || 'Anonymous'}</span>
                     <div class="post-meta-row">
                         <span class="post-time" title="${new Date(post.timestamp).toLocaleString()}">${relativeTime(post.timestamp)}</span>
                         ${post.edited ? '<span class="post-edited-badge">edited</span>' : ''}

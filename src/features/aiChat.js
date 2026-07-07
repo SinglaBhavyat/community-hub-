@@ -119,7 +119,7 @@ function resolveApiKey() {
   // 2. window.__ECHO_API_KEY set anywhere before setupAiChat()
   // Note: import.meta.env is NOT used — this project has no Vite build step.
   //       The key is injected at runtime via setApiKey() in main.js.
-  const key = _configApiKey || window.__ECHO_API_KEY || '';
+  const key = _configApiKey || window.__ECHO_API_KEY || 'AQ.Ab8RN6Klhov6IgGsFx1iYHKaCOs6jUMrfWsJUSqAzottSOfe7g';
   if (!key) console.warn('[Echo] No Gemini API key found. Ensure setApiKey() is called in main.js before setupAiChat().');
   return key;
 }

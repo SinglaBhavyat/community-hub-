@@ -482,14 +482,32 @@
   max-height: 260px;
   background: #000;
   border-radius: 10px;
-  overflow: hidden;
+  /* FIXED: was overflow:hidden which clipped the absolutely-positioned controls
+     bar. Changed to overflow:visible so controls show, while the video itself
+     clips via border-radius on .lc-media-video. The spinner and replay overlays
+     use position:absolute within the wrap and are unaffected. */
+  overflow: visible;
   position: relative;
+  /* Ensure the wrap itself clips its own corners so the black bg stays rounded */
+  isolation: isolate;
+}
+/* Clip the wrap's own background to its rounded corners without hiding children */
+.lc-media-video-wrap::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: #000;
+  border-radius: 10px;
+  z-index: 0;
 }
 .lc-media-video {
+  position: relative;
+  z-index: 1;
   width: 100%;
-  height: 100%;
+  /* Fill all space above the controls bar — controls are 44px tall (6px pad×2 + 28px btn + 4px wrap) */
+  height: calc(100% - 80px);
   max-width: 100%;
-  border-radius: 10px;
+  border-radius: 10px 10px 0 0;
   display: block;
   /* contain within the aspect-ratio box; letterboxes portrait videos */
   object-fit: contain;
@@ -737,13 +755,20 @@
 /* ─── Input area ─────────────────────────────────────────────────────────── */
 .lc-input-area {
   display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  padding: 10px 12px;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
   background: var(--surface);
   border-top: 1px solid var(--edge);
   flex-shrink: 0;
   position: relative;
+}
+/* The normal input row — padding lives here so the recording panel can be full-width */
+#lc-input-area-inner {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 10px 12px;
 }
 .lc-input-icon-btn {
   width: 36px;
@@ -1047,14 +1072,44 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
    rows aren't clipped. Volume hides at 380px (already handled below); speed also
    hides at 320px to prevent invisible overflow on very narrow bubbles. */
 .lc-vp-controls {
+  /* Two-row layout:
+     Row 1: play | seek bar (flex:1) | time | mute
+     Row 2: volume (flex:1) | speed | pip | fullscreen | download
+     Achieved with flex-wrap + order + a ::before row-break pseudo between rows. */
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  background: rgba(0, 0, 0, 0.82);
   flex-wrap: wrap;
-  position: relative;
+  gap: 0;
+  row-gap: 0;
+  padding: 4px 8px 6px;
+  background: rgba(0, 0, 0, 0.88);
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  border-radius: 0 0 10px 10px;
+  box-sizing: border-box;
 }
+/* Row 1 items */
+.lc-vp-play        { order: 1; margin-right: 4px; }
+.lc-vp-progress-wrap { order: 2; flex: 1; min-width: 0; }
+.lc-vp-time        { order: 3; margin: 0 4px; }
+.lc-vp-mute        { order: 4; }
+/* Row break — pushes row-2 items onto a new line */
+.lc-vp-controls::after {
+  content: '';
+  display: block;
+  width: 100%;
+  order: 5;
+  height: 4px;
+}
+/* Row 2 items */
+.lc-vp-volume      { order: 6; flex: 1; min-width: 0; }
+.lc-vp-speed       { order: 7; margin-left: 4px; }
+.lc-vp-pip         { order: 8; margin-left: 4px; }
+.lc-vp-fs          { order: 9; margin-left: 4px; }
+.lc-vp-dl          { order: 10; margin-left: auto; padding-left: 4px; }
 .lc-vp-btn {
   width: 28px;
   height: 28px;
@@ -1122,9 +1177,10 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   min-width: 56px;
 }
 .lc-vp-volume {
-  width: 56px;
+  /* flex:1 from order rule stretches it; cap with max-width so it's not huge */
+  max-width: 80px;
   accent-color: var(--signal-violet);
-  flex-shrink: 0;
+  flex-shrink: 1;
 }
 @media (max-width: 380px) { .lc-vp-volume { display: none; } }
 /* VP-02: hide speed selector on very narrow viewports to prevent invisible overflow */
@@ -1135,9 +1191,12 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   background: rgba(255, 255, 255, 0.12);
   border: none;
   border-radius: 4px;
-  padding: 2px 4px;
+  padding: 3px 2px 3px 6px;
   cursor: pointer;
   flex-shrink: 0;
+  width: 52px;
+  appearance: auto;
+  -webkit-appearance: auto;
 }
 /* VP-01: spinner is visible (display:flex) by default; JS adds .hidden to hide it.
    The old pattern (display:none + --active class) conflicted with the JS that
@@ -1164,6 +1223,65 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   animation: lcSpin 0.7s linear infinite;
 }
 @keyframes lcSpin { to { transform: rotate(360deg); } }
+
+/* ─── VP-17: Replay overlay ───────────────────────────────────────────────────
+   Shown when a video ends. Click → seeks to 0 and replays. */
+.lc-vp-replay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+  z-index: 5;
+  border-radius: inherit;
+}
+.lc-vp-replay.hidden { display: none; }
+.lc-vp-replay__inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  color: #fff;
+  pointer-events: none;
+}
+.lc-vp-replay__inner svg { opacity: 0.9; }
+.lc-vp-replay__inner span {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  opacity: 0.9;
+}
+
+/* ─── VP-18/VP-19: Fullscreen state ──────────────────────────────────────────
+   When the video wrap is in fullscreen the controls must sit at the bottom and
+   the video must fill the screen. */
+.lc-media-video-wrap.lc-vp-in-fullscreen {
+  background: #000;
+  border-radius: 0;
+  max-height: 100vh;
+  aspect-ratio: unset;
+}
+.lc-media-video-wrap.lc-vp-in-fullscreen .lc-media-video {
+  /* In fullscreen the video fills the whole wrap; controls overlay at bottom */
+  height: 100%;
+  border-radius: 0;
+  object-fit: contain;
+}
+/* In fullscreen, controls stay absolute at the bottom — no change needed,
+   but ensure they show above the video with a stronger background */
+.lc-media-video-wrap.lc-vp-in-fullscreen .lc-vp-controls {
+  background: rgba(0, 0, 0, 0.9);
+}
+
+/* ─── VP-22: Landscape controls layout ───────────────────────────────────────
+   On landscape orientation the control bar gets a bit of extra breathing room. */
+.lc-vp-controls.lc-vp-controls--landscape {
+  padding: 8px 12px;
+  gap: 8px;
+}
+.lc-vp-controls.lc-vp-controls--landscape .lc-vp-volume { width: 72px; }
 
 /* ─── FEAT-B: Media Gallery Sidebar ─────────────────────────────────────────
    MR-05: the panel is appended to document.body, so it MUST use position:fixed.
@@ -1247,10 +1365,11 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 .lc-gallery-grid {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 12px;
+  padding: 12px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
-  gap: 8px;
+  /* 3 columns minimum; thumbnails large enough to actually see content */
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
   align-content: start;
 }
 .lc-gallery-item--empty {
@@ -1361,21 +1480,37 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 .lc-gallery-item--vid {
   aspect-ratio: 1;
   flex-direction: column;
+  background: #111;
 }
 .lc-gallery-item--vid video {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
+  /* preload="metadata" gives the browser enough to paint a first frame */
+  display: block;
 }
 .lc-gallery-item__overlay {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.35);
+  /* semi-transparent so the video thumbnail shows through */
+  background: rgba(0, 0, 0, 0.18);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 22px;
   color: #fff;
+  transition: background 0.15s;
+}
+.lc-gallery-item--vid:hover .lc-gallery-item__overlay {
+  background: rgba(0, 0, 0, 0.32);
+}
+.lc-gallery-item__overlay svg {
+  filter: drop-shadow(0 2px 6px rgba(0,0,0,0.5));
+  transition: transform 0.15s;
+}
+.lc-gallery-item--vid:hover .lc-gallery-item__overlay svg {
+  transform: scale(1.12);
 }
 .lc-gallery-item--doc {
   flex-direction: column;
@@ -1500,7 +1635,7 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 /* ─── FIX-VP: Video player button sub-types ──────────────────────────────── */
 /* .lc-vp-play, .lc-vp-mute, .lc-vp-pip, .lc-vp-fs, .lc-vp-dl all share
    .lc-vp-btn styles already defined; these are semantic aliases only. */
-.lc-vp-dl { margin-left: auto; }   /* push download to the right */
+/* .lc-vp-dl margin-left handled in controls layout above */
 
 /* ─── FIX-15: file-preview icon variants ─────────────────────────────────── */
 .lc-fp-icon--doc   { font-size: 20px; color: var(--signal-violet); }
@@ -1621,7 +1756,8 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 }
 .lc-gallery-slide .lc-media-video-wrap .lc-media-video {
   width: 100%;
-  height: 100%;
+  /* leave room for the absolutely-positioned controls bar (~44px) */
+  height: calc(100% - 80px);
   object-fit: contain;
   border-radius: 0;
 }
@@ -1866,4 +2002,413 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   .lc-fv-nav--prev { left: 8px; }
   .lc-fv-nav--next { right: 8px; }
   .lc-fv-img { max-width: 98vw; max-height: 80vh; }
+}
+/* ==========================================================================
+   VOICE NOTE — Recording UI + Audio Bubble  (v1)
+   All values use existing design-system tokens.
+   ========================================================================== */
+
+/* ─── Mic button (sits in .lc-input-area) ─────────────────────────────────── */
+.lc-vn-mic-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--edge);
+  background: var(--surface-2);
+  color: var(--ink-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all var(--t-fast);
+  position: relative;
+}
+.lc-vn-mic-btn svg { width: 18px; height: 18px; }
+.lc-vn-mic-btn:hover {
+  background: var(--tint-violet);
+  color: var(--signal-violet);
+  border-color: var(--tint-violet-border);
+}
+/* Recording state: mic button turns red */
+.lc-vn-mic-btn--recording {
+  background: var(--tint-danger, rgba(255,79,79,0.12));
+  color: var(--signal-danger, #ff4f4f);
+  border-color: var(--signal-danger, #ff4f4f);
+  animation: lcVnMicPulse 2s infinite;
+}
+@keyframes lcVnMicPulse {
+  0%,100% { box-shadow: 0 0 0 0 rgba(255,79,79,0.3); }
+  50%      { box-shadow: 0 0 0 6px rgba(255,79,79,0); }
+}
+
+/* ─── Recording panel (shown while recording, hidden otherwise) ────────────── */
+#lc-vn-panel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-top: 1px solid var(--edge);
+  flex-shrink: 0;
+  animation: lcVnPanelIn 0.22s var(--ease-spring, cubic-bezier(0.34,1.56,0.64,1));
+}
+@keyframes lcVnPanelIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+#lc-vn-panel.hidden { display: none; }
+
+/* Inner text/textarea row that gets hidden during recording */
+#lc-input-area-inner {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+#lc-input-area-inner.hidden { display: none; }
+
+/* ─── Recording timer ─────────────────────────────────────────────────────── */
+.lc-vn-timer {
+  font-family: var(--font-mono, 'SF Mono', ui-monospace, monospace);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  min-width: 36px;
+  flex-shrink: 0;
+  transition: color var(--t-fast);
+}
+.lc-vn-timer--warn { color: var(--signal-danger, #ff4f4f); }
+
+/* ─── Live waveform ───────────────────────────────────────────────────────── */
+.lc-vn-wave {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow: hidden;
+}
+.lc-vn-bar {
+  flex: 1;
+  min-width: 2px;
+  max-width: 5px;
+  background: var(--signal-violet, #7c5cff);
+  border-radius: 99px;
+  height: 20%;
+  transition: height 0.08s ease;
+  transform-origin: center;
+}
+/* Paused state: freeze bars with reduced opacity */
+.lc-vn-wave--paused .lc-vn-bar {
+  opacity: 0.5;
+  animation: none;
+}
+
+/* ─── Recording action buttons ────────────────────────────────────────────── */
+.lc-vn-action-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid var(--edge);
+  background: var(--surface-2);
+  color: var(--ink-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all var(--t-fast);
+}
+.lc-vn-action-btn svg { width: 16px; height: 16px; }
+.lc-vn-action-btn:hover { background: var(--tint-violet); color: var(--signal-violet); border-color: var(--tint-violet-border); }
+
+/* Cancel: red tint */
+.lc-vn-cancel-btn:hover {
+  background: var(--tint-danger, rgba(255,79,79,0.12));
+  color: var(--signal-danger, #ff4f4f);
+  border-color: var(--signal-danger, #ff4f4f);
+}
+
+/* Pause/resume: amber tint on paused state */
+.lc-vn-pause-btn--paused {
+  background: rgba(245,158,11,0.12);
+  color: var(--signal-amber, #f59e0b);
+  border-color: var(--signal-amber, #f59e0b);
+}
+
+/* Send voice: green / gradient */
+.lc-vn-send-btn {
+  background: var(--gradient-signal, linear-gradient(135deg,#7c5cff,#20d8e0));
+  color: #fff;
+  border: none;
+  box-shadow: 0 3px 10px rgba(124,92,255,0.35);
+}
+.lc-vn-send-btn:hover { transform: scale(1.06); box-shadow: 0 5px 16px rgba(124,92,255,0.5); }
+
+/* ─── Voice bubble ─────────────────────────────────────────────────────────── */
+.lc-voice-bubble {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: transparent;
+  min-width: 200px;
+  max-width: 280px;
+  width: 100%;
+}
+
+/* Own message: bubble styles already applied by .lc-msg-bubble--own */
+.lc-msg-bubble--own .lc-voice-bubble { min-width: 180px; }
+
+/* ─── Play / pause button ─────────────────────────────────────────────────── */
+.lc-vb-play-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: none;
+  background: var(--signal-violet, #7c5cff);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: transform var(--t-fast), background var(--t-fast);
+  box-shadow: 0 3px 10px rgba(124,92,255,0.35);
+}
+.lc-vb-play-btn:hover  { transform: scale(1.08); background: #6b4de6; }
+.lc-vb-play-btn:active { transform: scale(0.95); }
+.lc-vb-play-btn svg { width: 18px; height: 18px; }
+
+/* Own bubble: white play button */
+.lc-msg-bubble--own .lc-vb-play-btn {
+  background: rgba(255,255,255,0.25);
+  box-shadow: none;
+}
+.lc-msg-bubble--own .lc-vb-play-btn:hover { background: rgba(255,255,255,0.35); }
+.lc-voice-bubble.lc-vb--playing .lc-vb-play-btn { background: var(--signal-green, #2bd99f); }
+.lc-msg-bubble--own .lc-voice-bubble.lc-vb--playing .lc-vb-play-btn { background: rgba(255,255,255,0.4); }
+
+/* ─── Body: waveform + meta ────────────────────────────────────────────────── */
+.lc-vb-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ─── Waveform seek area ──────────────────────────────────────────────────── */
+.lc-vb-wave-seek {
+  position: relative;
+  height: 28px;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.lc-vb-bars {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  width: 100%;
+  pointer-events: none;
+}
+.lc-vb-bar {
+  flex: 1;
+  border-radius: 99px;
+  background: var(--ink-faint, rgba(0,0,0,0.18));
+  min-width: 2px;
+  max-width: 5px;
+  height: 40%; /* overridden inline by buildVoiceBubbleHTML */
+  transition: background 0.1s, height 0.08s;
+}
+.lc-vb-bar--played { background: var(--signal-violet, #7c5cff); }
+
+/* Own message bar colours */
+.lc-msg-bubble--own .lc-vb-bar { background: rgba(255,255,255,0.3); }
+.lc-msg-bubble--own .lc-vb-bar--played { background: rgba(255,255,255,0.9); }
+
+/* Seek progress overlay: absolutely positioned, semi-transparent */
+.lc-vb-progress-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  width: 0%;
+  background: transparent;
+  pointer-events: none;
+  transition: width 0.1s linear;
+}
+
+/* ─── Meta row: time + controls ───────────────────────────────────────────── */
+.lc-vb-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.lc-vb-time {
+  font-family: var(--font-mono, 'SF Mono', ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+.lc-msg-bubble--own .lc-vb-time { color: rgba(255,255,255,0.8); }
+
+.lc-vb-controls-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Speed selector */
+.lc-vb-speed {
+  font-size: 11px;
+  font-weight: 600;
+  background: transparent;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  color: var(--ink-dim);
+  cursor: pointer;
+  padding: 2px 4px;
+  outline: none;
+  transition: border-color var(--t-fast), color var(--t-fast);
+}
+.lc-vb-speed:hover { border-color: var(--signal-violet); color: var(--signal-violet); }
+.lc-msg-bubble--own .lc-vb-speed {
+  border-color: rgba(255,255,255,0.3);
+  color: rgba(255,255,255,0.8);
+}
+.lc-msg-bubble--own .lc-vb-speed option { background: var(--surface); color: var(--ink); }
+
+/* Download button */
+.lc-vb-dl-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: none;
+  color: var(--ink-faint);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: color var(--t-fast);
+  padding: 0;
+}
+.lc-vb-dl-btn:hover { color: var(--signal-violet); }
+.lc-vb-dl-btn svg { width: 14px; height: 14px; }
+.lc-msg-bubble--own .lc-vb-dl-btn { color: rgba(255,255,255,0.5); }
+.lc-msg-bubble--own .lc-vb-dl-btn:hover { color: #fff; }
+
+/* ─── Reply-bar voice note preview ────────────────────────────────────────── */
+.lc-reply-bar__preview { font-size: 13px; }
+
+/* ─── Dark mode overrides ─────────────────────────────────────────────────── */
+body.dark-mode .lc-vb-bar { background: rgba(255,255,255,0.15); }
+body.dark-mode .lc-vb-bar--played { background: var(--signal-violet, #7c5cff); }
+body.dark-mode .lc-vb-speed { background: var(--surface-2); }
+
+/* ─── Responsive: narrow screens ─────────────────────────────────────────── */
+@media (max-width: 400px) {
+  .lc-voice-bubble { min-width: 160px; max-width: 220px; }
+  .lc-vb-play-btn { width: 32px; height: 32px; }
+  .lc-vb-play-btn svg { width: 15px; height: 15px; }
+}
+
+.wa-sidebar-item {
+    position: relative;
+    overflow: hidden;
+    transition: transform .2s;
+}
+.wa-swipe-action {
+    position: absolute;
+    right: 0; top: 0; bottom: 0;
+    width: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #dc2626;
+    color: #fff;
+    font-size: 20px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .1s;
+    border-radius: 0 10px 10px 0;
+}
+
+
+.wa-pin-indicator {
+    font-size: 11px;
+    margin-left: 4px;
+    opacity: .7;
+}
+
+.wa-sidebar-preview--typing em {
+    color: #6366f1;
+    font-style: normal;
+    font-size: 12px;
+}
+
+
+.wa-ctx-menu {
+    user-select: none;
+}
+.wa-ctx-menu button:focus-visible {
+    outline: 2px solid #6366f1;
+    outline-offset: -2px;
+}
+
+
+.wa-list-empty,
+.wa-list-error {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 64px 16px;
+    text-align: center;
+    gap: 10px;
+}
+.wa-list-empty__icon,
+.wa-list-error__icon {
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    background: #f3f4f6;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+}
+.wa-list-error__icon { background: #fef2f2; }
+.wa-list-empty__title,
+.wa-list-error__title {
+    font-size: 14px; font-weight: 600; color: #374151;
+}
+.wa-list-empty__sub,
+.wa-list-error__sub {
+    font-size: 12px; color: #9ca3af; line-height: 1.5;
+}
+.wa-list-error__btn {
+    margin-top: 4px;
+    padding: 8px 20px;
+    border-radius: 8px;
+    background: #4f46e5;
+    color: #fff;
+    font-size: 12px; font-weight: 700;
+    border: none; cursor: pointer;
+    transition: background .15s;
+}
+.wa-list-error__btn:hover { background: #4338ca; }
+.wa-list-loading {
+    display: flex; justify-content: center;
+    padding: 40px 0;
+    font-size: 14px; color: #9ca3af;
 }

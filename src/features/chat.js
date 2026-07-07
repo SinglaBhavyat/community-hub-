@@ -9,13 +9,14 @@ import {
     serverTimestamp, getDocs, limit, where, deleteDoc, updateDoc,
     arrayUnion, arrayRemove, getDoc, writeBatch, runTransaction, increment
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+import { RecentChatsManager } from './RecentChatsManager.js';
 
 // ─────────────────────────────────────────────
 // MODULE-LEVEL STATE
 // ─────────────────────────────────────────────
 let chatSub              = null;
 let rootChatSub          = null;
-let recentChatsSub       = null;
+
 let presenceSub          = null;   // real-time presence (online/last-seen) listener
 let typingSub            = null;   // real-time typing indicator listener (private from presenceSub)
 let activeRoomId         = null;
@@ -42,9 +43,92 @@ let isRecording          = false;
 let recordingCancelled   = false;  // FIX: use flag instead of clearing audioChunks before stop fires
 let emojiPickerVisible   = false;
 // FIX Bug 9: removed forwardingMsgId — was never read; openForwardModal takes msgId as a direct parameter.
-let _totalUnread         = 0;   // FIX: track real total so _recomputeNavBadge doesn't parse DOM badges
-let _pendingReadRooms    = new Set(); // FIX: rooms where markRoomRead fired but server timestamp not yet resolved
-let _roomUnreadMap      = new Map(); // FIX BUG 5: per-room unread counts from last snapshot, used by markRoomRead
+
+// ── NOTIFICATION / UNREAD BADGE STATE ────────────────────────────────────────
+// Single source of truth for the entire notification indicator system.
+// All badge updates funnel through _unread.commit() — nothing writes to the
+// nav-dot or sidebar badges directly except the two render helpers below.
+//
+// Architecture summary (WhatsApp-grade):
+//   _unread.rooms  – Map<roomId, number>  authoritative per-room counter (set by snapshot)
+//   _unread.total  – number               sum of rooms (recomputed by _unread.commit)
+//   _unread.pending – Set<roomId>         rooms where markRoomRead fired but the
+//                                         serverTimestamp() write hasn't resolved yet;
+//                                         excluded from total so no badge flicker on open
+//
+// Lifecycle: reset on logout (resetUnreadState()), never on page nav.
+// Cross-device: server unreadCount field is authoritative; pending-set is device-local.
+// Memory: Map + Set with bounded keys (one per conversation the user is in).
+const _unread = Object.seal({
+    rooms:   new Map(),   // roomId → current unread count (from last Firestore snapshot)
+    total:   0,           // cached sum of all rooms (excludes pending-read rooms)
+    pending: new Set(),   // rooms where markRoomRead fired, waiting for server ACK
+    // RAF handle — ensures at most one DOM paint per animation frame
+    _raf:    null,
+});
+
+// Schedule one nav-badge DOM update per animation frame.
+// Idempotent: multiple calls before the frame fires coalesce into one paint.
+// NEVER call navDot.textContent / classList directly — always go through here.
+function _scheduleNavBadgePaint() {
+    if (_unread._raf) return; // already queued — latest _unread.total will be used
+    _unread._raf = requestAnimationFrame(() => {
+        _unread._raf = null;
+        const total  = currentUser ? _unread.total : 0;
+        const navDot = document.getElementById('chat-nav-indicator');
+        if (!navDot) return;
+        if (total <= 0) {
+            navDot.classList.add('hidden');
+            navDot.classList.remove('chat-nav-dot--count');
+            navDot.textContent = '';
+        } else {
+            navDot.classList.remove('hidden');
+            navDot.classList.add('chat-nav-dot--count');
+            navDot.textContent = total > 99 ? '99+' : String(total);
+        }
+    });
+}
+
+// Recompute _unread.total from _unread.rooms (excluding pending-read rooms)
+// then schedule one nav paint.  Called after any mutation to rooms or pending.
+function _recomputeNavBadge() {
+    let sum = 0;
+    for (const [roomId, count] of _unread.rooms) {
+        if (!_unread.pending.has(roomId)) sum += count;
+    }
+    _unread.total = Math.max(0, sum);
+    _scheduleNavBadgePaint();
+}
+
+// Clear a single sidebar item's badge classes without re-rendering the whole list.
+// Safe to call when the item is filtered out or not yet mounted — querySelectorAll
+// returns an empty NodeList in that case and the loop is a no-op.
+function _clearSidebarItemBadge(roomId) {
+    document.querySelectorAll('.wa-sidebar-item[data-email]').forEach(item => {
+        const itemRoomId = item.dataset.type === 'group'
+            ? item.dataset.email
+            : getPrivateRoomId(currentUser?.email || '', item.dataset.email);
+        if (itemRoomId !== roomId) return;
+        item.querySelector('.wa-badge[data-count]')?.remove();
+        item.querySelector('.wa-sidebar-name')?.classList.remove('wa-sidebar-name--unread');
+        item.querySelector('.wa-sidebar-time')?.classList.remove('wa-sidebar-time--unread');
+        item.querySelector('.wa-sidebar-preview')?.classList.remove('wa-sidebar-preview--unread');
+    });
+}
+
+// Full state reset — call on logout, user-switch, and teardownChat().
+// Does NOT cancel the nav-badge RAF (caller is responsible — see teardownChat).
+function resetUnreadState() {
+    _unread.rooms.clear();
+    _unread.pending.clear();
+    _unread.total = 0;
+    // Immediately hide the nav dot without waiting for next RAF
+    const navDot = document.getElementById('chat-nav-indicator');
+    if (navDot) { navDot.classList.add('hidden'); navDot.classList.remove('chat-nav-dot--count'); navDot.textContent = ''; }
+}
+
+// ── END NOTIFICATION STATE ────────────────────────────────────────────────────
+
 let _hbInterval          = null;   // heartbeat interval ref for cleanup
 let _activeAudio         = null;   // FIX: was window._waAudio — keep audio state at module scope
 let _cleanupDropdown     = null;   // FIX #5: module-scope instead of DOM property
@@ -331,9 +415,6 @@ function unsubscribeRoomListeners() {
     clearTypingState();
 }
 
-function unsubscribeRecent() {
-    recentChatsSub?.(); recentChatsSub = null;
-}
 
 function clearTypingState() {
     if (typingTimeout) { clearTimeout(typingTimeout); typingTimeout = null; }
@@ -366,13 +447,13 @@ function writeTypingStateThrottled(roomId, typing) {
 
 export function teardownChat() {
     unsubscribeRoomListeners();
-    unsubscribeRecent();
+    _rcm.teardown();
     stopRecording(true);
     typingSub?.();     typingSub   = null;
-    // FIX: cancel any pending nav-badge RAF so a stale count doesn't paint
-    // after logout (the frame would fire after _totalUnread is reset to 0,
-    // but before the DOM is updated — resulting in a momentary ghost badge).
-    if (_navBadgeRaf) { cancelAnimationFrame(_navBadgeRaf); _navBadgeRaf = null; }
+    // Cancel any pending nav-badge RAF so a stale count doesn't paint after
+    // logout (the frame would fire after resetUnreadState() has hidden the dot,
+    // potentially un-hiding it with a ghost total from a previous session).
+    if (_unread._raf) { cancelAnimationFrame(_unread._raf); _unread._raf = null; }
     if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
     // FIX BUG-DROPDOWN: remove the document-level click listener that closes the
     // header dropdown.  Previously teardownChat only nulled the reference without
@@ -392,12 +473,11 @@ export function teardownChat() {
     cachedUsersHTML   = null;
     cachedUsersData   = null;
     cachedUsersAt     = 0;
-    // FIX: reset unread counters and pending-read tracking so stale state from
-    // a previous authenticated user cannot bleed into the next session after
+    // Reset unread counters, pending-read tracking, and nav badge so stale state
+    // from a previous authenticated user cannot bleed into the next session after
     // sign-out / re-authentication or a fast user switch.
-    _totalUnread      = 0;
-    _pendingReadRooms.clear();
-    _roomUnreadMap.clear();
+    // resetUnreadState() also clears the nav dot immediately (no RAF dependency).
+    resetUnreadState();
     // FIX: clear message snapshot so previous user's messages never appear
     lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
     // FIX: clear seenBy tracking set so previous user's read receipts cannot
@@ -405,9 +485,7 @@ export function teardownChat() {
     // never reset on logout, meaning re-login saw all old keys as "submitted"
     // and silently skipped marking new messages as seen.
     _seenBySubmitted.clear();
-    // FIX: reset nav badge immediately so previous user's unread dot disappears
-    const navDot = document.getElementById('chat-nav-indicator');
-    if (navDot) { navDot.classList.add('hidden'); navDot.textContent = ''; }
+    // Note: nav badge is already cleared by resetUnreadState() above.
     // Remove injected hidden file inputs on teardown to prevent accumulation.
     // Also clear data-wired so re-login will re-attach the change listeners.
     document.querySelectorAll('[data-chat-input="true"]').forEach(el => el.remove());
@@ -3385,78 +3463,66 @@ function subscribeTypingIndicator(roomId, chatType) {
 }
 
 // ─────────────────────────────────────────────
-// MARK ROOM READ
+// MARK ROOM READ  (notification-system integration point)
 // ─────────────────────────────────────────────
+// Called whenever the user opens a conversation (openChatRoom) or explicitly
+// dismisses unread state.  Must be idempotent and race-condition free:
+//
+//   1. Optimistic UI: zero the room in _unread.rooms and clear its sidebar badge
+//      synchronously — the user sees 0 immediately regardless of network state.
+//   2. Pending-read guard: add to _unread.pending before the Firestore write so
+//      snapshot callbacks arriving while the write is in-flight don't restore the
+//      old count (the snapshot loop checks pending and skips those rooms).
+//   3. Server write: setDoc with merge writes lastRead + unreadCount=0 atomically.
+//      serverTimestamp() on lastRead ensures cross-device ordering is correct.
+//   4. ACK: on success, remove from pending — subsequent snapshots are now safe to
+//      use the server counter (which will be 0).
+//   5. Rollback: on failure (offline / permission-denied), remove from pending and
+//      re-run _recomputeNavBadge so the next snapshot delivery restores the badge.
+//      The server counter was never written, so the next snapshot will reflect the
+//      true (non-zero) count — no permanent inconsistency.
 function markRoomRead(roomId) {
-    if (!roomId || !currentUser?.email) return;
-    // Mark pending immediately so snapshot re-renders don't restore the badge
-    // before the serverTimestamp() resolves from null → real value.
-    _pendingReadRooms.add(roomId);
+    // Guard against both the local currentUser profile AND Firebase Auth being confirmed.
+    // currentUser (from store/db.js) is populated from a Firestore profile doc and can be
+    // truthy before Firebase Auth has propagated the JWT to Firestore's backend, causing
+    // Firestore rules' isSignedIn() (request.auth != null) to fail with permission-denied.
+    // auth.currentUser is only non-null once Firebase Auth has actually resolved the session,
+    // making it the correct gate for any Firestore write that relies on request.auth.
+    if (!roomId || !currentUser?.email || !auth.currentUser) return;
+
+    // ── Step 1: Optimistic clear ─────────────────────────────────────────────
+    // Zero the room's count before the async write.  This is the ONLY place that
+    // sets _unread.rooms to 0 for this room; the snapshot loop respects pending
+    // and will not restore it until the ACK removes the pending guard (step 4).
+    _unread.rooms.set(roomId, 0);
+    _clearSidebarItemBadge(roomId);
+
+    // ── Step 2: Pending guard ────────────────────────────────────────────────
+    _unread.pending.add(roomId);
+
+    // Recompute total now (excludes pending rooms) so nav badge drops instantly.
+    _recomputeNavBadge();
+
+    // ── Step 3 + 4 + 5: Server write with ACK / Rollback ────────────────────
     setDoc(doc(db, 'chats', roomId), {
         [`lastRead.${currentUser.email}`]: serverTimestamp(),
         [`unreadCount.${currentUser.email}`]: 0
-    }, { merge: true }).then(() => {
-        _pendingReadRooms.delete(roomId);
-    }).catch(err => {
-        // FIX ROLLBACK: if the Firestore write fails (e.g. permission denied or offline),
-        // remove the room from the pending set so the next snapshot can restore the
-        // correct unread count.  Also restore _totalUnread so the nav badge re-appears.
-        console.warn('[Chat] markRoomRead failed — rolling back badge:', err);
-        _pendingReadRooms.delete(roomId);
-        // Restore the count from the authoritative Map (set by the last snapshot).
-        // _roomUnreadMap already holds 0 because we zeroed it below; re-read from
-        // the snapshot is not possible here, so simply force a re-render — the next
-        // snapshot delivery will correct it automatically.
-        _recomputeNavBadge();
-    });
-
-    // FIX BUG 5: read cleared count from _roomUnreadMap (set by the snapshot)
-    // instead of scraping the DOM. The DOM may be filtered, hidden, or not yet
-    // rendered — making DOM-based clearedCount unreliable and leaving the nav
-    // badge non-zero even after the room is opened.
-    const clearedCount = _roomUnreadMap.get(roomId) || 0;
-    _roomUnreadMap.set(roomId, 0); // zero it immediately
-
-    // Also clear the visual badge in the DOM if the item is currently visible.
-    document.querySelectorAll(`.wa-sidebar-item[data-email]`).forEach(item => {
-        const itemRoomId = item.dataset.type === 'group'
-            ? item.dataset.email
-            : getPrivateRoomId(currentUser.email, item.dataset.email);
-        if (itemRoomId !== roomId) return;
-        item.querySelector('.wa-badge[data-count]')?.remove();
-        item.querySelector('.wa-sidebar-name')?.classList.remove('wa-sidebar-name--unread');
-        item.querySelector('.wa-sidebar-time')?.classList.remove('wa-sidebar-time--unread');
-        item.querySelector('.wa-sidebar-preview')?.classList.remove('wa-sidebar-preview--unread');
-    });
-
-    // Recompute the nav-level badge immediately (subtract this room's count)
-    _totalUnread = Math.max(0, _totalUnread - clearedCount);
-    _recomputeNavBadge();
-}
-// FIX DEBOUNCE: rapid snapshot bursts (reactions, seenBy updates) cause _recomputeNavBadge
-// to fire many times per second.  Debounce to one DOM write per animation frame.
-let _navBadgeRaf = null;
-function _recomputeNavBadge() {
-    if (_navBadgeRaf) return; // already scheduled — the pending frame will pick up latest _totalUnread
-    _navBadgeRaf = requestAnimationFrame(() => {
-        _navBadgeRaf = null;
-        // Use the module-level _totalUnread counter (kept in sync by loadRecentChats
-        // snapshot and decremented in markRoomRead) instead of re-summing DOM badges.
-        // If no authenticated user exists, force total to 0 so a signed-out state
-        // never shows a stale indicator from the previous session.
-        const total = currentUser ? _totalUnread : 0;
-        const navDot = document.getElementById('chat-nav-indicator');
-        if (!navDot) return;
-        if (total === 0) {
-            navDot.classList.add('hidden');
-            navDot.classList.remove('chat-nav-dot--count');
-            navDot.textContent = '';
-        } else {
-            navDot.classList.remove('hidden');
-            navDot.classList.toggle('chat-nav-dot--count', true);
-            navDot.textContent = total > 99 ? '99+' : String(total);
-        }
-    });
+    }, { merge: true })
+        .then(() => {
+            // ACK: write succeeded — safe for subsequent snapshots to use server counter.
+            _unread.pending.delete(roomId);
+            // No need to recompute: total is already correct (room contributes 0).
+        })
+        .catch(err => {
+            // Rollback: write failed (offline, permission-denied, etc.).
+            // Remove pending guard so the next snapshot can restore the true count.
+            console.warn('[Chat] markRoomRead write failed — rolling back optimistic badge:', err);
+            _unread.pending.delete(roomId);
+            // Force recompute; _unread.rooms still shows 0 for this room but the next
+            // snapshot delivery will overwrite it with the real server value and call
+            // _recomputeNavBadge again — converging to correct state automatically.
+            _recomputeNavBadge();
+        });
 }
 
 // FIX Bug 1: track message IDs for which we've already fired a seenBy write this
@@ -3773,197 +3839,44 @@ export function setupChat() {
     _hbInterval = setInterval(writeHeartbeat, 45000);
     window.addEventListener('beforeunload', () => {
         clearInterval(_hbInterval);
-        _hbInterval = null; // FIX #20: keep state consistent
-        // FIX: clear typing state on tab close so the indicator doesn't stay visible for TYPING_TTL_MS
+        _hbInterval = null;
         if (isCurrentlyTyping && activeRoomId) {
             writeTypingState(activeRoomId, false);
             isCurrentlyTyping = false;
         }
     }, { once: true });
 
+// ── Recent chats ────────────────────────────
+// (Constructed after openChatRoom is defined below so onOpenRoom is valid)
+
     // ── Recent chats ────────────────────────────
     // Track which user's recent-chats subscription is currently live.
-    let _recentSubOwner = null; // email of the user whose sub is active
-
-    const loadRecentChats = () => {
-        // Guard: currentUser is populated asynchronously from store/db.js.
-        // If it isn't ready yet we return false so the caller can retry.
-        if (!currentUser) return false;
-        // Guard: recentList may be null if setupChat() ran before the DOM was
-        // fully rendered (e.g. the chat page is lazily injected).
-        if (!recentList) return false;
-        // FIX BUG 1+4: skip re-subscribe if a live subscription already exists
-        // for THIS user — avoids blank-list flash on every page-chat visit.
-        // Only re-subscribe when: no sub exists, or it belongs to a different user.
-        const _ownerEmail = currentUser.email;
-        if (recentChatsSub && _recentSubOwner === _ownerEmail) return true;
-        _recentSubOwner = _ownerEmail;
-        unsubscribeRecent();
-
-        // FIX: if the composite index (members ARRAY_CONTAINS + lastUpdated DESC) isn't
-        // ready yet, Firestore returns a 'failed-precondition' / index-required error and
-        // kills the listener — the recent list goes blank permanently.
-        // Solution: try the ordered query first; on index error fall back to the simpler
-        // unordered query and sort client-side, so the list always works.
-        // Deploy firestore.indexes.json to build the index (takes ~1-2 min on first deploy).
-        const _buildRecentQuery = (withOrder) => withOrder
-            ? query(collection(db, 'chats'), where('members', 'array-contains', _ownerEmail), orderBy('lastUpdated', 'desc'))
-            : query(collection(db, 'chats'), where('members', 'array-contains', _ownerEmail));
-
-        const _attachRecentListener = (withOrder) => {
-            recentChatsSub?.();
-            recentChatsSub = onSnapshot(_buildRecentQuery(withOrder), snap => {
-            // FIX: discard snapshot if no user is signed in or if the user changed
-            // between when this listener was registered and when the snapshot arrived.
-            // Prevents "Unable to load chat list" ghost data from showing post-logout
-            // and cross-user leakage on fast account switches.
-            if (!currentUser || currentUser.email !== _ownerEmail) return;
-            const chats = [];
-            snap.forEach(d => chats.push({ id: d.id, ...d.data() }));
-            // Secondary client-side sort as a safety net (already ordered by server).
-            chats.sort((a, b) => (b.lastUpdated?.toMillis() || 0) - (a.lastUpdated?.toMillis() || 0));
-
-            if (!chats.length) {
-                recentList.innerHTML = `
-                    <div class="flex flex-col items-center justify-center py-16 px-4 text-center gap-3">
-                        <div class="w-14 h-14 rounded-full bg-gray-100 flex items-center justify-center text-2xl">💬</div>
-                        <p class="text-gray-700 text-sm font-medium">No conversations yet</p>
-                        <p class="text-gray-400 text-xs">Start one from the Contacts tab</p>
-                    </div>`;
-                // FIX BUG 3: reset _totalUnread and go through _recomputeNavBadge so
-                // the pill class and text are also cleared — not just the hidden class.
-                _totalUnread = 0;
-                _recomputeNavBadge();
-                return;
-            }
-
-            let html = '';
-            let totalUnread = 0;
-            chats.forEach(chat => {
-                const isGroup    = chat.type === 'group';
-                const email      = isGroup ? chat.id : (chat.members?.find(e => e !== currentUser.email) || '');
-                const name       = isGroup
-                    ? chat.name
-                    // Prefer an authoritative name lookup by email from the contacts cache.
-                    // The memberNames array uses display names as keys, which breaks silently
-                    // when two users share the same name — email is the stable identity.
-                    : (cachedUsersData?.find(u => u.email === email)?.name
-                        || chat.memberNames?.find(n => n && n !== currentUser.name)
-                        || email.split('@')[0]
-                        || 'Unknown');
-                const isBlocked  = chat.blockedBy?.length > 0;
-                const lastMessage = isBlocked ? '🔒 Chat Blocked' : (chat.lastMessage || 'New Chat');
-                const time        = formatRelativeTime(chat.lastUpdated);
-                const lastReadMs  = chat.lastRead?.[currentUser.email]?.toMillis?.() || 0;
-                const updatedMs   = chat.lastUpdated?.toMillis?.() || 0;
-                const isActiveRoom = chat.id === activeRoomId;
-                // FIX: also suppress badge for rooms where markRoomRead fired but the
-                // serverTimestamp() hasn't resolved yet (arrives as null → lastReadMs=0 → stale unread shown)
-                const isPendingRead = _pendingReadRooms.has(chat.id);
-                const unreadFromCounter = chat.unreadCount?.[currentUser.email];
-                // If the room is currently open (or pending read), clear any stale server counter
-                if ((isActiveRoom || isPendingRead) && typeof unreadFromCounter === 'number' && unreadFromCounter > 0) {
-                    setDoc(doc(db, 'chats', chat.id), {
-                        [`unreadCount.${currentUser.email}`]: 0
-                    }, { merge: true }).catch(() => {});
-                }
-                // FIX: also treat missing lastSenderEmail (new chat doc with no messages yet)
-                // as "no unread" — previously `undefined !== currentUser.email` was true,
-                // giving the opener a phantom unread badge on their own new chat.
-                // FIX CROSS-DEVICE SYNC: when the user is signed in on multiple devices/tabs,
-                // another device may have already cleared unreadCount to 0 via markRoomRead.
-                // We must honour the server-side unreadCount=0 even if lastRead hasn't resolved
-                // yet on this device (it will propagate in the next snapshot).
-                // Priority: active/pending-read room → explicit server counter → time-based heuristic.
-                const unread = (isActiveRoom || isPendingRead) ? 0
-                    : (typeof unreadFromCounter === 'number'
-                        ? Math.max(0, unreadFromCounter) // server counter is authoritative (cross-device)
-                        : (updatedMs > lastReadMs && chat.lastSenderEmail && chat.lastSenderEmail !== currentUser.email ? 1 : 0));
-                const online      = !isGroup && cachedUsersData?.find(u => u.email === email)
-                    ? isUserOnline(cachedUsersData.find(u => u.email === email).lastActive) : false;
-
-                // FIX: surface pending join requests to admins directly in the sidebar
-                // so they don't have to open the members panel to discover them.
-                // Show a "🔔 N requests" preview on the group's sidebar item when the
-                // current user is an admin and there are pending requests waiting.
-                const admins = isGroup ? (chat.admins || [chat.admin].filter(Boolean)) : [];
-                const isMeGroupAdmin = isGroup && admins.includes(currentUser.email);
-                const pendingCount = isMeGroupAdmin ? (chat.pendingRequests?.length || 0) : 0;
-                const effectiveLastMessage = (pendingCount > 0 && !isActiveRoom)
-                    ? `🔔 ${pendingCount} join request${pendingCount > 1 ? 's' : ''} pending`
-                    : lastMessage;
-                const effectiveUnread = pendingCount > 0 ? Math.max(unread, pendingCount) : unread;
-
-                html += createSidebarItemHTML({ id: chat.id, email, name, type: chat.type, lastMessage: effectiveLastMessage, time, unread: effectiveUnread, online, isActive: isActiveRoom });
-                // FIX BUG 5: record per-room unread in Map so markRoomRead can look up
-                // the count without parsing the DOM (DOM may be filtered/hidden/empty).
-                _roomUnreadMap.set(chat.id, effectiveUnread);
-                // Use effectiveUnread (not unread) so the module-level total stays in sync.
-                // FIX Bug 4: exclude pending-read rooms from the total so a racing snapshot
-                // (arriving before the serverTimestamp() resolves) doesn't re-add this room's
-                // count and cause the nav indicator to flicker back on after opening a chat.
-                if (!isActiveRoom && !isPendingRead) {
-                    totalUnread += effectiveUnread;
-                }
-            });
-            recentList.innerHTML = html;
-            // FIX: re-apply active search filter after sidebar re-render
-            _applyContactFilter();
-
-            // ── Nav indicator: show unread count badge ──
-            _totalUnread = totalUnread; // FIX: keep module-level total in sync with snapshot
-            _recomputeNavBadge(); // FIX Bug 5: centralise all nav-dot updates through
-            // _recomputeNavBadge so the explicit zero-reset (remove pill class, clear text)
-            // is always applied consistently — avoids the empty-pill flash on toggle.
-        }, err => {
-            // FIX: if Firestore rejects because the composite index doesn't exist yet,
-            // fall back to the unordered query and sort client-side. This is a one-time
-            // degraded mode; once the index builds, reload will use the fast path.
-            const isIndexError = err?.code === 'failed-precondition' ||
-                (err?.message || '').toLowerCase().includes('index');
-            if (withOrder && isIndexError) {
-                console.warn('[Chat] recent: composite index not ready, falling back to client-side sort. Deploy firestore.indexes.json to fix.');
-                _attachRecentListener(false); // retry without orderBy
-                return;
-            }
-            console.error('[Chat] recent:', err);
-            // FIX BUG-DEAD-SUB: On a permanent (non-index) Firestore error the SDK stops
-            // delivering snapshots and the listener is effectively dead.  If we leave
-            // recentChatsSub non-null and _recentSubOwner set, subsequent calls to
-            // loadRecentChats() will hit the early-return guard and never re-subscribe,
-            // leaving the sidebar frozen with stale data indefinitely.
-            // Clearing both variables lets the next loadRecentChats() call (triggered by
-            // the next page visit, auth change, or onPageVisit callback) re-establish the
-            // listener cleanly.
-            recentChatsSub  = null;
-            _recentSubOwner = null;
-            // FIX "Unable to load chat list": show inline error state in the sidebar
-            // so the user has a clear visual cue instead of just a transient toast
-            // that disappears. Also offer a retry button.
-            if (recentList && currentUser) {
-                recentList.innerHTML = `
-                    <div class="flex flex-col items-center justify-center py-16 px-4 text-center gap-3">
-                        <div class="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center text-2xl">⚠️</div>
-                        <p class="text-gray-700 text-sm font-semibold">Unable to load chat list</p>
-                        <p class="text-gray-400 text-xs leading-relaxed">Check your connection or try again</p>
-                        <button id="chat-list-retry-btn"
-                            class="mt-1 px-4 py-2 rounded-lg bg-indigo-600 text-white text-xs font-bold hover:bg-indigo-700 transition">
-                            Retry
-                        </button>
-                    </div>`;
-                document.getElementById('chat-list-retry-btn')?.addEventListener('click', () => {
-                    recentList.innerHTML = `<div class="flex justify-center py-10 text-sm text-gray-400">Reconnecting…</div>`;
-                    // Clear state so loadRecentChats re-subscribes
-                    recentChatsSub  = null;
-                    _recentSubOwner = null;
-                    setTimeout(() => loadRecentChats(), 300);
-                });
-            }
-            showToast('Lost connection to chat list.', 'error');
-        });
-        };
-        _attachRecentListener(true); // start with the indexed (ordered) query
-    };
+    // email of the user whose sub is active
+       // ── Recent chats manager ────────────────────
+    const _rcm = new RecentChatsManager({
+        db,
+        auth,
+        currentUser:        () => currentUser,
+        recentList,
+        sidebarSearchInput,
+        activeRoomId:       () => activeRoomId,
+        cachedUsersData:    () => cachedUsersData,
+        unread:             _unread,
+        recomputeNavBadge:  _recomputeNavBadge,
+        // onOpenRoom must be a zero-arg getter (() => fn) per RecentChatsManager's contract.
+        // The manager calls this._getOpenRoom()?.(email, name, chatType) — invoking _getOpenRoom()
+        // first to resolve the function reference, then calling it. Passing the function directly
+        // caused "this._getOpenRoom(...) is not a function" because the returned value (undefined
+        // from calling the actual fn with no args) was then invoked as if it were a function.
+        onOpenRoom:         () => (...args) => openChatRoom(...args),
+        sanitize,
+        avatarEl,
+        formatRelativeTime,
+        isUserOnline,
+        showToast,
+        showConfirm,
+    });
+    _rcm.start();
 
     // Gate ALL Firestore subscriptions behind Firebase Auth being confirmed.
     // The old retry-loop checked `currentUser` (a local store value) which can be
@@ -3990,12 +3903,12 @@ export function setupChat() {
             _unsubAuth(); // one-shot — stop listening after first resolution
             if (!firebaseUser) return; // not signed in; nothing to load
             // Now auth is confirmed — safe to open Firestore listeners.
-            if (loadRecentChats() === false) {
+            if (_rcm.refresh() === false) {
                 // DOM may not be ready yet (chat page lazily injected); retry briefly.
                 let _rcRetries = 0;
                 const _rcRetryId = setInterval(() => {
                     _rcRetries++;
-                    if (loadRecentChats() !== false || _rcRetries > 50) {
+                    if (_rcm.refresh() !== false || _rcRetries > 50) {
                         clearInterval(_rcRetryId);
                     }
                 }, 200);
@@ -4020,11 +3933,10 @@ export function setupChat() {
                     isCurrentlyTyping = false;
                 }
                 unsubscribeRoomListeners();
-                unsubscribeRecent();
-                _recentSubOwner   = null; // FIX BUG 2: clear owner so next sign-in re-subscribes
-                _totalUnread      = 0;
-                _pendingReadRooms.clear();
-                _roomUnreadMap.clear();
+                _rcm.teardown(); // resets _subOwner internally
+                // Reset all unread / notification state immediately on sign-out.
+                // resetUnreadState() hides the nav dot synchronously — no RAF dependency.
+                resetUnreadState();
                 lastMessagesSnapshot.splice(0, lastMessagesSnapshot.length);
                 _seenBySubmitted.clear(); // FIX: prevent cross-session read-receipt leakage
                 activeRoomId      = null;
@@ -4032,7 +3944,7 @@ export function setupChat() {
                 cachedUsersHTML   = null;
                 cachedUsersData   = null;
                 cachedUsersAt     = 0;
-                _recomputeNavBadge();
+                // Nav badge already cleared synchronously by resetUnreadState() above.
             } else {
                 // FIX BUG 2: on sign-in (including account switch), immediately start
                 // the recent-chats subscription so the nav badge updates even before
@@ -4041,7 +3953,7 @@ export function setupChat() {
                 let _signInRetries = 0;
                 const _signInRetryId = setInterval(() => {
                     _signInRetries++;
-                    if (loadRecentChats() !== false || _signInRetries > 30) {
+                    if (_rcm.refresh() !== false || _signInRetries > 30) {
                         clearInterval(_signInRetryId);
                     }
                 }, 200);
@@ -4049,7 +3961,7 @@ export function setupChat() {
         });
 
         // FIX: Use onPageVisit so recent chats are ALWAYS refreshed every time the
-        // user navigates to the Chat section — not only when recentChatsSub is null.
+        // user navigates to the Chat section — not only when no subscription is live.
         // The old click-listener only restarted the subscription if it had been torn
         // down, meaning stale data could linger indefinitely within a session.
         // onPageVisit fires for every visit (including subsequent ones), ensuring the
@@ -4057,7 +3969,7 @@ export function setupChat() {
         onPageVisit('page-chat', () => {
             if (!currentUser) return;
             // Always re-subscribe to guarantee the list is fresh for this user.
-            loadRecentChats();
+            _rcm.refresh();
 
             // MOBILE: when navigating to the chat page decide which panel to show.
             // _getChatWrapper() now returns #page-chat itself, so we check mobile
