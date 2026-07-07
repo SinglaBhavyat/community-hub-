@@ -12,8 +12,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Inject API key
-        run: sed -i "s|%%GEMINI_KEY%%|${{ secrets.GEMINI_API_KEY }}|g" index.html
+      - name: Inject API keys
+        run: |
+          sed -i "s|%%GEMINI_KEY%%|${{ secrets.GEMINI_API_KEY }}|g" index.html
+          sed -i "s|%%FIREBASE_API_KEY%%|${{ secrets.FIREBASE_API_KEY }}|g" src/config/firebase.js
+          sed -i "s|%%FIREBASE_SENDER_ID%%|${{ secrets.FIREBASE_SENDER_ID }}|g" src/config/firebase.js
+          sed -i "s|%%FIREBASE_APP_ID%%|${{ secrets.FIREBASE_APP_ID }}|g" src/config/firebase.js
 
       - name: Deploy to Firebase Hosting (live channel)
         uses: FirebaseExtended/action-hosting-deploy@v0

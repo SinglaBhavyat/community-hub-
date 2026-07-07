@@ -8,12 +8,12 @@ import { getStorage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-s
 // Find them in: Firebase Console → Project Settings → Your Apps → SDK setup.
 // NEVER commit real credentials to version control.
 const firebaseConfig = {
-   apiKey: "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA",
+   apiKey: "%%FIREBASE_API_KEY%%",
   authDomain: "community-45e72.firebaseapp.com",
   projectId: "community-45e72",
   storageBucket: "community-45e72.appspot.com",
-  messagingSenderId: "852110945704",
-  appId: "1:852110945704:web:920c59cc27c9493517c19d"
+  messagingSenderId: "%%FIREBASE_SENDER_ID%%",
+  appId: "%%FIREBASE_APP_ID%%"
 };
 
 const app = initializeApp(firebaseConfig);
