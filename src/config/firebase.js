@@ -7,12 +7,12 @@ const firebaseConfig = {
   apiKey:            "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA",
   authDomain:        "community-45e72.firebaseapp.com",
   projectId:         "community-45e72",
-  storageBucket:     "community-45e72.appspot.com",
+  storageBucket:     "community-45e72.firebasestorage.app",
   messagingSenderId: "852110945704",
-  appId:             "1:852110945704:web:920c59cc27c9493517c19d"
+  appId:             "1:852110945704:web:3eceb2e4f71fedfb17c19d"
 };
 
-const app = initializeApp(firebaseConfig);
+export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 export const db = getFirestore(app);
