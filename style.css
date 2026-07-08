@@ -1022,6 +1022,133 @@ main { animation: pageTransition 0.3s ease; }
 .upvote-btn:active { animation: votePulse 0.3s ease; }
 
 /* --------------------------------------------------------------------------
+   19b. HERO VIDEO ANIMATION
+   -------------------------------------------------------------------------- */
+
+/* Outer wrapper — controls spacing and entrance animation */
+.hero-video-wrapper {
+    width: 100%;
+    max-width: 860px;
+    margin: 0 auto 3rem;
+    padding: 0 1rem;
+}
+
+/* Frame — rounded border with signal-violet glow, clips the video */
+.hero-video-frame {
+    position: relative;
+    width: 100%;
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    border: 1.5px solid var(--tint-violet-border);
+    background: var(--surface-2);
+    box-shadow:
+        0 0 0 1px var(--edge),
+        var(--shadow-glow),
+        var(--shadow-lift);
+    animation: videoFramePulse 4s ease-in-out infinite alternate;
+}
+
+/* The video itself */
+.hero-video {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 480px;
+    object-fit: cover;
+    border-radius: 0;
+}
+
+/* Translucent gradient overlay for depth */
+.hero-video-glow {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background:
+        linear-gradient(to bottom,
+            rgba(124, 92, 255, 0.08) 0%,
+            transparent 30%,
+            transparent 70%,
+            rgba(32, 216, 224, 0.06) 100%
+        );
+}
+
+@keyframes videoFramePulse {
+    from { box-shadow: 0 0 0 1px var(--edge), 0 20px 50px -10px rgba(124, 92, 255, 0.25), var(--shadow-lift); }
+    to   { box-shadow: 0 0 0 1px var(--edge), 0 30px 70px -10px rgba(124, 92, 255, 0.45), var(--shadow-lift); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .hero-video-frame { animation: none; }
+}
+
+.card--video {
+    padding: 0;
+    overflow: hidden;
+}
+
+.card--video:hover {
+    transform: none;
+}
+
+/* Help card — video as background */
+.card--video-bg {
+    position: relative;
+    min-height: 320px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.help-card-video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: inherit;
+    z-index: 0;
+}
+
+.help-card-overlay {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    z-index: 1;
+    background: linear-gradient(
+        135deg,
+        rgba(10, 8, 30, 0.72) 0%,
+        rgba(32, 16, 80, 0.60) 50%,
+        rgba(10, 8, 30, 0.72) 100%
+    );
+}
+
+.help-card-content {
+    position: relative;
+    z-index: 2;
+    padding: 3rem 2rem;
+    text-align: center;
+    color: #fff;
+}
+
+.help-card-content h4 {
+    color: #fff;
+}
+
+@media (max-width: 768px) {
+    .card--video-bg {
+        min-height: 240px;
+    }
+    .help-card-content {
+        padding: 2rem 1.25rem;
+    }
+}
+
+@media (max-width: 768px) {
+    .hero-video { max-height: 220px; }
+}
+
+/* --------------------------------------------------------------------------
    20. RESPONSIVE
    -------------------------------------------------------------------------- */
 @media (max-width: 1024px) {
@@ -1030,6 +1157,7 @@ main { animation: pageTransition 0.3s ease; }
 
 @media (max-width: 768px) {
     .card, .post-card { padding: 1.5rem; }
+    .card.card--video { padding: 0; }
     #main-nav-links { grid-template-columns: 1fr 1fr !important; }
     .btn-primary, .btn-secondary { padding: 0.65rem 1.1rem; font-size: 0.9rem; }
     .eyebrow { font-size: 0.7rem; }

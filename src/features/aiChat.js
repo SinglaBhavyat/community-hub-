@@ -313,10 +313,10 @@ function injectStyles() {
     /* ── Light theme ── [FIX-BUG-19] */
     @media (prefers-color-scheme: light) {
       :root:not(.echo-theme-dark) {
-        --echo-bg-bubble-bot:     rgba(28, 28, 32, 0.95);
+        --echo-bg-bubble-bot:     #ffffff;
         --echo-bg-bubble-bot-h:   #f5f5f5;
-        --echo-border-bubble-bot: rgba(63, 63, 70, 0.55);
-        --echo-text-bubble-bot:   #e4e4e7;
+        --echo-border-bubble-bot: rgba(0, 0, 0, 0.1);
+        --echo-text-bubble-bot:   #111827;
         --echo-bg-code-block:     #f6f8fa;
         --echo-bg-code-header:    #eef0f2;
         --echo-border-code:       rgba(0,0,0,0.12);
@@ -352,10 +352,10 @@ function injectStyles() {
     }
 
     .echo-theme-light {
-      --echo-bg-bubble-bot:     rgba(28, 28, 32, 0.95);
+      --echo-bg-bubble-bot:     #ffffff;
       --echo-bg-bubble-bot-h:   #f5f5f5;
-      --echo-border-bubble-bot: rgba(63, 63, 70, 0.55);
-      --echo-text-bubble-bot:   #e4e4e7;
+      --echo-border-bubble-bot: rgba(0, 0, 0, 0.1);
+      --echo-text-bubble-bot:   #111827;
       --echo-bg-code-block:     #f6f8fa;
       --echo-bg-code-header:    #eef0f2;
       --echo-border-code:       rgba(0,0,0,0.12);

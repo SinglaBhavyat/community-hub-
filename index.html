@@ -632,12 +632,28 @@
         </section>
 
         <section id="page-help" class="page-section hidden py-20 px-4">
-            <div class="max-w-2xl mx-auto text-center">
+            <div class="max-w-3xl mx-auto text-center">
                 <h3 class="text-5xl font-bold mb-8">Need Help?</h3>
-                <div class="card">
-                    <h4 class="text-2xl font-bold mb-3">Chat with Echo AI</h4>
-                    <p class="text-gray-600 mb-6">Available 24/7 to help you out</p>
-                    <a href="#" data-target="page-ai-chat" class="btn-primary">Start Conversation</a>
+                <div class="card card--video card--video-bg mb-8">
+                    <!-- Background video -->
+                    <video
+                        class="help-card-video"
+                        src="./hero-animation.mp4"
+                        autoplay
+                        loop
+                        muted
+                        playsinline
+                        aria-hidden="true"
+                        preload="auto"
+                    ></video>
+                    <!-- Overlay for readability -->
+                    <div class="help-card-overlay" aria-hidden="true"></div>
+                    <!-- Content sits above the video -->
+                    <div class="help-card-content">
+                        <h4 class="text-2xl font-bold mb-3">Chat with Echo AI</h4>
+                        <p class="mb-6" style="color:rgba(255,255,255,0.75);">Available 24/7 to help you out</p>
+                        <a href="#" data-target="page-ai-chat" class="btn-primary">Start Conversation</a>
+                    </div>
                 </div>
             </div>
         </section>
