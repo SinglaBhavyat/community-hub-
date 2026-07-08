@@ -43,7 +43,7 @@ const REPLY_MAX     = 500;
 const REACTIONS     = ['👍', '❤️', '😂', '😮', '😢'];
 
 // Gemini API — swap out key or model as needed
-const API_KEY = 'YOUR_FIREBASE_API_KEY';
+const API_KEY = 'AQ.Ab8RN6I0q1nC9l96_uQ_nsGOrzJbeFjt0V9alaJ2mXoNPoGr9w';
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`;
 
 // ─── Module state ─────────────────────────────────────────────────────────────

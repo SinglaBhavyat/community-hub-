@@ -3,15 +3,13 @@ import { getAuth, GoogleAuthProvider } from "https://www.gstatic.com/firebasejs/
 import { getFirestore } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
 import { getStorage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
-const isLocal = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
-
 const firebaseConfig = {
-  apiKey:            isLocal ? "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA" : "%%FIREBASE_API_KEY%%",
+  apiKey:            "AIzaSyChCuuv9sv4IArEuIIjyQa-9CfzqCvZywA",
   authDomain:        "community-45e72.firebaseapp.com",
   projectId:         "community-45e72",
   storageBucket:     "community-45e72.appspot.com",
-  messagingSenderId: isLocal ? "852110945704" : "%%FIREBASE_SENDER_ID%%",
-  appId:             isLocal ? "1:852110945704:web:920c59cc27c9493517c19d" : "%%FIREBASE_APP_ID%%"
+  messagingSenderId: "852110945704",
+  appId:             "1:852110945704:web:920c59cc27c9493517c19d"
 };
 
 const app = initializeApp(firebaseConfig);
