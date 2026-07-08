@@ -115,9 +115,8 @@ export function setApiKey(key) {
 
 function resolveApiKey() {
   const key = _configApiKey
-    || localStorage.getItem('echo_gemini_api_key')
     || window.__GEMINI_KEY
-    || '';
+    || 'AQ.Ab8RN6Jx5AFXs_seMd4PR1ClcaEj36OLv7H6_36gM5PyAI3nrA';
   return key;
 }
 
