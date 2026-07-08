@@ -201,7 +201,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const savedKey = localStorage.getItem('echo_gemini_api_key');
             if (savedKey) setApiKey(savedKey);
             else if (window.__GEMINI_KEY) setApiKey(window.__GEMINI_KEY);
-            setupAiChat();
+            setupAiChat({ theme: 'dark' });
             setupAchievements();
             setupProfile();
             setupAdmin();
