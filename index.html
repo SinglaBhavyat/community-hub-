@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Community Hub</title>
+    <meta name="description" content="Community Hub — posts, lost &amp; found, messaging, study groups, and AI help, all in one place for your campus.">
+
+    <!-- Fonts: Space Grotesk for display headings, Inter for UI/body -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/browser-image-compression@2.0.1/dist/browser-image-compression.js"></script>
+
+    <link rel="stylesheet" href="./style.css">
+    <link rel="stylesheet" href="./Livechat.css">
+</head>
+<body class="bg-white">
+
+    <!-- Ambient backdrop: drifting aurora orbs + grain, purely decorative -->
+    <div id="ambient-bg" aria-hidden="true">
+        <div class="aurora-orb aurora-orb--one"></div>
+        <div class="aurora-orb aurora-orb--two"></div>
+        <div class="aurora-orb aurora-orb--three"></div>
+    </div>
+
+    <header id="header" class="fixed top-0 left-0 right-0 z-50 transition-all duration-300">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+            <div class="flex items-center justify-between">
+                <a href="#" data-target="page-home" class="flex items-center gap-3 no-underline">
+                    <div class="logo-box">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                    </div>
+                    <h1 class="hidden sm:flex items-center">Community<span class="brand-pulse" title="The community is active"></span></h1>
+                </a>
+
+                <div class="flex items-center gap-3 sm:gap-4">
+                    <div id="header-guest-view" class="flex items-center gap-2">
+                        <!-- Live Chat button (guest — redirects to sign-in) -->
+                        <button class="lc-open-btn lc-header-btn" title="Community Live Chat" aria-label="Open live chat">
+                            <svg class="lc-header-btn__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                            </svg>
+                            <span class="lc-header-btn__label">Live Chat</span>
+                            <span class="lc-header-badge hidden">0</span>
+                        </button>
+                        <button id="theme-toggle-btn" class="p-2 rounded-lg hover:bg-gray-100 transition-colors duration-300" title="Toggle Theme" aria-label="Toggle dark mode">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 015.646 5.646 9.001 9.001 0 0120.354 15.354z" />
+                            </svg>
+                        </button>
+                        <a href="#" data-target="page-login" class="btn-primary text-sm sm:text-base">Sign In</a>
+                    </div>
+
+                    <div id="header-auth-view" class="hidden items-center gap-3">
+                        <!-- Live Chat button (authenticated) -->
+                        <button class="lc-open-btn lc-header-btn" title="Community Live Chat" aria-label="Open live chat">
+                            <svg class="lc-header-btn__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                            </svg>
+                            <span class="lc-header-btn__label">Live Chat</span>
+                            <span class="lc-header-badge hidden">0</span>
+                        </button>
+                        <button id="theme-toggle-btn" class="p-2 rounded-lg hover:bg-gray-100 transition-colors duration-300" title="Toggle Theme" aria-label="Toggle dark mode">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 015.646 5.646 9.001 9.001 0 0120.354 15.354z" />
+                            </svg>
+                        </button>
+                        <div class="relative">
+                            <button id="profile-dropdown-btn" class="flex items-center gap-2 p-1 rounded-lg hover:bg-gray-100 transition-colors duration-300">
+                                <span id="header-user-name" class="font-semibold text-sm hidden sm:block"></span>
+                                <div id="header-avatar" class="w-9 h-9 rounded-lg text-sm"></div>
+                            </button>
+                            <div id="profile-dropdown-menu" class="options-dropdown hidden">
+                                <div class="px-4 py-3 border-b border-gray-200">
+                                    <p class="font-semibold text-sm" id="dropdown-user-name"></p>
+                                    <p class="text-xs text-gray-500" id="dropdown-user-email"></p>
+                                </div>
+                                <a href="#" data-target="page-profile" class="block px-4 py-2 text-sm hover:bg-gray-100 transition-colors">My Profile</a>
+                                <a href="#" data-target="page-my-posts" class="block px-4 py-2 text-sm hover:bg-gray-100 transition-colors">My Posts</a>
+                                <a href="#" data-target="page-bookmarked-posts" class="block px-4 py-2 text-sm hover:bg-gray-100 transition-colors">Bookmarked Posts</a>
+                                <a href="#" data-target="page-achievements" class="block px-4 py-2 text-sm hover:bg-gray-100 transition-colors">Achievements</a>
+                                <a href="#" data-target="page-admin" id="admin-panel-link" class="hidden flex items-center justify-between px-4 py-2 text-sm text-yellow-600 hover:bg-gray-100 transition-colors">Admin Panel<span id="admin-nav-indicator" class="hidden bg-red-500 text-white text-[10px] font-black px-1.5 py-0.5 rounded-full animate-pulse">0</span></a>
+                                <hr class="my-1 border-gray-200">
+                                <button id="switch-account-btn" class="block w-full text-left px-4 py-2 text-sm text-blue-600 hover:bg-gray-100 transition-colors">Switch Account</button>
+                                <button id="logout-btn" class="block w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-gray-100 transition-colors">Sign Out</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <nav id="secondary-navbar" class="hidden sticky top-[72px] z-40">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-center gap-8 h-16 overflow-x-auto" style="overflow: visible; overflow-x: auto; padding-top: 8px; padding-bottom: 8px;">
+                <a href="#" data-target="page-posts" class="nav-link whitespace-nowrap">Posts</a>
+                <a href="#" data-target="page-create" class="nav-link whitespace-nowrap">Create</a>
+                <a href="#" data-target="page-lost-found" class="nav-link whitespace-nowrap">Lost & Found</a>
+                <a href="#" data-target="page-chat" class="nav-link whitespace-nowrap">Messages<span id="chat-nav-indicator" class="chat-nav-dot hidden"></span></a>
+                <a href="#" data-target="page-help" class="nav-link whitespace-nowrap">Help</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="pt-20 relative z-10">
+
+        <section id="page-login" class="page-section hidden min-h-screen flex items-center justify-center py-20 px-4">
+            <div class="w-full max-w-md">
+                <div class="card">
+                    <div class="text-center mb-8 stagger-item" style="animation-delay: 0;">
+                        <div class="w-16 h-16 mx-auto mb-6 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center shadow-lg">
+                            <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                            </svg>
+                        </div>
+                        <h2 class="text-4xl font-bold mb-2">Welcome Back</h2>
+                        <p class="text-gray-500">Sign in to connect with your community</p>
+                    </div>
+                    <button type="button" id="google-login-btn" class="stagger-item w-full flex items-center justify-center gap-3 bg-white border border-gray-300 hover:bg-gray-50 text-gray-900 font-semibold py-3 px-4 rounded-lg transition-all duration-300 mb-4" style="animation-delay: 0.1s;">
+                        <svg class="w-5 h-5" viewBox="0 0 18 18">
+                            <path fill="#4285F4" d="M17.64 9.2045c0-.6381-.0573-1.2518-.1636-1.8409H9v3.4814h4.8436c-.2086 1.125-.8427 2.0782-1.7959 2.7164v2.2581h2.9087c1.7018-1.5668 2.6836-3.874 2.6836-6.615z"/>
+                            <path fill="#34A853" d="M9 18c2.43 0 4.4673-.8059 5.9564-2.1805l-2.9087-2.2581c-.8059.5409-1.8368.8605-3.0477.8605-2.3441 0-4.3286-1.5818-5.0364-3.7104H.9573v2.3318C2.4382 15.9832 5.4818 18 9 18z"/>
+                            <path fill="#FBBC05" d="M3.9636 10.71c-.18-.5341-.2823-1.1059-.2823-1.71s.1023-1.1759.2823-1.71V4.9582H.9573C.3477 6.1732 0 7.5477 0 9s.3477 2.8268.9573 4.0418L3.9636 10.71z"/>
+                            <path fill="#EA4335" d="M9 3.5795c1.3214 0 2.5077.4541 3.4405 1.346l2.5813-2.5814C13.4632.8918 11.426 0 9 0 5.4818 0 2.4382 2.0168.9573 4.9582L3.9636 7.29C4.6714 5.1614 6.6559 3.5795 9 3.5795z"/>
+                        </svg>
+                        Continue with Google
+                    </button>
+                    <p id="login-error" class="text-red-500 text-sm hidden text-center stagger-item" style="animation-delay: 0.2s;"></p>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-home" class="page-section hidden min-h-screen flex items-center justify-center py-32 px-4">
+            <div class="max-w-5xl mx-auto text-center w-full">
+                <span class="eyebrow mb-6 justify-center w-full stagger-item">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                    Built for your campus
+                </span>
+                <h2 class="hero-title text-5xl sm:text-6xl lg:text-7xl mb-6">
+                    Connect Your <span class="gradient-text">Community</span>
+                </h2>
+                <p class="hero-subtitle text-xl sm:text-2xl mx-auto mb-12 max-w-2xl">
+                    A modern platform for sharing posts, finding lost items, messaging neighbors, and getting support all in one place.
+                </p>
+                
+                <div id="main-nav-links" class="hidden grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-16">
+                    <a href="#" data-target="page-create" class="feature-card stagger-item">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                        </svg>
+                        <h3>Create</h3>
+                    </a>
+                    <a href="#" data-target="page-posts" class="feature-card stagger-item">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 20H5a2 2 0 01-2-2V6a2 2 0 012-2h10a2 2 0 012 2v1m2 13a2 2 0 01-2-2v-5.5a2 2 0 012-2h2.5" />
+                        </svg>
+                        <h3>Posts</h3>
+                    </a>
+                    <a href="#" data-target="page-lost-found" class="feature-card stagger-item">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <h3>Lost & Found</h3>
+                    </a>
+                    <a href="#" data-target="page-chat" class="feature-card stagger-item">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                        </svg>
+                        <h3>Messages</h3>
+                    </a>
+                    <a href="#" data-target="page-help" class="feature-card stagger-item">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <h3>Help</h3>
+                    </a>
+                </div>
+
+                <a href="#" data-target="page-posts" class="btn-primary hero-button inline-flex items-center gap-2 text-lg">
+                    Explore the Community
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                    </svg>
+                </a>
+            </div>
+        </section>
+
+        <section id="page-profile" class="page-section hidden py-20 px-4">
+            <div class="max-w-2xl mx-auto">
+                <h3 class="text-5xl font-bold mb-12">My Profile</h3>
+                <div class="card">
+                    <form id="profile-update-form" class="space-y-8">
+                        <div class="form-group">
+                            <label>Display Name</label>
+                            <input type="text" id="profile-update-name" required>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                            <div class="form-group">
+                                <label>Major / Program</label>
+                                <input type="text" id="profile-update-major" placeholder="e.g. Computer Science">
+                            </div>
+                            <div class="form-group">
+                                <label>Graduation Year</label>
+                                <input type="number" id="profile-update-year" placeholder="e.g. 2026">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Bio</label>
+                            <textarea id="profile-update-bio" rows="4" placeholder="Tell the community about yourself..."></textarea>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <p id="profile-update-success" class="text-green-500 text-sm hidden"></p>
+                            <button type="submit" class="btn-primary">Save Changes</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-user-profile" class="page-section hidden">
+            <!-- Dynamically populated by profile.js when a user avatar/name is clicked -->
+        </section>
+
+        <section id="page-my-posts" class="page-section hidden py-20 px-4">
+            <div class="max-w-3xl mx-auto">
+                <h3 class="text-5xl font-bold mb-12">My Posts</h3>
+                <div id="my-posts-feed" class="space-y-6"></div>
+            </div>
+        </section>
+
+        <section id="page-bookmarked-posts" class="page-section hidden py-20 px-4">
+            <div class="max-w-3xl mx-auto">
+                <h3 class="text-5xl font-bold mb-12">Bookmarked Posts</h3>
+                <div id="bookmarked-posts-feed" class="space-y-6"></div>
+            </div>
+        </section>
+
+        <section id="page-create" class="page-section hidden py-20 px-4">
+            <div class="max-w-2xl mx-auto">
+                <h3 class="text-5xl font-bold mb-12">Create New Post</h3>
+                <div class="card">
+                    <div class="flex gap-2 mb-12 p-1 bg-gray-200 rounded-lg">
+                        <button id="select-general-post" class="flex-1 py-3 px-4 text-sm font-semibold rounded-md bg-blue-500 text-white transition-all duration-300">General</button>
+                        <button id="select-event-post" class="flex-1 py-3 px-4 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors duration-300">Event</button>
+                        <button id="select-study-post" class="flex-1 py-3 px-4 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors duration-300">Study Group</button>
+                        <button id="select-lost-found" class="flex-1 py-3 px-4 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors duration-300">Lost & Found</button>
+                    </div>
+
+                    <div id="form-general-post">
+                        <form class="space-y-8">
+                            <div class="form-group">
+                                <label>Title</label>
+                                <input type="text" id="post-title" required>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                                <div class="form-group">
+                                    <label>Category</label>
+                                    <select id="post-category">
+                                        <option>General</option>
+                                        <option>Need Advice</option>
+                                        <option>Discussion</option>
+                                        <option>Recruitment</option>
+                                        <option>Achievements</option>
+                                        <option>Assisting</option>
+                                        <option>Advertisement</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Community</label>
+                                    <select id="post-community">
+                                        <option value="Global">Global</option>
+                                        <option value="APS">APS</option>
+                                        <option value="SOL">SOL</option>
+                                        <option value="SOM">SOM</option>
+                                        <option value="CSE">CSE</option>
+                                        <option value="Custom">Custom...</option>
+                                    </select>
+                                    <input type="text" id="post-community-custom" class="hidden mt-2" placeholder="Type custom channel name...">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Content (Include #hashtags)</label>
+                                <textarea id="post-content" rows="6" required placeholder="What's on your mind?"></textarea>
+                                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;">
+                                    <div id="post-tag-preview" style="display:flex;flex-wrap:wrap;gap:4px;"></div>
+                                    <span id="post-char-counter" style="font-size:12px;color:#9ca3af;flex-shrink:0;">0 / 5000</span>
+                                </div>
+                            </div>
+                            <button type="button" id="add-poll-btn" class="btn-secondary w-full">+ Create Poll</button>
+                            <div id="poll-creator-container" class="hidden p-4 border border-gray-300 rounded-lg bg-gray-50 space-y-4">
+                                <label class="block text-sm font-medium">Poll Options</label>
+                                <div id="poll-options-list" class="space-y-3">
+                                    <div class="poll-option-row" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                                        <input type="text" class="poll-option-input" placeholder="Option 1" maxlength="100" style="flex:1;padding:8px 12px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:14px;">
+                                    </div>
+                                    <div class="poll-option-row" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                                        <input type="text" class="poll-option-input" placeholder="Option 2" maxlength="100" style="flex:1;padding:8px 12px;border:1.5px solid #e5e7eb;border-radius:8px;font-size:14px;">
+                                    </div>
+                                </div>
+                                <button type="button" id="add-poll-option-btn" class="btn-secondary" style="font-size:13px;padding:6px 14px;">+ Add option</button>
+                            </div>
+                            <div class="form-group">
+                                <label>Media <span style="font-weight:400;color:#9ca3af;font-size:12px;">Images &amp; videos · up to 6 files</span></label>
+                                <div id="post-media-dropzone" class="post-media-dropzone">
+                                    <svg width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" style="color:#9ca3af;flex-shrink:0;">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+                                    </svg>
+                                    <div>
+                                        <p style="font-size:14px;color:#374151;margin:0 0 2px;">Drag &amp; drop here, or <label for="post-media-input" style="color:#6366f1;cursor:pointer;font-weight:500;text-decoration:underline;">browse</label></p>
+                                        <p style="font-size:12px;color:#9ca3af;margin:0;">Images (JPG, PNG, GIF, WebP) up to 10 MB · Videos (MP4, WebM, MOV) up to 50 MB</p>
+                                    </div>
+                                    <input id="post-media-input" type="file" accept="image/*,video/mp4,video/webm,video/quicktime" multiple style="display:none;">
+                                </div>
+                                <div id="post-media-preview" class="post-media-preview-grid" style="display:none;"></div>
+                            </div>
+                            <button type="submit" id="submit-post-btn" class="btn-primary w-full">Publish Post</button>
+                        </form>
+                    </div>
+
+                    <div id="form-study" class="hidden">
+                        <form class="space-y-8">
+                            <div class="form-group">
+                                <label>Course / Subject</label>
+                                <input type="text" id="study-course" required>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                                <div class="form-group">
+                                    <label>Date</label>
+                                    <input type="date" id="study-date" required>
+                                </div>
+                                <div class="form-group">
+                                    <label>Time</label>
+                                    <input type="time" id="study-time" required>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Location / Link</label>
+                                <input type="text" id="study-location" required>
+                            </div>
+                            <div class="form-group">
+                                <label>Description</label>
+                                <textarea id="study-content" rows="4" required></textarea>
+                            </div>
+                            <button type="submit" class="btn-primary w-full">Create Study Group</button>
+                        </form>
+                    </div>
+
+                    <div id="form-event" class="hidden">
+                        <form class="space-y-8">
+                            <div class="form-group">
+                                <label>Event Title</label>
+                                <input type="text" id="event-title" required placeholder="e.g. End-of-Semester Meetup">
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                                <div class="form-group">
+                                    <label>Date</label>
+                                    <input type="date" id="event-date" required>
+                                </div>
+                                <div class="form-group">
+                                    <label>Time</label>
+                                    <input type="time" id="event-time" required>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Location</label>
+                                <input type="text" id="event-location" required placeholder="Building, room, or online link">
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                                <div class="form-group">
+                                    <label>Community</label>
+                                    <select id="event-community">
+                                        <option value="Global">Global</option>
+                                        <option value="APS">APS</option>
+                                        <option value="SOL">SOL</option>
+                                        <option value="SOM">SOM</option>
+                                        <option value="CSE">CSE</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>Capacity <span style="font-weight:400;color:#9ca3af;font-size:12px;">optional</span></label>
+                                    <input type="number" id="event-capacity" min="1" placeholder="e.g. 50">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Description <span style="font-weight:400;color:#9ca3af;font-size:12px;">Include #hashtags</span></label>
+                                <textarea id="event-content" rows="4" required placeholder="What's the event about? Who should come?"></textarea>
+                                <div style="display:flex;justify-content:flex-end;margin-top:4px;">
+                                    <span id="event-content-counter" style="font-size:12px;color:#9ca3af;">0 / 1000</span>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Photos &amp; Videos <span style="font-weight:400;color:#9ca3af;font-size:12px;">Images &amp; videos · up to 6 files</span></label>
+                                <div id="event-media-dropzone" class="post-media-dropzone" style="cursor:pointer;">
+                                    <svg width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" style="color:#9ca3af;flex-shrink:0;">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+                                    </svg>
+                                    <div>
+                                        <p style="font-size:14px;color:#374151;margin:0 0 2px;">Drag &amp; drop here, or <label for="event-photo" style="color:#6366f1;cursor:pointer;font-weight:500;text-decoration:underline;">browse</label></p>
+                                        <p style="font-size:12px;color:#9ca3af;margin:0;">Images (JPG, PNG, GIF, WebP) up to 10 MB · Videos (MP4, WebM, MOV) up to 50 MB</p>
+                                    </div>
+                                    <input id="event-photo" type="file" accept="image/*,video/mp4,video/webm,video/quicktime" multiple style="display:none;">
+                                </div>
+                                <div id="event-media-preview" class="post-media-preview-grid" style="display:none;"></div>
+                            </div>
+                            <button type="submit" class="btn-primary w-full">Create Event</button>
+                        </form>
+                    </div>
+
+                    <div id="form-lost-found" class="hidden">
+                        <form class="space-y-8">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                                <div class="form-group">
+                                    <label>Item Name</label>
+                                    <input type="text" id="item-name" required placeholder="e.g. Blue water bottle">
+                                </div>
+                                <div class="form-group">
+                                    <label>Status</label>
+                                    <select id="item-status">
+                                        <option value="Lost">Lost</option>
+                                        <option value="Found">Found</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+                                <div class="form-group">
+                                    <label>Phone <span style="font-weight:400;color:#9ca3af;font-size:12px;">optional if email provided</span></label>
+                                    <input type="tel" id="item-contact-phone" placeholder="+1 555 000 0000">
+                                </div>
+                                <div class="form-group">
+                                    <label>Contact Email <span style="font-weight:400;color:#9ca3af;font-size:12px;">optional if phone provided</span></label>
+                                    <input type="email" id="item-contact-email" placeholder="you@example.com">
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Description</label>
+                                <textarea id="item-description" rows="4" placeholder="Describe the item — colour, size, where it was lost/found, any identifying marks…"></textarea>
+                            </div>
+                            <div class="form-group">
+                                <label>Photos &amp; Videos <span style="font-weight:400;color:#9ca3af;font-size:12px;">Images &amp; videos · up to 6 files</span></label>
+                                <div id="lf-media-dropzone" class="post-media-dropzone" style="cursor:pointer;">
+                                    <svg width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" style="color:#9ca3af;flex-shrink:0;">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+                                    </svg>
+                                    <div>
+                                        <p style="font-size:14px;color:#374151;margin:0 0 2px;">Drag &amp; drop here, or <label for="item-photo" style="color:#6366f1;cursor:pointer;font-weight:500;text-decoration:underline;">browse</label></p>
+                                        <p style="font-size:12px;color:#9ca3af;margin:0;">Images (JPG, PNG, GIF, WebP) up to 5 MB · Videos (MP4, WebM, MOV) up to 50 MB</p>
+                                    </div>
+                                    <input id="item-photo" type="file" accept="image/*,video/mp4,video/webm,video/quicktime" multiple style="display:none;">
+                                </div>
+                                <div id="lf-media-preview-grid" class="post-media-preview-grid" style="display:none;"></div>
+                            </div>
+                            <button type="submit" class="btn-primary w-full">Report Item</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-posts" class="page-section hidden py-20 px-4">
+            <div class="max-w-3xl mx-auto">
+                <div class="flex flex-col gap-4 mb-10">
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                        <h3 class="text-5xl font-bold">Community Feed</h3>
+                        <div class="flex flex-wrap gap-2">
+                            <button data-sort="timestamp" class="feed-sort-btn feed-sort-btn--active">🕒 Latest</button>
+                            <button data-sort="popular" class="feed-sort-btn">🔥 Top</button>
+                        </div>
+                    </div>
+                    <div class="flex flex-col sm:flex-row gap-3">
+                        <input type="text" id="keyword-search-input" class="flex-1" placeholder="🔍 Search posts…">
+                        <input type="text" id="hashtag-filter-input" class="flex-1 sm:flex-none sm:w-40" placeholder="#hashtag">
+                        <select id="community-filter-select" class="flex-1 sm:flex-none">
+                            <option value="all">🌐 All Channels</option>
+                            <option value="Global">Global</option>
+                            <option value="APS">APS</option>
+                            <option value="SOL">SOL</option>
+                            <option value="SOM">SOM</option>
+                            <option value="CSE">CSE</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="posts-feed"></div>
+                <div id="feed-end-sentinel" class="py-8 text-center text-gray-400 hidden">Loading more posts…</div>
+            </div>
+        </section>
+
+        <section id="page-comments" class="page-section hidden py-20 px-4">
+            <div class="max-w-3xl mx-auto">
+                <div class="mb-8 flex justify-between items-center">
+                    <a href="#" data-target="page-posts" class="text-blue-500 hover:text-blue-600 font-semibold flex items-center gap-2 transition-colors duration-300">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                        </svg>
+                        Back to Posts
+                    </a>
+                    <button id="ai-summarize-btn" class="hidden bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold py-2 px-4 rounded-lg items-center gap-2 transition-all duration-300">
+                        ✨ Summarize with AI
+                    </button>
+                </div>
+                <div id="ai-summary-output" class="hidden mb-6 p-4 bg-indigo-100 border border-indigo-300 rounded-lg">
+                    <p class="text-xs font-bold text-indigo-900 mb-2">AI Summary</p>
+                    <p id="ai-summary-text" class="text-sm text-indigo-800"></p>
+                </div>
+                <div id="comments-page-post-container" class="mb-12"></div>
+                <div class="mb-12">
+                    <h3 class="text-2xl font-bold mb-6">Add Comment</h3>
+                    <textarea class="comment-textarea w-full" rows="4" placeholder="Share your thoughts..."></textarea>
+                    <div class="text-right mt-4">
+                        <button class="submit-comment-btn btn-primary">Post Comment</button>
+                    </div>
+                </div>
+                <div class="border-t border-gray-200 pt-8">
+                    <h3 class="text-2xl font-bold mb-8">Comments</h3>
+                    <div id="comments-page-list" class="space-y-6"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-chat" class="page-section hidden py-20 px-4">
+            <div class="max-w-6xl mx-auto">
+                <div class="bg-white border border-gray-200 rounded-2xl h-[85vh] flex overflow-hidden shadow-xl">
+                    
+                    <div class="w-full sm:w-80 border-r border-gray-200 flex flex-col bg-gray-50">
+                        <div class="p-4 border-b border-gray-200 flex justify-between items-center">
+                            <h3 class="font-bold text-lg">Messages</h3>
+                            <div class="flex gap-1 bg-white rounded-lg p-1 border border-gray-200">
+                                <button id="btn-show-recent" class="p-2 text-blue-500 bg-blue-50 rounded-md transition-all duration-300" title="Recent">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01" />
+                                    </svg>
+                                </button>
+                                <button id="btn-show-users" class="p-2 text-gray-600 hover:text-gray-900 rounded-md transition-colors duration-300" title="New Chat">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                                    </svg>
+                                </button>
+                                <button id="btn-create-group" class="p-2 text-gray-600 hover:text-gray-900 rounded-md transition-colors duration-300" title="Group">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-2a6 6 0 0112 0v2z" />
+                                    </svg>
+                                </button>
+                                <button id="btn-join-group" class="p-2 text-gray-600 hover:text-gray-900 rounded-md transition-colors duration-300" title="Join group with invite code">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 010 5.656l-3 3a4 4 0 11-5.656-5.656l1.5-1.5M10.172 13.828a4 4 0 010-5.656l3-3a4 4 0 115.656 5.656l-1.5 1.5" />
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="px-3 pt-2 pb-1">
+                            <div class="wa-search-bar">
+                                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z"/>
+                                </svg>
+                                <input type="search" id="sidebar-search-input" placeholder="Search or start a new chat">
+                            </div>
+                        </div>
+
+                        <div class="flex-grow overflow-y-auto px-3 py-2 space-y-1" id="sidebar-lists-container">
+                            <div id="chat-recent-list" class="space-y-1"></div>
+                            <div id="chat-users-list" class="hidden space-y-1">
+                                <div class="px-2 py-2"><p class="text-xs text-blue-600 font-bold uppercase tracking-wide">Contacts</p></div>
+                                <div id="chat-users-list-content" class="space-y-1"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flex-1 flex flex-col bg-white" id="chat-window">
+                        <div id="chat-header" class="px-6 py-4 border-b border-gray-200 flex items-center gap-4">
+                            <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center">
+                                <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01" />
+                                </svg>
+                            </div>
+                            <div>
+                                <h5 class="font-bold">Select a Chat</h5>
+                                <p class="text-xs text-gray-500">Start messaging</p>
+                            </div>
+                        </div>
+                        
+                        <div id="chat-messages" class="flex-grow p-6 space-y-4 overflow-y-auto flex flex-col-reverse scroll-smooth"></div>
+                        
+                        <div class="p-4 bg-gray-50 border-t border-gray-200">
+                            <form id="chat-message-form" class="flex gap-2 bg-white border border-gray-200 rounded-lg p-2">
+                                <button type="button" id="chat-attachment-btn" class="text-gray-400 hover:text-blue-500 p-2 rounded transition-colors duration-300 flex-shrink-0" disabled>
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                                    </svg>
+                                </button>
+                                <input type="file" id="chat-attachment-input" accept="image/*" class="hidden">
+
+                                <div class="wa-input-wrap">
+                                    <button type="button" id="chat-emoji-btn" aria-label="Insert emoji">
+                                        <svg width="22" height="22" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <circle cx="12" cy="12" r="9" stroke-width="2"/>
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10h.01M15 10h.01M8.5 14.5a4 4 0 007 0"/>
+                                        </svg>
+                                    </button>
+                                    <textarea id="chat-message-input" rows="1" placeholder="Type a message..." disabled></textarea>
+                                </div>
+
+                                <button type="button" id="wa-mic-btn" aria-label="Record voice message" title="Record voice message">
+                                    <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/>
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 10v2a7 7 0 01-14 0v-2M12 19v3"/>
+                                    </svg>
+                                </button>
+
+                                <button type="submit" id="send-msg-btn" class="bg-blue-500 hover:bg-blue-600 text-white rounded p-2 disabled:opacity-50 transition-all duration-300 flex-shrink-0" disabled>
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                                    </svg>
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-lost-found" class="page-section hidden py-20 px-4">
+            <div class="max-w-5xl mx-auto">
+                <h3 class="text-5xl font-bold text-center mb-12">Lost & Found</h3>
+                <div id="lost-found-feed" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+            </div>
+        </section>
+
+        <section id="page-help" class="page-section hidden py-20 px-4">
+            <div class="max-w-2xl mx-auto text-center">
+                <h3 class="text-5xl font-bold mb-8">Need Help?</h3>
+                <div class="card">
+                    <h4 class="text-2xl font-bold mb-3">Chat with Echo AI</h4>
+                    <p class="text-gray-600 mb-6">Available 24/7 to help you out</p>
+                    <a href="#" data-target="page-ai-chat" class="btn-primary">Start Conversation</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-ai-chat" class="page-section hidden">
+            <div class="ai-chat-shell">
+                <!-- Header -->
+                <div class="ai-chat-header">
+                    <div class="ai-chat-header-left">
+                        <div class="ai-chat-avatar-wrap">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                            </svg>
+                        </div>
+                        <div>
+                            <h3 class="ai-chat-title">Echo AI</h3>
+                            <p class="ai-chat-subtitle">Powered by Gemini · Always available</p>
+                        </div>
+                    </div>
+                    <button id="ai-chat-clear-btn" class="ai-chat-clear-btn" title="Clear conversation" aria-label="Clear conversation">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                        </svg>
+                        Clear
+                    </button>
+                </div>
+
+                <!-- Messages -->
+                <div id="ai-chat-messages" class="ai-chat-messages"></div>
+
+                <!-- Footer: status + suggestions + stop injected here by JS -->
+                <div class="ai-chat-footer">
+                    <form id="ai-chat-form" class="ai-chat-form">
+                        <textarea id="ai-chat-input" class="ai-chat-input" placeholder="Message Echo…" rows="1" required></textarea>
+                        <button type="submit" class="ai-chat-send-btn" aria-label="Send message">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                            </svg>
+                        </button>
+                    </form>
+                    <p class="ai-chat-hint">Press Enter to send · Shift+Enter for new line</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="page-achievements" class="page-section hidden py-20 px-4">
+            <div class="max-w-5xl mx-auto">
+                <h3 class="text-5xl font-bold text-center mb-12">Achievements</h3>
+                <div id="achievements-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+            </div>
+        </section>
+
+        <section id="page-admin" class="page-section hidden py-20 px-4">
+            <div class="max-w-4xl mx-auto">
+                <h3 class="text-5xl font-bold mb-3">Admin Panel</h3>
+                <p class="text-gray-600 mb-12">Manage reported content and community</p>
+                <div id="admin-reported-content" class="space-y-4"></div>
+            </div>
+        </section>
+
+    </main>
+
+    <div id="report-modal" class="hidden fixed inset-0 z-[100] flex items-center justify-center px-4">
+        <div class="card max-w-md w-full">
+            <h3 class="text-xl font-bold mb-6">Report Content</h3>
+            <form id="report-form" class="space-y-6">
+                <input type="hidden" id="report-content-id" name="contentId">
+                <input type="hidden" id="report-content-type" name="contentType">
+                <div class="space-y-4">
+                    <label class="flex items-center gap-3 cursor-pointer hover:text-blue-500 transition-colors duration-300">
+                        <input type="radio" name="reason" value="Spam" checked>
+                        <span>Spam</span>
+                    </label>
+                    <label class="flex items-center gap-3 cursor-pointer hover:text-blue-500 transition-colors duration-300">
+                        <input type="radio" name="reason" value="Inappropriate">
+                        <span>Inappropriate</span>
+                    </label>
+                </div>
+                <div class="flex justify-end gap-3 pt-6 border-t border-gray-200">
+                    <button type="button" id="cancel-report-btn" class="btn-secondary">Cancel</button>
+                    <button type="submit" class="bg-red-500 hover:bg-red-600 text-white px-6 py-2 rounded-lg font-semibold transition-all duration-300">Report</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        (function() {
+            const STORAGE_KEY = 'nexus_theme';
+
+            const sunIcon  = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" /></svg>';
+            const moonIcon = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 015.646 5.646 9.001 9.001 0 0120.354 15.354z" /></svg>';
+
+            // Expose applyTheme globally so posts.js can call it instead of
+            // setting up its own conflicting listener (prevents double-toggle).
+            window.__applyTheme = function applyTheme(isDark) {
+                document.body.classList.toggle('dark-mode', isDark);
+                localStorage.setItem(STORAGE_KEY, isDark ? 'dark' : 'light');
+                const btn = document.getElementById('theme-toggle-btn');
+                if (btn) {
+                    btn.innerHTML = isDark ? sunIcon : moonIcon;
+                    btn.setAttribute('aria-pressed', String(isDark));
+                    // Sync hover style for dark bg
+                    if (isDark) {
+                        btn.classList.remove('hover:bg-gray-100');
+                        btn.classList.add('hover:bg-white/10');
+                    } else {
+                        btn.classList.add('hover:bg-gray-100');
+                        btn.classList.remove('hover:bg-white/10');
+                    }
+                }
+            };
+
+            // Apply saved preference or system default immediately (no flash)
+            const saved      = localStorage.getItem(STORAGE_KEY);
+            const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            window.__applyTheme(saved === 'dark' || (!saved && systemDark));
+
+            // Single authoritative click handler — uses capture so it runs
+            // before posts.js's delegated listener; posts.js checks for
+            // window.__applyTheme and defers to this one instead of toggling again.
+            document.addEventListener('click', function(e) {
+                const btn = e.target.closest('#theme-toggle-btn');
+                if (!btn) return;
+                e.stopPropagation();
+                const isDark = !document.body.classList.contains('dark-mode');
+                window.__applyTheme(isDark);
+                btn.classList.remove('spinning');
+                void btn.offsetWidth;
+                btn.classList.add('spinning');
+                setTimeout(() => btn.classList.remove('spinning'), 520);
+            }, true); // capture phase
+
+            // Keep in sync if another tab changes the theme
+            window.addEventListener('storage', function(e) {
+                if (e.key === STORAGE_KEY) {
+                    window.__applyTheme(e.newValue === 'dark');
+                }
+            });
+        })();
+
+        // Ensure Report Modal animates properly when shown
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach((m) => {
+                if(m.target.id === 'report-modal') {
+                    if(!m.target.classList.contains('hidden')) {
+                        setTimeout(() => { 
+                            m.target.classList.remove('opacity-0'); 
+                            if(m.target.firstElementChild) m.target.firstElementChild.classList.remove('scale-95'); 
+                        }, 10);
+                    } else {
+                        m.target.classList.add('opacity-0'); 
+                        if(m.target.firstElementChild) m.target.firstElementChild.classList.add('scale-95');
+                    }
+                }
+            });
+        });
+        const rModal = document.getElementById('report-modal');
+        if(rModal) observer.observe(rModal, { attributes: true, attributeFilter: ['class'] });
+    </script>
+    <!-- ═══════════════════════════════════════════════════════════
+         LIVE CHAT OVERLAY
+         ═══════════════════════════════════════════════════════════ -->
+    <div id="live-chat-overlay" class="lc-overlay lc-overlay--hidden" role="dialog" aria-modal="true" aria-label="Community Live Chat">
+
+        <!-- Backdrop -->
+        <div id="lc-backdrop" class="lc-backdrop"></div>
+
+        <!-- Panel -->
+        <aside id="lc-panel" class="lc-panel">
+
+            <!-- ── Header ─────────────────────────────────────── -->
+            <header class="lc-panel__header">
+                <div class="lc-panel__header-left">
+                    <div class="lc-panel__icon-wrap" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="lc-panel__title">Community Chat</h2>
+                        <div id="lc-online-count" class="lc-online-count">connecting…</div>
+                    </div>
+                </div>
+                <button id="lc-close-btn" class="lc-close-btn" aria-label="Close chat">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </header>
+
+            <!-- ── Gallery toggle (opens shared media panel) ── -->
+            <div class="lc-gallery-btn-wrap" style="display:flex;justify-content:flex-end;padding:4px 12px 0;">
+                <button id="lc-gallery-btn" class="lc-input-icon-btn" type="button"
+                        title="Shared media" aria-label="Open media gallery">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:18px;height:18px;">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                        <circle cx="8.5" cy="8.5" r="1.5"/>
+                        <polyline points="21 15 16 10 5 21"/>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- ── Load older messages ───────────────────────── -->
+            <div class="lc-load-more-wrap">
+                <button id="lc-load-more-btn" class="lc-load-more-btn">Load older messages</button>
+            </div>
+
+            <!-- ── Messages container ───────────────────────── -->
+            <div id="lc-messages-container" class="lc-messages-container" role="log" aria-live="polite" aria-relevant="additions">
+                <div id="lc-messages-list" class="lc-messages-list"></div>
+            </div>
+
+            <!-- ── "New Messages" scroll indicator ──────────── -->
+            <button id="lc-new-msgs-bar" class="lc-new-msgs-bar hidden" aria-live="polite">
+                ↓ New messages
+            </button>
+
+            <!-- ── Typing indicator bar ─────────────────────── -->
+            <div id="lc-typing-bar" class="lc-typing-bar hidden" aria-live="polite" aria-atomic="true">
+                <div class="lc-typing-dots">
+                    <span></span><span></span><span></span>
+                </div>
+                <span class="lc-typing-label">Someone is typing…</span>
+            </div>
+
+            <!-- ── Upload progress bar ──────────────────────── -->
+            <div id="lc-upload-bar" class="lc-upload-bar hidden">
+                <div id="lc-upload-fill" class="lc-upload-fill"></div>
+                <span id="lc-upload-label" class="lc-upload-label">Uploading…</span>
+            </div>
+
+            <!-- ── File preview ─────────────────────────────── -->
+            <div id="lc-file-preview" class="lc-file-preview hidden">
+                <div class="lc-fp-thumb"></div>
+                <div class="lc-fp-meta">
+                    <span class="lc-fp-name"></span>
+                    <span class="lc-fp-size"></span>
+                </div>
+                <button id="lc-fp-remove" class="lc-fp-remove" aria-label="Remove file">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- ── Reply preview bar ────────────────────────── -->
+            <div id="lc-reply-bar" class="lc-reply-bar hidden">
+                <div class="lc-reply-bar__accent"></div>
+                <div class="lc-reply-bar__body">
+                    <span class="lc-reply-bar__who"></span>
+                    <span class="lc-reply-bar__preview"></span>
+                </div>
+                <button id="lc-reply-cancel" class="lc-reply-bar__close" aria-label="Cancel reply">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- ── Edit indicator bar ───────────────────────── -->
+            <div id="lc-edit-bar" class="lc-edit-bar hidden">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="lc-edit-bar__icon">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                </svg>
+                <span class="lc-edit-label">Editing message</span>
+                <button id="lc-edit-cancel" class="lc-reply-bar__close" aria-label="Cancel edit">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- ── Input area ───────────────────────────────── -->
+            <div class="lc-input-area">
+                <input type="file" id="lc-file-input-el"
+                    accept="image/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.zip,.rar,.7z,.csv"
+                    class="lc-visually-hidden" tabindex="-1" aria-hidden="true">
+            
+                <!-- Recording panel — shown only when a voice note is being recorded -->
+                <div id="lc-vn-panel" class="hidden" role="region" aria-label="Voice recording">
+                    <!-- Cancel -->
+                    <button id="lc-vn-cancel-btn" class="lc-vn-action-btn lc-vn-cancel-btn"
+                            type="button" aria-label="Cancel recording" title="Cancel">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+                        </svg>
+                    </button>
+            
+                    <!-- Timer -->
+                    <span id="lc-vn-timer" class="lc-vn-timer">0:00</span>
+            
+                    <!-- Live waveform — 20 bars, heights driven by AudioAnalyser via JS -->
+                    <div id="lc-vn-wave" class="lc-vn-wave" aria-hidden="true">
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                        <div class="lc-vn-bar"></div><div class="lc-vn-bar"></div>
+                    </div>
+            
+                    <!-- Pause / Resume -->
+                    <button id="lc-vn-pause-btn" class="lc-vn-action-btn lc-vn-pause-btn"
+                            type="button" aria-label="Pause recording" title="Pause">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                        </svg>
+                    </button>
+            
+                    <!-- Send voice note -->
+                    <button id="lc-vn-send-btn" class="lc-vn-action-btn lc-vn-send-btn"
+                            type="button" aria-label="Send voice note" title="Send">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
+                        </svg>
+                    </button>
+                </div>
+            
+                <!-- Normal input row — hidden while recording -->
+                <div id="lc-input-area-inner">
+                    <!-- Attach file -->
+                    <button id="lc-attach-btn" class="lc-input-icon-btn" type="button"
+                            title="Attach file" aria-label="Attach file">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/>
+                        </svg>
+                    </button>
+            
+                    <!-- Mic / voice note -->
+                    <button id="lc-vn-mic-btn" class="lc-input-icon-btn lc-vn-mic-btn"
+                            type="button" title="Record voice note" aria-label="Record voice note">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/>
+                        </svg>
+                    </button>
+            
+                    <!-- Emoji -->
+                    <button id="lc-emoji-btn" class="lc-input-icon-btn" type="button"
+                            title="Emoji" aria-label="Insert emoji">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="9" stroke-width="2"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M9 10h.01M15 10h.01M8.5 14.5a4 4 0 007 0"/>
+                        </svg>
+                    </button>
+            
+                    <!-- Message textarea -->
+                    <textarea
+                        id="lc-input"
+                        class="lc-textarea"
+                        placeholder="Message everyone… (Shift+Enter for new line)"
+                        rows="1"
+                        maxlength="4000"
+                        aria-label="Chat message"
+                    ></textarea>
+            
+                    <!-- Send text message -->
+                    <button id="lc-send-btn" class="lc-send-btn" type="button" aria-label="Send message">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- ── Drag-and-drop overlay ─────────────────────── -->
+            <div id="lc-drag-overlay" class="lc-drag-overlay hidden" aria-hidden="true">
+                <div class="lc-drag-overlay__inner">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                    </svg>
+                    <p>Drop to share</p>
+                </div>
+            </div>
+
+        </aside>
+    </div>
+    <!-- /LIVE CHAT -->
+
+    <!-- Gemini API key injection — no build step, so the key is inlined here directly -->
+    <script>
+        window.__GEMINI_KEY = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' ? ['AQ.Ab8RN6I0q1nC9l96','_uQ_nsGOrzJbeFjt0V9alaJ2mXoNPoGr9w'].join('') : '%%GEMINI_KEY%%';
+    </script>
+    <script type="module" src="./src/main.js"></script>
+</body>
+</html>
