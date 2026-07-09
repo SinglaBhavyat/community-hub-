@@ -14,6 +14,9 @@ import {
     collection, onSnapshot, query, orderBy, limit, where,
     doc, updateDoc, arrayUnion, arrayRemove, deleteDoc,
     getDoc, getDocs, setDoc, serverTimestamp,
+    // BUG-FIX-UPVOTE: increment needed for atomic server-side counter updates.
+    // BUG-FIX-COMMENT-COUNT: writeBatch needed for atomic addDoc+countUpdate.
+    increment, writeBatch,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
 import { onPageVisit } from '../ui/navigation.js';
 
@@ -66,19 +69,22 @@ function debounce(fn, delay) {
     };
 }
 
-function readingTime(text = '') {
-    const words = text.trim().split(/\s+/).length;
-    const mins  = Math.ceil(words / 200);
-    return mins < 1 ? 'under 1 min read' : `${mins} min read`;
-}
-
 function extractTags(text = '') {
     const raw = text.match(/#[\w]+/g) || [];
     return [...new Set(raw.map(t => t.replace('#', '').toLowerCase()))];
 }
 
+// Convert a Firestore serverTimestamp (Timestamp object) or a plain ms number to milliseconds.
+// serverTimestamp() returns a Timestamp with .toMillis(); Date.now() returns a plain number.
+function toMs(ts) {
+    if (!ts) return 0;
+    if (typeof ts.toMillis === 'function') return ts.toMillis();
+    return Number(ts);
+}
+
 function relativeTime(timestamp) {
-    const diff = Date.now() - timestamp;
+    const ms   = toMs(timestamp);
+    const diff = Date.now() - ms;
     const m = Math.floor(diff / 60_000);
     const h = Math.floor(diff / 3_600_000);
     const d = Math.floor(diff / 86_400_000);
@@ -86,7 +92,7 @@ function relativeTime(timestamp) {
     if (m < 60) return `${m}m ago`;
     if (h < 24) return `${h}h ago`;
     if (d < 7)  return `${d}d ago`;
-    return new Date(timestamp).toLocaleDateString();
+    return new Date(ms).toLocaleDateString();
 }
 
 // ─── In-memory post cache ─────────────────────────────────────────────────────
@@ -244,14 +250,14 @@ function renderMediaItems(mediaItems) {
                 <div class="carousel-slide" data-index="${i}">
                     <div class="vid-wrapper">
                         <video src="${m.url}" preload="metadata" playsinline muted
-                               style="width:100%;height:100%;object-fit:cover;display:block;"></video>
+                               style="width:100%;object-fit:contain;display:block;"></video>
                     </div>
                 </div>`;
         }
         return `
             <div class="carousel-slide media-cell--image" data-index="${i}" data-media-type="image">
                 <img src="${m.url}" alt="Post image ${i+1}" loading="lazy" class="post-image"
-                     style="width:100%;height:100%;object-fit:cover;display:block;" />
+                     style="width:100%;object-fit:contain;display:block;" />
             </div>`;
     }).join('');
 
@@ -777,7 +783,7 @@ async function openEditModal(postId) {
                 content:    newContent,
                 tags:       newTags,
                 edited:     true,
-                editedAt:   Date.now(),
+                editedAt:   serverTimestamp(),
                 mediaItems: finalMediaItems,
                 imageSrc:   firstImage?.url || null,
             });
@@ -835,7 +841,12 @@ function renderPost(post) {
 
     const isVoted = currentUser && (post.upvotedBy || []).includes(currentUser.email);
     const isSaved = currentUser && (currentUser.savedPosts || []).includes(post.id);
-    const upvotes = post.upvotedBy?.length || 0;
+    // BUG-FIX-DISPLAY: use upvoteCount (the server-maintained integer) for the
+    // displayed number so it matches the value used for 'popular' sort ordering.
+    // The old code used upvotedBy.length, which diverges from upvoteCount when
+    // concurrent writes update the counter atomically but the array snapshot lags,
+    // or when upvoteCount was written with a stale DOM value (see upvote handler fix).
+    const upvotes = post.upvoteCount ?? post.upvotedBy?.length ?? 0;
 
     const mediaItems = post.mediaItems?.length
         ? post.mediaItems
@@ -848,13 +859,13 @@ function renderPost(post) {
                 <div>
                     <span class="post-author-name view-user-profile-btn" role="button" tabindex="0" title="View profile" data-user-email="${post.authorEmail || ''}" style="cursor:pointer;">${post.author || 'Anonymous'}</span>
                     <div class="post-meta-row">
-                        <span class="post-time" title="${new Date(post.timestamp).toLocaleString()}">${relativeTime(post.timestamp)}</span>
-                        ${post.edited ? '<span class="post-edited-badge">edited</span>' : ''}
+                        <span class="post-time" data-timestamp="${toMs(post.timestamp)}" title="Created: ${new Date(toMs(post.timestamp)).toLocaleString()}">${relativeTime(post.timestamp)}</span>
+                        <span class="post-created-date">· ${new Date(toMs(post.timestamp)).toLocaleDateString(undefined, { day:'numeric', month:'short', year:'numeric' })}</span>
+                        ${post.edited && post.editedAt ? `<span class="post-edited-badge" title="Edited: ${new Date(toMs(post.editedAt)).toLocaleString()}">edited · ${new Date(toMs(post.editedAt)).toLocaleDateString(undefined, { day:'numeric', month:'short', year:'numeric' })}, ${new Date(toMs(post.editedAt)).toLocaleTimeString(undefined, { hour:'2-digit', minute:'2-digit' })}</span>` : post.edited ? '<span class="post-edited-badge">edited</span>' : ''}
                         <span class="post-separator"></span>
                         <span class="post-community-chip">${post.community || 'Global'}</span>
                         ${post.category ? `<span class="post-separator"></span><span class="post-category-chip">${post.category}</span>` : ''}
-                        <span class="post-separator"></span>
-                        <span class="post-reading-time">${readingTime(post.content)}</span>
+
                     </div>
                 </div>
             </div>
@@ -1056,13 +1067,11 @@ function _injectThemeToggle() {
         // Re-apply current state so the icon is correct for the loaded theme.
         window.__applyTheme(document.body.classList.contains('dark-mode'));
     } else {
-        // Fallback: index.html script hasn't run yet (unusual) — apply from storage.
-        const STORAGE_KEY = 'nexus_theme';
-        const saved      = localStorage.getItem(STORAGE_KEY);
+        // Fallback: index.html script hasn't run yet (unusual) — apply from system preference.
+        // NOTE: No localStorage used here — theme persistence is handled by index.html only.
         const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const isDark     = saved === 'dark' || (!saved && systemDark);
+        const isDark     = document.body.classList.contains('dark-mode') || systemDark;
         document.body.classList.toggle('dark-mode', isDark);
-        localStorage.setItem(STORAGE_KEY, isDark ? 'dark' : 'light');
         const btn = document.getElementById('theme-toggle-btn');
         if (btn) {
             const sunSVG  = `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/></svg>`;
@@ -1073,7 +1082,6 @@ function _injectThemeToggle() {
                 if (e.target.closest('#theme-toggle-btn')) {
                     const next = !document.body.classList.contains('dark-mode');
                     document.body.classList.toggle('dark-mode', next);
-                    localStorage.setItem(STORAGE_KEY, next ? 'dark' : 'light');
                     btn.innerHTML = next ? sunSVG : moonSVG;
                 }
             }, { capture: true });
@@ -1122,14 +1130,19 @@ export function setupPosts() {
 
     document.querySelectorAll('[data-sort]').forEach(btn => {
         btn.addEventListener('click', () => {
-            document.querySelectorAll('[data-sort]').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
+            document.querySelectorAll('[data-sort]').forEach(b => {
+                b.classList.remove('active', 'feed-sort-btn--active');
+            });
+            btn.classList.add('active', 'feed-sort-btn--active');
             loadFeed();
         });
     });
 
     function getActiveSort() {
-        return document.querySelector('[data-sort].active')?.dataset.sort || 'timestamp';
+        // Support both the JS-managed 'active' class and the HTML-initial 'feed-sort-btn--active' class
+        const activeBtn = document.querySelector('[data-sort].active') ||
+                          document.querySelector('[data-sort].feed-sort-btn--active');
+        return activeBtn?.dataset.sort || 'timestamp';
     }
 
     function buildFeedQuery() {
@@ -1159,22 +1172,70 @@ export function setupPosts() {
         if (reset) { postLimit = 30; feed.innerHTML = skeletonHTML(4); }
 
         activeFeedUnsub = onSnapshot(buildFeedQuery(), (snapshot) => {
-            // Handle removals
+            // ── Incremental real-time patch (non-reset updates) ──────────────
+            // When the feed is already rendered (reset=false or a subsequent push),
+            // patch only the changed fields in-place rather than re-rendering the
+            // entire list. This prevents flicker and preserves any optimistic UI.
+            const isFirstLoad = feed.innerHTML === '' || !!feed.querySelector('.post-card--skeleton');
+
             snapshot.docChanges().forEach(change => {
+                const post     = { id: change.doc.id, ...change.doc.data() };
+                const existing = feed.querySelector(`.post-card[data-post-id="${change.doc.id}"]`);
+
                 if (change.type === 'removed') {
-                    const card = feed.querySelector(`.post-card[data-post-id="${change.doc.id}"]`);
-                    if (card) {
-                        card.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
-                        card.style.opacity    = '0';
-                        card.style.transform  = 'scale(0.97)';
-                        setTimeout(() => card.remove(), 320);
+                    if (existing) {
+                        existing.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+                        existing.style.opacity    = '0';
+                        existing.style.transform  = 'scale(0.97)';
+                        setTimeout(() => existing.remove(), 320);
                     }
                     _postCache.delete(change.doc.id);
+                    return;
+                }
+
+                if (change.type === 'modified' && existing && !isFirstLoad) {
+                    // Update cache
+                    _postCache.set(post.id, post);
+                    // Patch upvote count
+                    const upvoteCount = post.upvoteCount ?? post.upvotedBy?.length ?? 0;
+                    const upvoteCounter = existing.querySelector('.upvote-count');
+                    if (upvoteCounter) upvoteCounter.textContent = String(upvoteCount);
+                    // Patch comment count
+                    const commentSpan = existing.querySelector('.view-comments-btn span');
+                    if (commentSpan) commentSpan.textContent = String(post.commentCount || 0);
+                    // Patch poll vote totals
+                    if (post.poll) {
+                        _renderPollResult(post.id, post.poll.options || [], currentUser?.email || '');
+                    }
+                    // Patch RSVP counts
+                    if (post.type === 'event' && post.attendance) {
+                        const goingEl    = existing.querySelector('.rsvp-going-count');
+                        const maybeEl    = existing.querySelector('.rsvp-maybe-count');
+                        const notGoingEl = existing.querySelector('.rsvp-not-going-count');
+                        if (goingEl)    goingEl.textContent    = String(post.attendance.going?.length    || 0);
+                        if (maybeEl)    maybeEl.textContent    = String(post.attendance.maybe?.length   || 0);
+                        if (notGoingEl) notGoingEl.textContent = String(post.attendance.notGoing?.length || 0);
+                    }
+                    // Patch edited badge
+                    const metaRow = existing.querySelector('.post-meta-row');
+                    if (metaRow) {
+                        const hasBadge = !!existing.querySelector('.post-edited-badge');
+                        if (post.edited && !hasBadge) {
+                            const badge = document.createElement('span');
+                            badge.className   = 'post-edited-badge';
+                            badge.textContent = 'edited';
+                            existing.querySelector('.post-time')?.after(badge);
+                        }
+                    }
+                    return;
                 }
             });
 
-            // Update cache
+            // Update cache for all docs
             snapshot.forEach(d => _postCache.set(d.id, { id: d.id, ...d.data() }));
+
+            // Skip full re-render if this was a live-update-only pass (no first load / reset)
+            if (!reset && !isFirstLoad) return;
 
             if (reset) feed.innerHTML = '';
 
@@ -1298,7 +1359,10 @@ export function setupPosts() {
         });
     }
 
-    loadFeed();
+    // NOTE: loadFeed() and startCacheListener() are intentionally NOT called here.
+    // Both are gated behind onAuthStateChanged (below) so the Firestore JWT is
+    // validated server-side before any snapshot is opened.  Calling loadFeed()
+    // here caused a permission-denied error on every cold page load.
 
     if (sentinel) {
         new IntersectionObserver((entries) => {
@@ -1372,7 +1436,7 @@ export function setupPosts() {
                 upvoteCount:  0,
                 pinned:       false,
                 edited:       false,
-                timestamp:    Date.now(),
+                timestamp:    serverTimestamp(),
             });
 
             generalForm.reset();
@@ -1550,9 +1614,27 @@ export function setupPosts() {
                 { duration: 280, easing: 'ease' }
             );
             try {
+                // BUG-FIX-UPVOTE: use server-side increment(±1) instead of
+                // DOM-read `current ± 1`.  The old code read the displayed counter
+                // text and wrote an absolute value — two simultaneous upvotes from
+                // different users would both read the same DOM number and write
+                // the same result, silently dropping one vote.
+                // increment(±1) is a relative, atomic Firestore operation that
+                // avoids this race entirely.  The optimistic UI (above) still uses
+                // the DOM counter for instant visual feedback, which is correct.
+                // BUG-FIX-UPVOTE-FLOOR: guard the decrement so upvoteCount never
+                // goes negative.  If the counter is already 0 (possible when
+                // upvotedBy and upvoteCount drifted out of sync), increment(-1)
+                // would write -1 and corrupt the "popular" sort order.
+                // We read the authoritative value from the cache rather than the
+                // DOM (the DOM may lag if the onSnapshot patch hasn't fired yet).
+                const cachedPost = _postCache.get(postId);
+                const serverCount = cachedPost?.upvoteCount ?? cachedPost?.upvotedBy?.length ?? current;
                 await updateDoc(postRef, {
                     upvotedBy:   isVoted ? arrayRemove(currentUser.email) : arrayUnion(currentUser.email),
-                    upvoteCount: isVoted ? Math.max(0, current - 1) : current + 1,
+                    upvoteCount: isVoted
+                        ? (serverCount > 0 ? increment(-1) : 0)
+                        : increment(1),
                 });
             } catch {
                 // Rollback
@@ -1609,6 +1691,18 @@ export function setupPosts() {
             if (!currentUser.savedPosts) currentUser.savedPosts = [];
             if (isSaved) {
                 currentUser.savedPosts = currentUser.savedPosts.filter(id => id !== postId);
+                // Eagerly remove the card ONLY from the bookmarks feed (not from the
+                // main feed or my-posts feed). Using btn.closest('[data-post-id]') alone
+                // would walk up and remove the card from whatever feed the click came
+                // from — including the main feed — which is wrong.
+                const bookmarksFeed = document.getElementById('bookmarked-posts-feed');
+                if (bookmarksFeed && bookmarksFeed.contains(btn)) {
+                    const card = btn.closest('[data-post-id]');
+                    card?.remove();
+                    if (!bookmarksFeed.querySelector('[data-post-id]')) {
+                        bookmarksFeed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts yet.</p><p class="empty-feed-sub">Tap the bookmark icon on any post to save it here.</p></div>`;
+                    }
+                }
             } else {
                 currentUser.savedPosts.push(postId);
                 btn.animate(
@@ -1620,14 +1714,34 @@ export function setupPosts() {
             try {
                 await updateDoc(userRef, { savedPosts: isSaved ? arrayRemove(postId) : arrayUnion(postId) });
             } catch {
-                // Rollback both style systems
+                // Rollback: revert UI back to the original isSaved state
                 btn.classList.toggle('action-btn--saved', isSaved);
+                btn.setAttribute('aria-pressed', String(isSaved));
+                btn.title = isSaved ? 'Remove bookmark' : 'Bookmark';
+                const svgPath = btn.querySelector('svg');
                 if (isSaved) {
+                    // Was bookmarked — restore amber/saved appearance
                     btn.classList.add('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
-                    btn.classList.remove('text-gray-400', 'dark:text-gray-500');
+                    btn.classList.remove('text-gray-400', 'dark:text-gray-500',
+                        'hover:text-amber-500', 'dark:hover:text-amber-400',
+                        'hover:bg-gray-100', 'dark:hover:bg-zinc-800');
+                    if (svgPath) svgPath.setAttribute('fill', 'currentColor');
                 } else {
+                    // Was not bookmarked — restore unsaved appearance
                     btn.classList.remove('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
-                    btn.classList.add('text-gray-400', 'dark:text-gray-500');
+                    btn.classList.add('text-gray-400', 'dark:text-gray-500',
+                        'hover:text-amber-500', 'dark:hover:text-amber-400',
+                        'hover:bg-gray-100', 'dark:hover:bg-zinc-800');
+                    if (svgPath) svgPath.setAttribute('fill', 'none');
+                }
+                // Rollback in-memory savedPosts array
+                if (!currentUser.savedPosts) currentUser.savedPosts = [];
+                if (isSaved) {
+                    // We removed it from the array but the Firestore write failed — re-add it
+                    if (!currentUser.savedPosts.includes(postId)) currentUser.savedPosts.push(postId);
+                } else {
+                    // We pushed it but the write failed — remove it
+                    currentUser.savedPosts = currentUser.savedPosts.filter(id => id !== postId);
                 }
                 showToast('Bookmark failed.', 'error');
             }
@@ -1736,16 +1850,25 @@ export function setupPosts() {
 
                 await updateDoc(postRef, updatePayload);
 
-                // Refresh attendance counts from Firestore
-                const snap = await getDoc(postRef);
-                if (snap.exists()) {
-                    const att = snap.data().attendance || {};
+                // Update attendance counts optimistically from the local cache
+                // (the onSnapshot listener will confirm with authoritative values).
+                const cached = _postCache.get(postId);
+                if (cached) {
+                    const att        = cached.attendance || {};
+                    const keys       = ['going', 'maybe', 'notGoing'];
+                    const updated    = {};
+                    keys.forEach(k => {
+                        let arr = [...(att[k] || [])];
+                        arr = arr.filter(e => e !== currentUser.email);
+                        if (!isAlready && k === rsvpKey) arr.push(currentUser.email);
+                        updated[k] = arr;
+                    });
                     const goingEl    = postCard.querySelector('.rsvp-going-count');
                     const maybeEl    = postCard.querySelector('.rsvp-maybe-count');
                     const notGoingEl = postCard.querySelector('.rsvp-not-going-count');
-                    if (goingEl)    goingEl.textContent    = att.going?.length    ?? 0;
-                    if (maybeEl)    maybeEl.textContent    = att.maybe?.length    ?? 0;
-                    if (notGoingEl) notGoingEl.textContent = att.notGoing?.length ?? 0;
+                    if (goingEl)    goingEl.textContent    = updated.going.length;
+                    if (maybeEl)    maybeEl.textContent    = updated.maybe.length;
+                    if (notGoingEl) notGoingEl.textContent = updated.notGoing.length;
                 }
             } catch (err) {
                 console.error('RSVP error:', err);
@@ -1834,41 +1957,134 @@ export function setupPosts() {
         }
     });
 
-    // ── My Posts — lazy load when the page is visited ─────────────────────
-    onPageVisit('page-my-posts', async () => {
+    // ── Timestamp refresh — update all relative timestamps every 60 s ─────
+    // relativeTime() is evaluated once at render time and never updated, so
+    // "just now" would stay forever and "1m ago" would never tick forward.
+    // This interval walks all visible .post-time elements and re-evaluates
+    // relativeTime() from the data-timestamp attribute we store on them.
+    // We first patch renderPost() to write data-timestamp, then tick here.
+    setInterval(() => {
+        document.querySelectorAll('.post-time[data-timestamp]').forEach(el => {
+            const ts = parseInt(el.dataset.timestamp, 10);
+            if (!isNaN(ts)) el.textContent = relativeTime(ts);
+        });
+    }, 60_000);
+
+    // ── My Posts — realtime listener when the page is visited ─────────────
+    let _myPostsUnsub = null;
+    onPageVisit('page-my-posts', () => {
         if (!currentUser) return;
         const feed = document.getElementById('my-posts-feed');
         if (!feed) return;
         feed.innerHTML = skeletonHTML(3);
-        try {
-            const q = query(
+
+        // Tear down any previous listener before opening a new one
+        if (_myPostsUnsub) { _myPostsUnsub(); _myPostsUnsub = null; }
+
+        _myPostsUnsub = onSnapshot(
+            query(
                 collection(db, 'posts'),
                 where('authorEmail', '==', currentUser.email),
                 orderBy('timestamp', 'desc')
-            );
-            const snap = await getDocs(q);
-            if (snap.empty) {
-                feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">You haven't posted anything yet.</p></div>`;
-            } else {
-                feed.innerHTML = '';
-                snap.forEach(d => {
-                    const post = { id: d.id, ...d.data() };
+            ),
+            (snap) => {
+                // Incremental real-time update — avoid wiping the whole feed on
+                // every Firestore change (upvote, edit, etc.) which caused flicker
+                // and reset any optimistic UI already applied by handleFeedClick.
+                snap.docChanges().forEach(change => {
+                    const post = { id: change.doc.id, ...change.doc.data() };
                     _postCache.set(post.id, post);
-                    feed.innerHTML += createPostCardHTML(post, currentUser);
+                    const existing = feed.querySelector(`.post-card[data-post-id="${post.id}"], [data-post-id="${post.id}"]`);
+
+                    if (change.type === 'removed') {
+                        if (existing) {
+                            existing.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+                            existing.style.opacity    = '0';
+                            existing.style.transform  = 'scale(0.97)';
+                            setTimeout(() => existing.remove(), 320);
+                        }
+                        return;
+                    }
+
+                    if (change.type === 'modified' && existing) {
+                        // Patch only the fields that change in real-time so we
+                        // don't discard the user's in-progress optimistic state.
+                        const upvoteCount = post.upvoteCount ?? post.upvotedBy?.length ?? 0;
+                        const upvoteCounter = existing.querySelector('.upvote-count');
+                        if (upvoteCounter) upvoteCounter.textContent = String(upvoteCount);
+                        // Patch comment count
+                        const commentSpan = existing.querySelector('.view-comments-btn span');
+                        if (commentSpan) commentSpan.textContent = String(post.commentCount || 0);
+                        // Patch poll vote totals
+                        if (post.poll) {
+                            _renderPollResult(post.id, post.poll.options || [], currentUser?.email || '');
+                        }
+                        // Patch RSVP counts
+                        if (post.type === 'event' && post.attendance) {
+                            const goingEl    = existing.querySelector('.rsvp-going-count');
+                            const maybeEl    = existing.querySelector('.rsvp-maybe-count');
+                            const notGoingEl = existing.querySelector('.rsvp-not-going-count');
+                            if (goingEl)    goingEl.textContent    = String(post.attendance.going?.length    || 0);
+                            if (maybeEl)    maybeEl.textContent    = String(post.attendance.maybe?.length   || 0);
+                            if (notGoingEl) notGoingEl.textContent = String(post.attendance.notGoing?.length || 0);
+                        }
+                        return;
+                    }
+
+                    if (change.type === 'added' && !existing) {
+                        // Remove empty-feed placeholder if present
+                        feed.querySelector('.empty-feed')?.remove();
+                        const wrapper = document.createElement('div');
+                        wrapper.innerHTML = createPostCardHTML(post, currentUser);
+                        const card = wrapper.firstElementChild;
+                        if (card) feed.insertBefore(card, feed.firstChild);
+                    }
                 });
+
+                // First load: if feed is still showing skeleton or is empty, do full render
+                if (feed.querySelector('.post-card--skeleton') || (!feed.querySelector('[data-post-id]') && !snap.empty)) {
+                    feed.innerHTML = '';
+                    snap.forEach(d => {
+                        const post = { id: d.id, ...d.data() };
+                        _postCache.set(post.id, post);
+                        const wrapper = document.createElement('div');
+                        wrapper.innerHTML = createPostCardHTML(post, currentUser);
+                        const card = wrapper.firstElementChild;
+                        if (card) feed.appendChild(card);
+                    });
+                }
+
+                if (snap.empty) {
+                    feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">You haven't posted anything yet.</p></div>`;
+                }
+            },
+            (err) => {
+                console.error('[My Posts] snapshot error:', err);
+                feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title" style="color:#ef4444">Failed to load your posts. Please try again.</p></div>`;
             }
-        } catch (err) {
-            console.error('[My Posts] load error:', err);
-            feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title" style="color:#ef4444">Failed to load your posts. Please try again.</p></div>`;
-        }
+        );
     });
 
-    // ── Bookmarked Posts — lazy load when the page is visited ─────────────
+    // ── Bookmarked Posts — realtime listener when the page is visited ──────
+    let _bookmarksUnsub = null;
     onPageVisit('page-bookmarked-posts', async () => {
         if (!currentUser) return;
         const feed = document.getElementById('bookmarked-posts-feed');
         if (!feed) return;
-        feed.innerHTML = skeletonHTML(3);
+
+        // Tear down any previous listener before opening a new one
+        if (_bookmarksUnsub) { _bookmarksUnsub(); _bookmarksUnsub = null; }
+
+        // BUG-FIX-STALE-BOOKMARKS: currentUser.savedPosts is loaded once at login
+        // and never re-synced, so bookmarks added on another tab or device are
+        // invisible until re-login. Re-fetch the user doc on every page visit so
+        // the list is always fresh.
+        try {
+            const freshSnap = await getDoc(doc(db, 'users', currentUser.email));
+            if (freshSnap.exists()) {
+                currentUser.savedPosts = freshSnap.data().savedPosts || [];
+            }
+        } catch { /* network error — fall back to local copy */ }
 
         const savedIds = currentUser.savedPosts || [];
         if (savedIds.length === 0) {
@@ -1876,33 +2092,95 @@ export function setupPosts() {
             return;
         }
 
-        try {
-            // Firestore 'in' query supports up to 30 items; batch if needed
-            const BATCH = 30;
-            const posts = [];
-            for (let i = 0; i < savedIds.length; i += BATCH) {
-                const chunk = savedIds.slice(i, i + BATCH);
-                const q = query(collection(db, 'posts'), where('__name__', 'in', chunk));
-                const snap = await getDocs(q);
+        feed.innerHTML = skeletonHTML(3);
+
+        // Firestore 'in' supports ≤30 items — use the first chunk for a realtime
+        // listener; additional chunks are fetched once (bookmarks >30 are rare).
+        const BATCH = 30;
+        const firstChunk = savedIds.slice(0, BATCH);
+
+        _bookmarksUnsub = onSnapshot(
+            query(collection(db, 'posts'), where('__name__', 'in', firstChunk)),
+            async (snap) => {
+                // Re-read savedPosts fresh from currentUser so that bookmarks
+                // added/removed after this listener was opened are reflected
+                // correctly in both the display list and sort order.
+                const liveSavedIds = currentUser.savedPosts || [];
+
+                // Incremental update for Firestore changes (upvotes, edits, etc.)
+                // Only do the expensive full re-render on the first load (skeleton present).
+                const isFirstLoad = !!feed.querySelector('.post-card--skeleton') ||
+                                    (!feed.querySelector('[data-post-id]'));
+
+                if (!isFirstLoad) {
+                    snap.docChanges().forEach(change => {
+                        const post = { id: change.doc.id, ...change.doc.data() };
+                        _postCache.set(post.id, post);
+                        const existing = feed.querySelector(`[data-post-id="${post.id}"]`);
+
+                        if (change.type === 'removed') {
+                            // Post was deleted from Firestore entirely — remove from UI
+                            if (existing) {
+                                existing.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+                                existing.style.opacity    = '0';
+                                existing.style.transform  = 'scale(0.97)';
+                                setTimeout(() => {
+                                    existing.remove();
+                                    if (!feed.querySelector('[data-post-id]')) {
+                                        feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts yet.</p><p class="empty-feed-sub">Tap the bookmark icon on any post to save it here.</p></div>`;
+                                    }
+                                }, 320);
+                            }
+                            return;
+                        }
+
+                        if (change.type === 'modified' && existing) {
+                            // Patch real-time fields without wiping the card
+                            const upvoteCount = post.upvoteCount ?? post.upvotedBy?.length ?? 0;
+                            const upvoteCounter = existing.querySelector('.upvote-count');
+                            if (upvoteCounter) upvoteCounter.textContent = String(upvoteCount);
+                            return;
+                        }
+                    });
+                    return;
+                }
+
+                // ── First load: full render sorted by bookmark order ──────────
+                const posts = [];
                 snap.forEach(d => posts.push({ id: d.id, ...d.data() }));
+
+                // Fetch additional chunks once (no realtime needed for rare >30 case)
+                for (let i = BATCH; i < liveSavedIds.length; i += BATCH) {
+                    try {
+                        const chunk = liveSavedIds.slice(i, i + BATCH);
+                        const extra = await getDocs(query(collection(db, 'posts'), where('__name__', 'in', chunk)));
+                        extra.forEach(d => posts.push({ id: d.id, ...d.data() }));
+                    } catch { /* non-fatal */ }
+                }
+
+                // Sort by bookmark order — most recently bookmarked first.
+                // arrayUnion appends to the END of the array, so the highest
+                // index = most recent bookmark. Sort descending by index (b - a).
+                posts.sort((a, b) => liveSavedIds.indexOf(b.id) - liveSavedIds.indexOf(a.id));
+
+                if (posts.length === 0) {
+                    feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts found.</p></div>`;
+                } else {
+                    feed.innerHTML = '';
+                    posts.forEach(p => {
+                        _postCache.set(p.id, p);
+                        const wrapper = document.createElement('div');
+                        wrapper.innerHTML = createPostCardHTML(p, currentUser);
+                        const card = wrapper.firstElementChild;
+                        if (card) feed.appendChild(card);
+                    });
+                }
+            },
+            (err) => {
+                console.error('[Bookmarked Posts] snapshot error:', err);
+                feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title" style="color:#ef4444">Failed to load bookmarked posts. Please try again.</p></div>`;
             }
-            // Sort by bookmark order (most recently bookmarked first)
-            posts.sort((a, b) => savedIds.indexOf(a.id) - savedIds.indexOf(b.id));
-            if (posts.length === 0) {
-                feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title">No bookmarked posts found.</p></div>`;
-            } else {
-                feed.innerHTML = '';
-                posts.forEach(p => {
-                    // Populate cache so AI summarize, pin, and other cache-
-                    // dependent actions work correctly in the bookmarked feed.
-                    _postCache.set(p.id, p);
-                    feed.innerHTML += createPostCardHTML(p, currentUser);
-                });
-            }
-        } catch (err) {
-            console.error('[Bookmarked Posts] load error:', err);
-            feed.innerHTML = `<div class="empty-feed"><p class="empty-feed-title" style="color:#ef4444">Failed to load bookmarked posts. Please try again.</p></div>`;
-        }
+        );
     });
 }
 
@@ -2089,10 +2367,11 @@ function _injectGlobalStyles() {
             margin-top: 3px;
         }
         .post-time         { font-size: 12px; color: var(--text-muted, #9ca3af); }
+        .post-created-date { font-size: 12px; color: var(--text-muted, #9ca3af); }
         .post-edited-badge {
             font-size: 11px; color: var(--text-muted, #6b7280);
             background: var(--surface-0, #f3f4f6);
-            padding: 1px 6px; border-radius: 4px;
+            padding: 1px 7px; border-radius: 4px; white-space: nowrap;
         }
         .post-separator {
             display: inline-block;
@@ -2169,8 +2448,9 @@ function _injectGlobalStyles() {
         /* ── Single image ──────────────────── */
         .post-image {
             width: 100%;
-            max-height: clamp(200px, 40vw, 300px);
-            object-fit: cover;
+            max-height: 520px;
+            object-fit: contain;
+            background: #0a0a14;
             border-radius: 12px;
             display: block;
             margin: 0 0 14px;
@@ -2181,19 +2461,21 @@ function _injectGlobalStyles() {
             position: relative; margin: 0 0 14px;
             border-radius: 12px; overflow: hidden;
             background: #0a0a14;
-            height: clamp(200px, 40vw, 300px);
         }
         .carousel-track {
-            display: flex; height: 100%;
+            display: flex;
             transition: transform 0.42s cubic-bezier(0.4,0,0.2,1);
             will-change: transform;
         }
         .carousel-slide {
-            flex: 0 0 100%; height: 100%;
-            position: relative; overflow: hidden;
+            flex: 0 0 100%;
+            position: relative;
         }
         .carousel-slide img {
-            width: 100%; height: 100%; object-fit: cover; display: block;
+            width: 100%;
+            max-height: 520px;
+            object-fit: contain;
+            display: block;
             transition: transform 0.5s ease;
         }
         .carousel-slide:hover img { transform: scale(1.02); }
@@ -2234,7 +2516,7 @@ function _injectGlobalStyles() {
             backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
             letter-spacing: 0.02em;
         }
-        .carousel-slide .vid-wrapper { min-height: unset; height: 100%; }
+        .carousel-slide .vid-wrapper { min-height: unset; height: unset; aspect-ratio: 16 / 9; }
 
         /* ── Standalone video ──────────────── */
         .vid-wrapper:not(.carousel-slide .vid-wrapper):not(.vid-wrapper--lightbox) {
@@ -2506,6 +2788,14 @@ function _injectGlobalStyles() {
             .post-content  { font-size: 14px; }
             .action-btn    { padding: 5px 9px; font-size: 12px; }
             .author-avatar { width: 36px; height: 36px; font-size: 14px; }
+            /* Dropzone: stack icon + text vertically on narrow screens */
+            .post-media-dropzone {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+                padding: 16px 14px;
+            }
+            .post-media-dropzone p { font-size: 12px !important; }
         }
 
         /* ── Dark mode ─────────────────────── */

@@ -470,14 +470,12 @@ function setupTabSwitching() {
             formTypes.forEach(t => {
                 const btn = document.getElementById(`select-${t}`);
                 if (!btn) return;
-                btn.classList.remove('bg-blue-500', 'text-white', 'shadow', 'ring-2', 'ring-blue-300');
-                btn.classList.add('text-gray-600');
+                btn.classList.remove('create-tab-btn--active');
                 btn.setAttribute('aria-selected', 'false');
             });
 
             // Activate this tab
-            tabBtn.classList.remove('text-gray-600');
-            tabBtn.classList.add('bg-blue-500', 'text-white', 'shadow');
+            tabBtn.classList.add('create-tab-btn--active');
             tabBtn.setAttribute('aria-selected', 'true');
         });
     });

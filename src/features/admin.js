@@ -366,6 +366,29 @@ export function setupAdmin() {
             }
             .broadcast-feed-banner span { font-size: 10px; font-weight: 800;
                 color: #38bdf8; text-transform: uppercase; letter-spacing: 0.08em; }
+
+            /* ── Admin: mobile nav scrolls horizontally ── */
+            @media (max-width: 1279px) {
+                #admin-sidebar-nav {
+                    display: flex !important;
+                    flex-direction: row !important;
+                    gap: 0.375rem !important;
+                    overflow-x: auto !important;
+                    overflow-y: visible !important;
+                    padding-bottom: 4px;
+                    scrollbar-width: none;
+                    -webkit-overflow-scrolling: touch;
+                }
+                #admin-sidebar-nav::-webkit-scrollbar { display: none; }
+                .admin-nav-btn {
+                    flex: 0 0 auto !important;
+                    width: auto !important;
+                    padding: 0.5rem 0.875rem !important;
+                    font-size: 0.8rem !important;
+                    white-space: nowrap !important;
+                }
+                .admin-nav-btn span:first-child { display: none; }
+            }
         `;
         document.head.appendChild(style);
     }
@@ -380,7 +403,7 @@ export function setupAdmin() {
                 <!-- ── Sidebar ────────────────────────────────────── -->
                 <aside class="w-full xl:w-72 flex-shrink-0">
                     <div class="bg-slate-900/90 border border-slate-800 rounded-3xl p-6
-                                sticky top-24 shadow-2xl shadow-black/30 backdrop-blur-sm">
+                                shadow-2xl shadow-black/30 backdrop-blur-sm xl:sticky xl:top-24">
 
                         <!-- Brand -->
                         <div class="mb-6 pb-5 border-b border-slate-800">

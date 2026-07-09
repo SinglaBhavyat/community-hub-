@@ -146,7 +146,11 @@ export function createPostCardHTML(post, currentUser, isDetailed = false) {
     const canDelete = isOwn || isAdmin;
     const canPin    = isAdmin;
 
-    const upvotes     = Array.isArray(post.upvotedBy) ? post.upvotedBy.length : 0;
+    // BUG-FIX-UPVOTE-COUNT: use upvoteCount (atomic server counter) for display,
+    // falling back to upvotedBy.length only if upvoteCount isn't written yet.
+    // upvotedBy.length diverges when concurrent writes update the counter atomically
+    // but the array snapshot lags, or when older posts never had upvoteCount set.
+    const upvotes     = (typeof post.upvoteCount === 'number') ? post.upvoteCount : (Array.isArray(post.upvotedBy) ? post.upvotedBy.length : 0);
     const hasVoted    = !!(currentUser && post.upvotedBy?.includes(currentUser.email));
     const isBookmarked= !!(currentUser && currentUser.savedPosts?.includes(post.id));
     const totalComments = typeof post.commentCount === 'number' ? post.commentCount : 0;
@@ -539,16 +543,24 @@ export function createPostCardHTML(post, currentUser, isDetailed = false) {
 // ============================================================
 //  AI SUMMARIZE
 // ============================================================
-let _summarizeFn = null;
+const GEMINI_API_KEY = 'AQ.Ab8RN6KFuYw_tfXqVS-QU05FFeChuogxdIU11OiffxsXhz_a9w';
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent`;
 
-async function getFirebaseSummarizeFn() {
-    if (_summarizeFn) return _summarizeFn;
-    try {
-        const { getFunctions, httpsCallable } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-functions.js');
-        const { app } = await import('../config/firebase.js');
-        _summarizeFn = httpsCallable(getFunctions(app), 'aiSummarize');
-        return _summarizeFn;
-    } catch { return null; }
+async function geminiSummarize(prompt) {
+    const res = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-goog-api-key': GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 120, temperature: 0.4 },
+        }),
+    });
+    if (!res.ok) throw new Error(`Gemini ${res.status}`);
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
 }
 
 function localSummary(post) {
@@ -587,12 +599,8 @@ export async function handleAiSummarize(postCard, post) {
 
     let summary = null;
     try {
-        const fn = await getFirebaseSummarizeFn();
-        if (fn) {
-            const result = await fn({ prompt });
-            summary = result.data?.summary?.trim() || null;
-        }
-    } catch (e) { console.warn('AI summary cloud fn failed, using local.', e.message); }
+        summary = await geminiSummarize(prompt);
+    } catch (e) { console.warn('Gemini summarize failed, using local.', e.message); }
 
     if (!summary) summary = localSummary(post);
 
@@ -711,7 +719,7 @@ export function initPostOptionsDropdowns() {
             dropdown.innerHTML = `
                 <button class="message-author-btn ${normCls}" data-email="${authorEmail}" data-name="${authorName}">${msgIcon} Message ${firstName}</button>
                 <button class="share-btn ${normCls}" data-post-id="${postId}">${shareIcon} Share</button>
-                <button class="report-btn ${orngCls}" data-content-id="${postId}" data-content-type="post">${rptIcon} Report</button>`;
+                <button class="report-btn ${orngCls}" data-content-id="${postId}" data-content-type="post" data-content-author-email="${authorEmail}">${rptIcon} Report</button>`;
         }
         // ──────────────────────────────────────────────────────────────────
 

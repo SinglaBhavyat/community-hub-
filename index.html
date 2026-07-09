@@ -98,10 +98,10 @@
 
     <nav id="secondary-navbar" class="hidden sticky top-[72px] z-40">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex items-center justify-center gap-8 h-16 overflow-x-auto" style="overflow: visible; overflow-x: auto; padding-top: 8px; padding-bottom: 8px;">
+            <div class="secondary-nav-inner">
                 <a href="#" data-target="page-posts" class="nav-link whitespace-nowrap">Posts</a>
                 <a href="#" data-target="page-create" class="nav-link whitespace-nowrap">Create</a>
-                <a href="#" data-target="page-lost-found" class="nav-link whitespace-nowrap">Lost & Found</a>
+                <a href="#" data-target="page-lost-found" class="nav-link whitespace-nowrap">Lost &amp; Found</a>
                 <a href="#" data-target="page-chat" class="nav-link whitespace-nowrap">Messages<span id="chat-nav-indicator" class="chat-nav-dot hidden"></span></a>
                 <a href="#" data-target="page-help" class="nav-link whitespace-nowrap">Help</a>
             </div>
@@ -110,16 +110,16 @@
 
     <main class="pt-20 relative z-10">
 
-        <section id="page-login" class="page-section hidden min-h-screen flex items-center justify-center py-20 px-4">
+        <section id="page-login" class="page-section hidden min-h-screen flex items-center justify-center py-12 sm:py-20 px-4">
             <div class="w-full max-w-md">
                 <div class="card">
                     <div class="text-center mb-8 stagger-item" style="animation-delay: 0;">
-                        <div class="w-16 h-16 mx-auto mb-6 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center shadow-lg">
+                        <div class="w-14 h-14 sm:w-16 sm:h-16 mx-auto mb-4 sm:mb-6 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center shadow-lg">
                             <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                             </svg>
                         </div>
-                        <h2 class="text-4xl font-bold mb-2">Welcome Back</h2>
+                        <h2 class="text-3xl sm:text-4xl font-bold mb-2">Welcome Back</h2>
                         <p class="text-gray-500">Sign in to connect with your community</p>
                     </div>
                     <button type="button" id="google-login-btn" class="stagger-item w-full flex items-center justify-center gap-3 bg-white border border-gray-300 hover:bg-gray-50 text-gray-900 font-semibold py-3 px-4 rounded-lg transition-all duration-300 mb-4" style="animation-delay: 0.1s;">
@@ -136,7 +136,7 @@
             </div>
         </section>
 
-        <section id="page-home" class="page-section hidden min-h-screen flex items-center justify-center py-32 px-4">
+        <section id="page-home" class="page-section hidden min-h-screen flex items-center justify-center py-16 sm:py-32 px-4">
             <div class="max-w-5xl mx-auto text-center w-full">
                 <span class="eyebrow mb-6 justify-center w-full stagger-item">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
@@ -145,11 +145,11 @@
                 <h2 class="hero-title text-5xl sm:text-6xl lg:text-7xl mb-6">
                     Connect Your <span class="gradient-text">Community</span>
                 </h2>
-                <p class="hero-subtitle text-xl sm:text-2xl mx-auto mb-12 max-w-2xl">
+                <p class="hero-subtitle text-xl sm:text-2xl mx-auto mb-8 sm:mb-12 max-w-2xl">
                     A modern platform for sharing posts, finding lost items, messaging neighbors, and getting support all in one place.
                 </p>
                 
-                <div id="main-nav-links" class="hidden grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-16">
+                <div id="main-nav-links" class="hidden grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4 mb-10 sm:mb-16">
                     <a href="#" data-target="page-create" class="feature-card stagger-item">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
@@ -191,9 +191,9 @@
             </div>
         </section>
 
-        <section id="page-profile" class="page-section hidden py-20 px-4">
+        <section id="page-profile" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-2xl mx-auto">
-                <h3 class="text-5xl font-bold mb-12">My Profile</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold mb-6 sm:mb-12">My Profile</h3>
                 <div class="card">
                     <form id="profile-update-form" class="space-y-8">
                         <div class="form-group">
@@ -227,29 +227,29 @@
             <!-- Dynamically populated by profile.js when a user avatar/name is clicked -->
         </section>
 
-        <section id="page-my-posts" class="page-section hidden py-20 px-4">
+        <section id="page-my-posts" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-3xl mx-auto">
-                <h3 class="text-5xl font-bold mb-12">My Posts</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold mb-6 sm:mb-12">My Posts</h3>
                 <div id="my-posts-feed" class="space-y-6"></div>
             </div>
         </section>
 
-        <section id="page-bookmarked-posts" class="page-section hidden py-20 px-4">
+        <section id="page-bookmarked-posts" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-3xl mx-auto">
-                <h3 class="text-5xl font-bold mb-12">Bookmarked Posts</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold mb-6 sm:mb-12">Bookmarked Posts</h3>
                 <div id="bookmarked-posts-feed" class="space-y-6"></div>
             </div>
         </section>
 
-        <section id="page-create" class="page-section hidden py-20 px-4">
+        <section id="page-create" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-2xl mx-auto">
-                <h3 class="text-5xl font-bold mb-12">Create New Post</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold mb-8 sm:mb-12">Create New Post</h3>
                 <div class="card">
-                    <div class="flex gap-2 mb-12 p-1 bg-gray-200 rounded-lg">
-                        <button id="select-general-post" class="flex-1 py-3 px-4 text-sm font-semibold rounded-md bg-blue-500 text-white transition-all duration-300">General</button>
-                        <button id="select-event-post" class="flex-1 py-3 px-4 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors duration-300">Event</button>
-                        <button id="select-study-post" class="flex-1 py-3 px-4 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors duration-300">Study Group</button>
-                        <button id="select-lost-found" class="flex-1 py-3 px-4 text-sm font-semibold text-gray-600 hover:text-gray-900 transition-colors duration-300">Lost & Found</button>
+                    <div class="create-tabs-bar mb-8 sm:mb-12">
+                        <button id="select-general-post" class="create-tab-btn create-tab-btn--active">General</button>
+                        <button id="select-event-post" class="create-tab-btn">Event</button>
+                        <button id="select-study-post" class="create-tab-btn">Study Group</button>
+                        <button id="select-lost-found" class="create-tab-btn">Lost &amp; Found</button>
                     </div>
 
                     <div id="form-general-post">
@@ -462,11 +462,11 @@
             </div>
         </section>
 
-        <section id="page-posts" class="page-section hidden py-20 px-4">
+        <section id="page-posts" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-3xl mx-auto">
                 <div class="flex flex-col gap-4 mb-10">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-                        <h3 class="text-5xl font-bold">Community Feed</h3>
+                        <h3 class="text-3xl sm:text-5xl font-bold">Community Feed</h3>
                         <div class="flex flex-wrap gap-2">
                             <button data-sort="timestamp" class="feed-sort-btn feed-sort-btn--active">🕒 Latest</button>
                             <button data-sort="popular" class="feed-sort-btn">🔥 Top</button>
@@ -474,7 +474,7 @@
                     </div>
                     <div class="flex flex-col sm:flex-row gap-3">
                         <input type="text" id="keyword-search-input" class="flex-1" placeholder="🔍 Search posts…">
-                        <input type="text" id="hashtag-filter-input" class="flex-1 sm:flex-none sm:w-40" placeholder="#hashtag">
+                        <input type="text" id="hashtag-filter-input" class="flex-1 sm:flex-none sm:w-36" placeholder="#hashtag">
                         <select id="community-filter-select" class="flex-1 sm:flex-none">
                             <option value="all">🌐 All Channels</option>
                             <option value="Global">Global</option>
@@ -490,9 +490,9 @@
             </div>
         </section>
 
-        <section id="page-comments" class="page-section hidden py-20 px-4">
+        <section id="page-comments" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-3xl mx-auto">
-                <div class="mb-8 flex justify-between items-center">
+                <div class="mb-8 flex flex-wrap gap-3 justify-between items-center">
                     <a href="#" data-target="page-posts" class="text-blue-500 hover:text-blue-600 font-semibold flex items-center gap-2 transition-colors duration-300">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
@@ -507,22 +507,22 @@
                     <p class="text-xs font-bold text-indigo-900 mb-2">AI Summary</p>
                     <p id="ai-summary-text" class="text-sm text-indigo-800"></p>
                 </div>
-                <div id="comments-page-post-container" class="mb-12"></div>
-                <div class="mb-12">
-                    <h3 class="text-2xl font-bold mb-6">Add Comment</h3>
-                    <textarea class="comment-textarea w-full" rows="4" placeholder="Share your thoughts..."></textarea>
+                <div id="comments-page-post-container" class="mb-6 sm:mb-12"></div>
+                <div class="mb-8 sm:mb-12">
+                    <h3 class="text-xl sm:text-2xl font-bold mb-4 sm:mb-6">Add Comment</h3>
+                    <textarea class="comment-textarea w-full" rows="4" placeholder="Share your thoughts..." style="font-size:16px;"></textarea>
                     <div class="text-right mt-4">
                         <button class="submit-comment-btn btn-primary">Post Comment</button>
                     </div>
                 </div>
-                <div class="border-t border-gray-200 pt-8">
-                    <h3 class="text-2xl font-bold mb-8">Comments</h3>
+                <div class="border-t border-gray-200 pt-6 sm:pt-8">
+                    <h3 class="text-xl sm:text-2xl font-bold mb-4 sm:mb-8">Comments</h3>
                     <div id="comments-page-list" class="space-y-6"></div>
                 </div>
             </div>
         </section>
 
-        <section id="page-chat" class="page-section hidden py-20 px-4">
+        <section id="page-chat" class="page-section hidden py-8 sm:py-20 px-2 sm:px-4">
             <div class="max-w-6xl mx-auto">
                 <div class="bg-white border border-gray-200 rounded-2xl h-[85vh] flex overflow-hidden shadow-xl">
                     
@@ -624,16 +624,16 @@
             </div>
         </section>
 
-        <section id="page-lost-found" class="page-section hidden py-20 px-4">
+        <section id="page-lost-found" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-5xl mx-auto">
-                <h3 class="text-5xl font-bold text-center mb-12">Lost & Found</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold text-center mb-6 sm:mb-12">Lost & Found</h3>
                 <div id="lost-found-feed" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
             </div>
         </section>
 
-        <section id="page-help" class="page-section hidden py-20 px-4">
+        <section id="page-help" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-3xl mx-auto text-center">
-                <h3 class="text-5xl font-bold mb-8">Need Help?</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold mb-4 sm:mb-8">Need Help?</h3>
                 <div class="card card--video card--video-bg mb-8">
                     <!-- Background video -->
                     <video
@@ -699,17 +699,17 @@
             </div>
         </section>
 
-        <section id="page-achievements" class="page-section hidden py-20 px-4">
+        <section id="page-achievements" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-5xl mx-auto">
-                <h3 class="text-5xl font-bold text-center mb-12">Achievements</h3>
+                <h3 class="text-3xl sm:text-5xl font-bold text-center mb-6 sm:mb-12">Achievements</h3>
                 <div id="achievements-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
             </div>
         </section>
 
-        <section id="page-admin" class="page-section hidden py-20 px-4">
+        <section id="page-admin" class="page-section hidden py-12 sm:py-20 px-4">
             <div class="max-w-4xl mx-auto">
-                <h3 class="text-5xl font-bold mb-3">Admin Panel</h3>
-                <p class="text-gray-600 mb-12">Manage reported content and community</p>
+                <h3 class="text-3xl sm:text-5xl font-bold mb-2">Admin Panel</h3>
+                <p class="text-gray-600 mb-6 sm:mb-12">Manage reported content and community</p>
                 <div id="admin-reported-content" class="space-y-4"></div>
             </div>
         </section>

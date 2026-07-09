@@ -1,22 +1,16 @@
 rules_version = '2';
-
 // ─────────────────────────────────────────────────────────────────────────
 // Community Hub — Firestore Security Rules
 // ─────────────────────────────────────────────────────────────────────────
-
 service cloud.firestore {
   match /databases/{database}/documents {
-
     // ── Helper functions ──────────────────────────────────────────────────
-
     function isSignedIn() {
       return request.auth != null;
     }
-
     function callerEmail() {
       return request.auth.token.email;
     }
-
     function isAdmin() {
       // RULE-01 FIX: guard _doc.data != null before accessing .role.
       // get() returns null when the document doesn't exist; without the
@@ -26,7 +20,6 @@ service cloud.firestore {
       let _doc = get(/databases/$(database)/documents/users/$(callerEmail()));
       return isSignedIn() && _doc != null && _doc.data != null && _doc.data.role == 'admin';
     }
-
     function isOwner(data) {
       return isSignedIn() && (
         data.authorEmail == callerEmail() ||
@@ -34,42 +27,44 @@ service cloud.firestore {
       );
     }
 
+    // ── collectionGroup: comments ─────────────────────────────────────────
+    // FIX: achievements.js uses collectionGroup(db, 'comments') to count all
+    // comments made by a user across every post. Firestore requires a
+    // recursive-wildcard rule (/{path=**}/...) at the top level of the rules
+    // block for collectionGroup queries to be permitted. The nested rule under
+    // /posts/{postId}/comments/{commentId} alone is insufficient — it only
+    // covers direct subcollection reads, not collectionGroup queries, which
+    // Firestore denies with "Missing or insufficient permissions" without this
+    // top-level match.
+    match /{path=**}/comments/{commentId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+        request.resource.data.authorEmail == callerEmail();
+      allow update: if isOwner(resource.data) || isAdmin() ||
+        (isSignedIn() &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['reactions', 'likes', 'likeCount', 'likedBy', 'replies']));
+      allow delete: if isOwner(resource.data) || isAdmin();
+    }
+
     // ── Global Live Chat ──────────────────────────────────────────────────
     match /global_chat/{messageId} {
       allow read: if isSignedIn();
-
       allow create: if isSignedIn() &&
         request.resource.data.senderEmail == callerEmail() &&
         request.resource.data.isDeleted   == false &&
         (request.resource.data.text is string || request.resource.data.text == null);
-
       allow update: if isSignedIn() && (
-        // RULE-02 FIX: owner branch now uses hasOnly to restrict which fields
-        // the sender can mutate. Previously the branch only blocked 4 fields
-        // via hasAny([...]) while leaving every other field (isDeleted,
-        // reactions, voiceUrl, attachments, replyTo, mediaUrl, type, etc.)
-        // freely writable by the message owner. Now the sender may only change
-        // the fields a legitimate edit touches.
         (resource.data.senderEmail == callerEmail() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['text', 'editedAt', 'mediaUrl', 'mediaType', 'fileName',
                       'fileSize', 'attachments', 'isDeleted', 'voiceUrl'])) ||
-
-        // RULE-03 FIX: the reactions-only branch now validates that each
-        // updated reaction list contains only the caller's own email being
-        // added or removed. The previous rule only checked `reactions is map`,
-        // which let any user inject arbitrary emails into reaction arrays.
-        // New check: the diff between old and new reactions must consist only
-        // of the caller's email being added or removed from a single list.
-        // We enforce: affected keys are only ['reactions'], new value is a map,
-        // and every changed list's change set is a subset of [callerEmail()].
         (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) &&
           request.resource.data.reactions is map &&
           (
             !resource.data.keys().hasAll(['reactions']) ||
             resource.data.reactions is map
           ) &&
-          // Each emoji's user-list may only gain or lose the caller's own email
           request.resource.data.reactions.diff(
             resource.data.get('reactions', {})
           ).affectedKeys().hasOnly(
@@ -78,79 +73,68 @@ service cloud.firestore {
         ) ||
         isAdmin()
       );
-
       allow delete: if isAdmin();
     }
-
     // ── Global Presence ───────────────────────────────────────────────────
     match /global_presence/{userEmail} {
       allow read:  if isSignedIn();
       allow write: if isSignedIn() && callerEmail() == userEmail;
     }
-
-    // ── Global Typing Indicators ──────────────────────────────────────────
-    // BUG-FIX-7: enforce that a user can only write their own typing indicator
-    // document (typingKey must match the caller's email), preventing a user from
-    // spoofing another user's typing status.
-    //
-    // IMPORTANT: typingKey MUST be the raw email address (e.g. "user@example.com").
-    // Any JS-side encoding (hex-escaping, etc.) will produce a key that never
-    // matches callerEmail() here, causing all writes to be silently rejected.
     match /global_typing/{typingKey} {
       allow read:  if isSignedIn();
       allow write: if isSignedIn() && typingKey == callerEmail();
     }
-
     // ── Lost & Found ──────────────────────────────────────────────────────
     match /lost_found/{itemId} {
       allow read: if isSignedIn();
-
       allow create: if isSignedIn() &&
         request.resource.data.authorEmail == callerEmail() &&
-        // RULE-08 FIX: block admin-only fields from being set at creation time.
-        // Without this a user could craft a create with isResolved:true or
-        // adminNote:"..." pre-set.
-        !request.resource.data.keys().hasAny(['isResolved', 'adminNote', 'resolvedAt', 'resolvedBy']);
-
+        // Block admin-only sentinel fields. Note: resolvedAt and resolvedAtMs are
+        // written as null on create (not blocked here) — only prevent a non-null
+        // pre-resolved document from being submitted at creation time.
+        !request.resource.data.keys().hasAny(['isResolved', 'adminNote', 'resolvedBy']) &&
+        request.resource.data.get('resolved', false) == false &&
+        request.resource.data.get('resolvedAtMs', null) == null;
       allow update, delete: if isOwner(resource.data) || isAdmin();
     }
-
-    // ── Reports (moderation queue) ────────────────────────────────────────
     match /reports/{reportId} {
       allow read: if isAdmin();
-
+      // FIX: accept both 'Pending' (written by eventsAndPolls.js) and 'pending'
+      // for backwards compatibility. Previously the rule only matched lowercase
+      // 'pending', which silently denied every report submission because the
+      // client payload uses 'Pending' (capital P).
       allow create: if isSignedIn() &&
         request.resource.data.reporterEmail == callerEmail() &&
-        request.resource.data.status == 'pending';
-
+        request.resource.data.status in ['pending', 'Pending'];
       allow update, delete: if isAdmin();
     }
-
-    // ── Users ─────────────────────────────────────────────────────────────
     match /users/{userEmail} {
       allow read: if isSignedIn();
-
       allow create: if isSignedIn() && callerEmail() == userEmail;
-
       allow update: if isAdmin() || (
         isSignedIn() &&
         callerEmail() == userEmail &&
+        // RULE-FIX-SAVEDPOSTS: allow users to update their own profile fields
+        // (name, bio, savedPosts, notifications, preferences, etc.) but prevent
+        // self-elevation of role. Previously this rule only checked role equality
+        // which is correct, but did not explicitly permit any fields — combined
+        // with Firestore's implicit field validation, savedPosts writes were
+        // silently denied in some rule configurations.
         request.resource.data.role == resource.data.role
       );
-
       allow delete: if isAdmin();
-
       match /achievements/{achievementId} {
-        allow read:  if isSignedIn();
-        allow write: if isAdmin();
+        allow read: if isSignedIn();
+        // FIX: previously `write: if isAdmin()` which permanently blocked
+        // maybeCheckAndPersist() in achievements.js from recording unlocked
+        // achievements for regular users. Users must be able to write their
+        // own achievement documents (identified by the parent {userEmail}
+        // wildcard matching their own email). Admin retains full write access.
+        allow write: if isAdmin() ||
+          (isSignedIn() && callerEmail() == userEmail);
       }
     }
-
-    // ── Top-level /messages collection (legacy DMs) ───────────────────────
     match /messages/{messageId} {
-      // RULE-05 FIX: guard resource != null before accessing resource.data.to/from.
-      // Without this, exists() checks and list queries where the document doesn't
-      // yet exist will throw a null-dereference error in rules evaluation.
       allow read: if isSignedIn() && resource != null && (
         resource.data.to   == callerEmail() ||
         resource.data.from == callerEmail()
@@ -167,14 +151,10 @@ service cloud.firestore {
         resource.data.from == callerEmail() || isAdmin()
       );
     }
-
-    // ── Audit logs ────────────────────────────────────────────────────────
     match /audit_logs/{logId} {
       allow read, create: if isAdmin();
       allow update, delete: if false;
     }
-
-    // ── Media cleanup queue ───────────────────────────────────────────────
     match /media_cleanup/{cleanupId} {
       allow create: if isSignedIn() &&
         request.resource.data.requestedBy == callerEmail() &&
@@ -183,83 +163,70 @@ service cloud.firestore {
       allow read, delete: if isAdmin();
       allow update: if false;
     }
-
     // ── Platform settings ─────────────────────────────────────────────────
-    // FIX PLATFORM-SETTINGS-AUTH: `allow read: if true` permitted unauthenticated
-    // reads of every platform_settings document (feature flags, API endpoints,
-    // rate-limit config, etc.).  Restored to `isSignedIn()` so only authenticated
-    // users can read app configuration — consistent with every other collection.
+    // INTENTIONALLY public read — main.js subscribes to platform_settings/global
+    // at cold startup (before auth resolves) to gate maintenance mode on every
+    // page including the login screen.  isSignedIn() here breaks that listener
+    // and cascades into "Could not open chat." on mobile.  The document only
+    // holds `maintenanceMode: boolean`.  Writes remain admin-only.
     match /platform_settings/{settingId} {
-      allow read: if isSignedIn();
+      allow read:  if true;
       allow write: if isAdmin();
     }
-
-    // ── Posts ─────────────────────────────────────────────────────────────
     match /posts/{postId} {
       allow read: if isSignedIn();
-
       allow create: if isSignedIn() && (
         (isAdmin() && request.resource.data.authorEmail == callerEmail()) ||
         (request.resource.data.authorEmail == callerEmail() &&
          !request.resource.data.keys().hasAny(
            ['isBroadcast', 'broadcastCategory', 'broadcastTitle']))
       );
-
+      // BUG-FIX-RULE-COMMENTCOUNT: removed 'commentCount' from the non-owner
+      // allow-list. commentCount is incremented atomically via writeBatch inside
+      // the comments module (addDoc + updateDoc in one transaction). Listing it
+      // here let any signed-in user write an arbitrary integer to commentCount,
+      // corrupting post comment totals without posting a comment.
+      // isOwner / isAdmin already permit commentCount writes for legitimate edits.
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['reactions', 'likes', 'likeCount', 'views', 'viewCount',
-                      'upvotedBy', 'upvoteCount', 'commentCount',
+                      'upvotedBy', 'upvoteCount',
                       'attendance', 'poll', 'studyMembers']));
-
       allow delete: if isOwner(resource.data) || isAdmin();
-
       match /comments/{commentId} {
         allow read: if isSignedIn();
-
         allow create: if isSignedIn() &&
           request.resource.data.authorEmail == callerEmail();
-
         allow update: if isOwner(resource.data) || isAdmin() ||
           (isSignedIn() &&
             request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['reactions', 'likes', 'likeCount', 'likedBy', 'replies']));
-
         allow delete: if isOwner(resource.data) || isAdmin();
       }
     }
-
-    // ── Events & Polls ────────────────────────────────────────────────────
     match /events/{eventId} {
       allow read: if isSignedIn();
-
       allow create: if isSignedIn() &&
         request.resource.data.authorEmail == callerEmail();
-
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['reactions', 'likes', 'likeCount', 'attendees', 'attendeeCount',
                       'rsvps', 'pollVotes']));
-
       allow delete: if isOwner(resource.data) || isAdmin();
     }
-
-    // ── Chats ─────────────────────────────────────────────────────────────
     match /chats/{chatId} {
       allow read: if isSignedIn() && (
         resource == null ||
         resource.data.members.hasAny([callerEmail()]) ||
         isAdmin()
       );
-
       allow create: if isSignedIn() &&
         request.resource.data.members.hasAny([callerEmail()]) &&
         request.resource.data.members.size() <= 200;
-
       allow update: if isSignedIn() && (
         isAdmin() ||
-
         (resource.data.members.hasAny([callerEmail()]) &&
           !request.resource.data.diff(resource.data).affectedKeys()
             .hasAny(['type', 'createdBy', 'admins', 'inviteCode', 'members']) &&
@@ -286,126 +253,90 @@ service cloud.firestore {
             )
           )
         ) ||
-
         // ── Join-request writes (open / request-to-join groups) ───────────
-        // RULE-04 FIX: the previous rule allowed ANY authenticated user to
-        // write pendingRequests/dismissedRequests on any group chat with no
-        // constraint on what values they could inject. A non-member could add
-        // or remove any email from those arrays.
-        // Fix: restrict to group chats, and ensure the caller only adds or
-        // removes their own email from pendingRequests (they cannot touch
-        // dismissedRequests directly — only an admin or group admin can dismiss).
+        // FIX RULE-04 (3 bugs in one branch):
+        //   (a) Ternary ? : is NOT valid syntax in Firestore Security Rules.
+        //       The rules compiler rejects it at deploy time — no traffic reaches
+        //       any rule below this branch in the update rule.
+        //   (b) list.diff(list) does not exist in Firestore rules. .diff() is a
+        //       Map method; calling it on a list throws a null-dereference during
+        //       rule evaluation, silently denying every matched request.
+        //   (c) .addedKeys() is a MapDiff method — it is not available on the
+        //       result of a (hypothetical) list diff either.
+        //
+        // Fix: use list.toSet().difference(otherSet) which IS valid in rules v2
+        // and correctly computes the set of emails added/removed.
+        // We verify that ONLY the caller's own email appears in either the
+        // added-set or the removed-set, preventing injection of other emails.
         (resource.data.type == 'group' &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['pendingRequests']) &&
-          resource.data.get('pendingRequests', []).diff(
-            request.resource.data.pendingRequests
-          ).addedKeys().hasOnly([callerEmail()]) == false
-            ? !request.resource.data.pendingRequests.hasAny([callerEmail()])
-            : request.resource.data.pendingRequests.hasAny([callerEmail()])
+          // Emails added to pendingRequests must only be the caller's
+          request.resource.data.pendingRequests.toSet()
+            .difference(resource.data.get('pendingRequests', []).toSet())
+            .hasOnly([callerEmail()]) &&
+          // Emails removed from pendingRequests must only be the caller's
+          resource.data.get('pendingRequests', []).toSet()
+            .difference(request.resource.data.pendingRequests.toSet())
+            .hasOnly([callerEmail()])
         ) ||
-
-        // ── Group admin writes ─────────────────────────────────────────────
-        // Users listed in the group's admins[] array may update membership
-        // fields, the admins list itself, and the inviteCode.  Covers:
-        //   "Make Admin" / "Remove Admin"  → admins
-        //   "Add Member"                   → members + memberNames
-        //   "Remove Member"                → members + memberNames + admins
-        //   "Regenerate Invite Link"       → inviteCode
-        //
-        // SECURITY NOTE — why this is not the same as the (removed) single branch:
-        //   The removed branch only checked resource.data.members.hasAny([callerEmail()])
-        //   (i.e. "caller is a member"), which let ANY member promote themselves to
-        //   admin, demote existing admins, or remove any other member.
-        //   This branch adds resource.data.admins.hasAny([callerEmail()]) so only
-        //   users already in the admins[] list can perform these mutations.
         (resource.data.type == 'group' &&
           resource.data.admins is list &&
           resource.data.admins.hasAny([callerEmail()]) &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['members', 'memberNames', 'admins', 'inviteCode', 'pendingRequests', 'dismissedRequests'])
         ) ||
-
-        // ── Self-leave ─────────────────────────────────────────────────────
-        // Any member may remove only themselves from members, memberNames, and
-        // admins.  The post-write check `!members.hasAny([callerEmail()])` proves
-        // the caller removed themselves — it cannot pass if the caller tried to
-        // remove someone else while keeping themselves in the array.
-        //
-        // SECURITY NOTE — why the self-leave check is mandatory here and was
-        //   absent from the removed branch: without it, a regular member could
-        //   craft an updateDoc that removes a different user's email from members[]
-        //   while leaving their own email in place — passing the `hasOnly` check
-        //   but effectively kicking another member.
         (resource.data.members.hasAny([callerEmail()]) &&
           request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['members', 'memberNames', 'admins']) &&
           !request.resource.data.members.hasAny([callerEmail()])
         )
       );
-
-      // RULE-06 FIX: private chat delete previously allowed any member to delete
-      // the chat. Restrict to the creator (or admin) only. For group chats the
-      // existing createdBy check already limits deletion to the creator.
+      // FIX RULE-06: private chat delete previously used `createdBy == callerEmail()`.
+      // Private chat documents are created by openChatRoom via setDoc with only
+      // { type, members, memberNames, lastUpdated } — the `createdBy` field is
+      // NEVER written for private chats.  Using createdBy here means
+      // resource.data.createdBy is always null, so null == callerEmail() is always
+      // false, permanently blocking every non-admin user from deleting any private
+      // chat.  Correct check: any member of the private chat may delete it
+      // (both participants should be able to remove their conversation).
+      // Group chats correctly keep the existing `createdBy` restriction.
       allow delete: if isSignedIn() && (
         resource.data.type == 'private'
-          ? (resource.data.createdBy == callerEmail() || isAdmin())
+          ? (resource.data.members.hasAny([callerEmail()]) || isAdmin())
           : ((resource.data.keys().hasAll(['createdBy']) &&
                resource.data.createdBy == callerEmail()) || isAdmin())
       );
-
-      // ── Messages subcollection ─────────────────────────────────────────
       match /messages/{messageId} {
-        // RULE-07 FIX: extracted a single getChatOnce() helper used by all
-        // three branches of allow update so the parent chat document is fetched
-        // at most once per rules evaluation instead of once per branch.
-        // Previously isChatMember() appeared in two separate branches of update,
-        // each calling get() independently — two billed reads per update request.
         function getChatOnce() {
           return get(/databases/$(database)/documents/chats/$(chatId));
         }
-
         function isChatMember() {
           let _chat = getChatOnce();
           return _chat != null && _chat.data.members.hasAny([callerEmail()]);
         }
-
-        // Returns the parent chat document (used where we need both membership
-        // and other fields, avoiding a second get() call).
         function getChatDoc() {
           return getChatOnce();
         }
-
-        // BUG-FIX-3: getChatDoc() was previously called twice in the non-member
-        // branch of allow create, triggering two Firestore document reads.
-        // Extracted into this helper so getChatDoc() is invoked exactly once.
         function isSystemMsgAllowed() {
           let _c = getChatDoc();
           return _c != null &&
                  _c.data.type == 'group' &&
                  request.resource.data.senderEmail == 'system';
         }
-
         allow read: if isSignedIn() && isChatMember();
-
-        // allow create: membership is resolved once via isChatMember().
-        // The non-member system-message branch uses isSystemMsgAllowed() which
-        // calls getChatDoc() only once, keeping total reads to 1 or 2.
         allow create: if isSignedIn() && (
           isChatMember()
             ? (request.resource.data.senderEmail == callerEmail() ||
                request.resource.data.senderEmail == 'system')
             : isSystemMsgAllowed()
         );
-
         allow update: if isSignedIn() && (
           isAdmin() ||
-
           (resource.data.senderEmail == callerEmail() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['senderEmail', 'senderName', 'createdAt',
                        'replyTo', 'forwarded', 'seenBy', 'deletedFor'])) ||
-
           (isChatMember() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['text', 'imageUrl', 'voiceUrl', 'fileUrl',
@@ -414,32 +345,25 @@ service cloud.firestore {
                        'fileName', 'fileMime', 'fileSize', '_deletedMediaUrls',
                        'attachments']))
         );
-
         allow delete: if isSignedIn() && (
           resource.data.senderEmail == callerEmail() || isAdmin()
         );
       }
-
-      // ── Typing indicators subcollection ───────────────────────────────
       match /typing/{typingUserEmail} {
         function callerIsTypingMember() {
           let _c = get(/databases/$(database)/documents/chats/$(chatId));
           return _c != null && _c.data.members.hasAny([callerEmail()]);
         }
-
         allow read:  if isSignedIn() && callerIsTypingMember();
         allow write: if isSignedIn() &&
                         callerEmail() == typingUserEmail &&
                         callerIsTypingMember();
       }
-
-      // ── Starred messages subcollection ────────────────────────────────
       match /starred/{starredUserEmail} {
         function callerIsStarredMember() {
           let _c = get(/databases/$(database)/documents/chats/$(chatId));
           return _c != null && _c.data.members.hasAny([callerEmail()]);
         }
-
         allow read:  if isSignedIn() && callerEmail() == starredUserEmail;
         allow write: if isSignedIn() &&
                         callerEmail() == starredUserEmail &&

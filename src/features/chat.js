@@ -522,7 +522,11 @@ export function teardownChat() {
 }
 
 function formatRelativeTime(ts) {
-    if (!ts?.toDate) return '';
+    // FIX: serverTimestamp() resolves to null on the local optimistic snapshot before the server
+    // confirms the write. Returning '' caused the sidebar time to go blank on every new message
+    // until the Firestore ACK arrived. Return 'Just now' so the sidebar always shows something
+    // meaningful for a freshly-updated conversation.
+    if (!ts?.toDate) return 'Just now';
     const date      = ts.toDate();
     const now       = new Date();
     const sameDay   = (a, b) =>
@@ -2332,7 +2336,7 @@ function ensureChatStyles() {
         }
         #chat-search-input {
             flex: 1; background: var(--wa-input-bg); border: 1.5px solid transparent;
-            outline: none; color: var(--wa-text); font-size: 14px;
+            outline: none; color: var(--wa-text); font-size: 16px; /* ≥16px prevents iOS auto-zoom */
             padding: 8px 14px; border-radius: 10px; transition: border-color .15s;
         }
         #chat-search-input:focus { border-color: var(--wa-accent); background: #fff; }
@@ -2768,6 +2772,16 @@ function ensureChatStyles() {
 
             /* Ensure active sidebar item unread badges don't overflow */
             .wa-badge { font-size: 10px !important; min-width: 18px !important; height: 18px !important; }
+
+            /* ─── Very narrow screens: collapse header action icons ─── */
+            #chat-action-starred-btn { font-size: 14px !important; }
+        }
+
+        /* ─── 360px and below: hide non-essential header buttons ─── */
+        @media (max-width: 360px) {
+            #chat-action-starred-btn { display: none !important; }
+            .wa-nav-btn { width: 32px !important; height: 32px !important; }
+            .ch-actions { gap: 1px !important; }
         }
 
         /* ─── Tablet: 640-767px — side-by-side but narrower sidebar ─── */
@@ -3466,8 +3480,11 @@ function subscribeTypingIndicator(roomId, chatType) {
             const data = d.data();
             if (d.id === currentUser.email) return;
             if (!data.typing) return;
-            // Treat as stale if no update in TYPING_TTL_MS (server-side not enforced, so we do it client-side)
-            const updatedMs = data.updatedAt?.toMillis?.() || 0;
+            // Treat as stale if no update in TYPING_TTL_MS (server-side not enforced, so we do it client-side).
+            // FIX: use ?? Date.now() instead of || 0 so a pending serverTimestamp (null before server
+            // ACK) is treated as "just written now" rather than epoch 0 — which made now-0 >> TYPING_TTL_MS
+            // and caused the indicator to be immediately filtered out before it ever appeared.
+            const updatedMs = data.updatedAt?.toMillis?.() ?? Date.now();
             if (now - updatedMs > TYPING_TTL_MS) return;
             typingName = data.name || d.id;
         });

@@ -27,11 +27,11 @@
 
 import { db } from '../config/firebase.js';
 import { currentUser } from '../store/db.js';
-import { createPostCardHTML, createCommentHTML, showToast } from '../ui/templates.js';
+import { createPostCardHTML, createCommentHTML, showToast, handleAiSummarize } from '../ui/templates.js';
 import {
     collection, addDoc, onSnapshot, query, orderBy, limit,
-    doc, getDoc, deleteDoc, updateDoc, increment,
-    arrayUnion, arrayRemove, serverTimestamp,
+    doc, getDoc, deleteDoc, updateDoc, increment, writeBatch,
+    arrayUnion, arrayRemove, serverTimestamp, runTransaction,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
 import { showPage } from '../ui/navigation.js';
 
@@ -43,7 +43,7 @@ const REPLY_MAX     = 500;
 const REACTIONS     = ['👍', '❤️', '😂', '😮', '😢'];
 
 // Gemini API — swap out key or model as needed
-const API_KEY = 'AQ.Ab8RN6Jx5AFXs_seMd4PR1ClcaEj36OLv7H6_36gM5PyAI3nrA';
+const API_KEY = 'YOUR_FIREBASE_API_KEY';
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`;
 
 // ─── Module state ─────────────────────────────────────────────────────────────
@@ -228,6 +228,30 @@ function deleteReplyFromTree(replies, targetId) {
         if (deleteReplyFromTree(replies[i].replies, targetId)) return true;
     }
     return false;
+}
+
+/**
+ * Count total replies (including nested) for a single reply subtree.
+ * Used to correctly decrement commentCount when a reply (and its children) is deleted.
+ */
+function countRepliesInSubtree(reply) {
+    if (!reply) return 0;
+    let count = 1; // the reply itself
+    if (Array.isArray(reply.replies)) {
+        for (const child of reply.replies) count += countRepliesInSubtree(child);
+    }
+    return count;
+}
+
+/** Find a reply node by id in the tree and return it (or null). */
+function findReplyInTree(replies, targetId) {
+    if (!Array.isArray(replies)) return null;
+    for (const r of replies) {
+        if (r.id === targetId) return r;
+        const found = findReplyInTree(r.replies, targetId);
+        if (found) return found;
+    }
+    return null;
 }
 
 /** Update the text of a reply with id `targetId`. Returns true if found. */
@@ -651,11 +675,14 @@ function startEditReply(replyCard, replyId, commentId, originalText) {
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving…';
         try {
-            const commentSnap = await getDoc(_commentRef(currentPostId, commentId));
-            if (!commentSnap.exists()) throw new Error('Comment not found');
-            const replies = commentSnap.data().replies || [];
-            editReplyInTree(replies, replyId, newText);
-            await updateDoc(_commentRef(currentPostId, commentId), { replies });
+            const ref = _commentRef(currentPostId, commentId);
+            await runTransaction(db, async (tx) => {
+                const snap = await tx.get(ref);
+                if (!snap.exists()) throw new Error('Comment not found');
+                const replies = snap.data().replies || [];
+                editReplyInTree(replies, replyId, newText);
+                tx.update(ref, { replies });
+            });
 
             textEl.textContent = newText;
             textEl.style.display = '';
@@ -708,33 +735,39 @@ async function toggleReplyLike(replyId, commentId, btn) {
     const counter = btn.querySelector('.like-count');
     const current = parseInt(counter?.textContent || '0', 10) || 0;
 
-    // Optimistic
+    // Optimistic UI update
     btn.classList.toggle('liked', !isLiked);
     if (counter) counter.textContent = String(isLiked ? Math.max(0, current - 1) : current + 1) || '';
 
     try {
-        const commentSnap = await getDoc(_commentRef(currentPostId, commentId));
-        if (!commentSnap.exists()) throw new Error('Comment not found');
-        const replies = commentSnap.data().replies || [];
+        // Use a transaction to avoid read-modify-write race conditions on the
+        // replies array (replies are stored as an embedded array, not a subcollection,
+        // so we must read+write atomically to prevent concurrent like updates
+        // from overwriting each other).
+        await runTransaction(db, async (tx) => {
+            const ref  = _commentRef(currentPostId, commentId);
+            const snap = await tx.get(ref);
+            if (!snap.exists()) throw new Error('Comment not found');
+            const replies = snap.data().replies || [];
 
-        // Walk tree to find and update the reply
-        const walk = (arr) => {
-            for (const r of arr) {
-                if (r.id === replyId) {
-                    r.likes   = isLiked ? Math.max(0, (r.likes || 0) - 1) : (r.likes || 0) + 1;
-                    r.likedBy = r.likedBy || [];
-                    if (isLiked) r.likedBy = r.likedBy.filter(e => e !== currentUser.email);
-                    else         r.likedBy.push(currentUser.email);
-                    return true;
+            const walk = (arr) => {
+                for (const r of arr) {
+                    if (r.id === replyId) {
+                        r.likes   = isLiked ? Math.max(0, (r.likes || 0) - 1) : (r.likes || 0) + 1;
+                        r.likedBy = r.likedBy || [];
+                        if (isLiked) r.likedBy = r.likedBy.filter(e => e !== currentUser.email);
+                        else if (!r.likedBy.includes(currentUser.email)) r.likedBy.push(currentUser.email);
+                        return true;
+                    }
+                    if (r.replies && walk(r.replies)) return true;
                 }
-                if (r.replies && walk(r.replies)) return true;
-            }
-            return false;
-        };
-        walk(replies);
-        await updateDoc(_commentRef(currentPostId, commentId), { replies });
+                return false;
+            };
+            walk(replies);
+            tx.update(ref, { replies });
+        });
     } catch (err) {
-        // Revert
+        // Revert optimistic UI on failure
         btn.classList.toggle('liked', isLiked);
         if (counter) counter.textContent = String(current) || '';
         _safeToast('Failed to update like.', 'error');
@@ -754,23 +787,30 @@ async function applyReaction(emoji, entityId, isReply, parentCommentId) {
 
     try {
         const commentId = isReply ? parentCommentId : entityId;
-        const commentSnap = await getDoc(_commentRef(currentPostId, commentId));
-        if (!commentSnap.exists()) throw new Error('Comment not found');
+        const ref       = _commentRef(currentPostId, commentId);
 
         if (!isReply) {
-            // Comment-level reaction
-            const field = `reactions.${emoji}`;
-            const hasReacted = (commentSnap.data().reactions?.[emoji] || []).includes(currentUser.email);
-            await updateDoc(_commentRef(currentPostId, commentId), {
+            // Comment-level reaction — reactions are top-level map fields so we
+            // can use a single read + atomic arrayUnion/arrayRemove safely.
+            const snap       = await getDoc(ref);
+            if (!snap.exists()) throw new Error('Comment not found');
+            const field      = `reactions.${emoji}`;
+            const hasReacted = (snap.data().reactions?.[emoji] || []).includes(currentUser.email);
+            await updateDoc(ref, {
                 [field]: hasReacted
                     ? arrayRemove(currentUser.email)
                     : arrayUnion(currentUser.email),
             });
         } else {
-            // Reply-level reaction — stored inside the replies array
-            const replies = commentSnap.data().replies || [];
-            toggleReactionInTree(replies, entityId, emoji, currentUser.email);
-            await updateDoc(_commentRef(currentPostId, commentId), { replies });
+            // Reply-level reaction — replies are embedded in an array so we use
+            // a transaction to avoid concurrent updates overwriting each other.
+            await runTransaction(db, async (tx) => {
+                const snap = await tx.get(ref);
+                if (!snap.exists()) throw new Error('Comment not found');
+                const replies = snap.data().replies || [];
+                toggleReactionInTree(replies, entityId, emoji, currentUser.email);
+                tx.update(ref, { replies });
+            });
         }
     } catch (err) {
         console.error('[comments] Reaction error:', err);
@@ -888,7 +928,9 @@ export function setupComments() {
                     commentsList.after(moreBtn);
                     moreBtn.addEventListener('click', () => {
                         commentLimit += PAGE_SIZE;
-                        if (activeCommentsListener) activeCommentsListener();
+                        // Reuse _openCommentsPage's restart logic — just bump the
+                        // limit and let the existing listener be replaced cleanly.
+                        if (activeCommentsListener) { activeCommentsListener(); activeCommentsListener = null; }
                         activeCommentsListener = onSnapshot(
                             query(
                                 collection(db, `posts/${postId}/comments`),
@@ -900,6 +942,9 @@ export function setupComments() {
                                 commentsList.innerHTML = '';
                                 snap.forEach(d => commentsList.innerHTML += renderComment({ id: d.id, ...d.data() }, postId));
                                 if (snap.size < commentLimit) moreBtn.remove();
+                            },
+                            (err) => {
+                                console.error('[comments] load-more snapshot error:', err);
                             }
                         );
                     });
@@ -949,12 +994,34 @@ export function setupComments() {
         if (e.target.closest('.upvote-btn')) {
             if (!currentUser) return _safeToast('Sign in to upvote.', 'warn');
             const btn     = e.target.closest('.upvote-btn');
-            const isVoted = btn.classList.contains('action-btn--active');
+
+            // BUG-FIX-COMMENTS-UPVOTE-DETECT: the post card here is rendered by
+            // createPostCardHTML (templates.js), which marks a voted button with
+            // 'bg-indigo-50' — NOT 'action-btn--active'. The old check only looked
+            // for 'action-btn--active', so a post the user already voted on always
+            // read as unvoted, causing a click to ADD a vote instead of removing it.
+            // Mirror the same three-way detection used by handleFeedClick in posts.js.
+            const isVoted = btn.classList.contains('action-btn--active') ||
+                            btn.getAttribute('aria-pressed') === 'true'  ||
+                            btn.classList.contains('bg-indigo-50');
+
             const counter = btn.querySelector('.upvote-count');
             const current = parseInt(counter?.textContent || '0', 10) || 0;
 
-            // Optimistic UI
+            // Optimistic UI — posts.js style
             btn.classList.toggle('action-btn--active', !isVoted);
+            // BUG-FIX-COMMENTS-UPVOTE-STYLE: the old handler only toggled
+            // 'action-btn--active' but never touched the indigo colour classes
+            // used by templates.js, leaving the button visually stuck after voting.
+            if (!isVoted) {
+                btn.classList.add('bg-indigo-50', 'text-indigo-600', 'border-indigo-200',
+                    'dark:bg-indigo-900/30', 'dark:text-indigo-400', 'dark:border-indigo-800');
+                btn.classList.remove('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+            } else {
+                btn.classList.remove('bg-indigo-50', 'text-indigo-600', 'border-indigo-200',
+                    'dark:bg-indigo-900/30', 'dark:text-indigo-400', 'dark:border-indigo-800');
+                btn.classList.add('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+            }
             btn.setAttribute('aria-pressed', String(!isVoted));
             const svg = btn.querySelector('svg');
             if (svg) svg.setAttribute('fill', isVoted ? 'none' : 'currentColor');
@@ -966,11 +1033,19 @@ export function setupComments() {
             try {
                 await updateDoc(doc(db, 'posts', postId), {
                     upvotedBy:   isVoted ? arrayRemove(currentUser.email) : arrayUnion(currentUser.email),
-                    upvoteCount: isVoted ? Math.max(0, current - 1) : current + 1,
+                    upvoteCount: increment(isVoted ? -1 : 1),
                 });
             } catch {
-                // Revert on failure
+                // Revert on failure — restore both class systems
                 btn.classList.toggle('action-btn--active', isVoted);
+                if (isVoted) {
+                    btn.classList.add('bg-indigo-50', 'text-indigo-600', 'border-indigo-200');
+                    btn.classList.remove('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+                } else {
+                    btn.classList.remove('bg-indigo-50', 'text-indigo-600', 'border-indigo-200');
+                    btn.classList.add('text-gray-500', 'dark:text-gray-400', 'border-transparent');
+                }
+                btn.setAttribute('aria-pressed', String(isVoted));
                 if (svg) svg.setAttribute('fill', isVoted ? 'currentColor' : 'none');
                 if (counter) counter.textContent = String(current);
                 _safeToast('Upvote failed. Try again.', 'error');
@@ -978,16 +1053,62 @@ export function setupComments() {
             return;
         }
 
+        // ── Bookmark ─────────────────────────────────────────────────────────
+        if (e.target.closest('.bookmark-btn')) {
+            if (!currentUser) return _safeToast('Sign in to bookmark.', 'warn');
+            const btn     = e.target.closest('.bookmark-btn');
+            const userRef = doc(db, 'users', currentUser.email);
+            const isSaved = btn.classList.contains('action-btn--saved') ||
+                            btn.getAttribute('aria-pressed') === 'true' ||
+                            btn.classList.contains('text-amber-500');
+
+            // Optimistic UI — posts.js style
+            btn.classList.toggle('action-btn--saved', !isSaved);
+            // Optimistic UI — templates.js style
+            if (!isSaved) {
+                btn.classList.add('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
+                btn.classList.remove('text-gray-400', 'dark:text-gray-500');
+                const svgEl = btn.querySelector('svg');
+                if (svgEl) svgEl.setAttribute('fill', 'currentColor');
+            } else {
+                btn.classList.remove('text-amber-500', 'bg-amber-50', 'dark:bg-amber-900/20');
+                btn.classList.add('text-gray-400', 'dark:text-gray-500');
+                const svgEl = btn.querySelector('svg');
+                if (svgEl) svgEl.setAttribute('fill', 'none');
+            }
+            btn.setAttribute('aria-pressed', String(!isSaved));
+
+            if (!currentUser.savedPosts) currentUser.savedPosts = [];
+            if (isSaved) {
+                currentUser.savedPosts = currentUser.savedPosts.filter(id => id !== postId);
+            } else {
+                currentUser.savedPosts.push(postId);
+            }
+            _safeToast(isSaved ? 'Bookmark removed.' : 'Bookmarked!', 'success', 2000);
+            try {
+                await updateDoc(userRef, { savedPosts: isSaved ? arrayRemove(postId) : arrayUnion(postId) });
+            } catch {
+                // Rollback
+                btn.classList.toggle('action-btn--saved', isSaved);
+                if (isSaved) btn.classList.add('text-amber-500', 'bg-amber-50');
+                else btn.classList.remove('text-amber-500', 'bg-amber-50');
+                _safeToast('Bookmark failed.', 'error');
+            }
+            return;
+        }
+
         // ── AI Summarize (post-card inline button) ───────────────────────────
         if (e.target.closest('.ai-summarize-btn')) {
             if (!currentUser) return _safeToast('Sign in to use AI features.', 'warn');
-            // Delegate to posts.js handler if available, otherwise basic inline summary
-            if (typeof window.aiSummarizePost === 'function' && postCard) {
-                const snap = await getDoc(doc(db, 'posts', postId));
-                if (snap.exists()) window.aiSummarizePost(postCard, { id: postId, ...snap.data() });
-            } else {
-                _safeToast('AI summary not available here.', 'info');
-            }
+            // BUG-FIX-AI-SUMMARIZE-COMMENTS: window.aiSummarizePost was never
+            // assigned anywhere in the codebase, so this check was always false
+            // and every click fell through to the "not available here" toast.
+            // The card here is rendered by createPostCardHTML (templates.js) which
+            // includes .ai-summary-container — call handleAiSummarize directly,
+            // the same function handleFeedClick uses for the bookmarks feed.
+            if (!postCard) return;
+            const snap = await getDoc(doc(db, 'posts', postId));
+            if (snap.exists()) await handleAiSummarize(postCard, { id: postId, ...snap.data() });
             return;
         }
 
@@ -1092,7 +1213,15 @@ export function setupComments() {
         submitCommentBtn.textContent = 'Posting…';
 
         try {
-            await addDoc(collection(db, `posts/${postId}/comments`), {
+            // BUG-FIX-COMMENT-ATOMIC: use writeBatch so the new comment doc and
+            // the commentCount increment land atomically.  The old sequential
+            // addDoc + updateDoc pattern let the count diverge permanently if the
+            // network dropped between the two calls (comment created, count not
+            // incremented) or if a Firestore permission error hit only one leg.
+            // writeBatch commits both operations in a single round-trip or neither.
+            const _addBatch   = writeBatch(db);
+            const _newComRef  = doc(collection(db, `posts/${postId}/comments`));
+            _addBatch.set(_newComRef, {
                 text,
                 author:        currentUser.name  || currentUser.email,
                 authorEmail:   currentUser.email,
@@ -1106,7 +1235,8 @@ export function setupComments() {
                 pinned:        false,
                 edited:        false,
             });
-            await updateDoc(doc(db, 'posts', postId), { commentCount: increment(1) });
+            _addBatch.update(doc(db, 'posts', postId), { commentCount: increment(1) });
+            await _addBatch.commit();
             if (commentTextarea) commentTextarea.value = '';
             // Reset counter
             const counterEl = commentTextarea?.nextElementSibling;
@@ -1256,20 +1386,23 @@ export function setupComments() {
 
             try {
                 const newReply       = _buildReplyObj(text);
-                const commentSnap    = await getDoc(commentRef);
-                if (!commentSnap.exists()) throw new Error('Comment not found');
+                const parentReplyId  = parentReplyCard?.dataset.replyId || null;
 
-                const replies = commentSnap.data().replies || [];
-
-                if (parentReplyCard) {
-                    // Deep-nested reply
-                    addReplyToTree(replies, parentReplyCard.dataset.replyId, newReply);
-                } else {
-                    // Top-level reply to the comment
-                    replies.push(newReply);
-                }
-
-                await updateDoc(commentRef, { replies });
+                // Use a transaction so the replies array read and write are atomic
+                // (prevents two simultaneous replies from overwriting each other),
+                // then batch-update commentCount in the same commit.
+                await runTransaction(db, async (tx) => {
+                    const snap = await tx.get(commentRef);
+                    if (!snap.exists()) throw new Error('Comment not found');
+                    const replies = snap.data().replies || [];
+                    if (parentReplyId) {
+                        addReplyToTree(replies, parentReplyId, newReply);
+                    } else {
+                        replies.push(newReply);
+                    }
+                    tx.update(commentRef, { replies });
+                    tx.update(doc(db, 'posts', postId), { commentCount: increment(1) });
+                });
                 textarea.value = '';
                 form.classList.remove('open');
                 _safeToast('Reply posted!', 'success');
@@ -1295,8 +1428,18 @@ export function setupComments() {
             if (!card) return;
             btn.textContent = 'Deleting…'; btn.disabled = true;
             try {
-                await deleteDoc(_commentRef(postId, commentId));
-                await updateDoc(doc(db, 'posts', postId), { commentCount: increment(-1) });
+                // BUG-FIX-COMMENT-ATOMIC + BUG-FIX-COMMENT-COUNT:
+                // Fetch the comment to count its nested replies, then batch the
+                // delete + decrement (1 for the comment itself + all nested replies)
+                // so both succeed or both fail together.
+                const commentSnap    = await getDoc(_commentRef(postId, commentId));
+                const commentReplies = commentSnap.exists() ? (commentSnap.data().replies || []) : [];
+                let totalDeleteCount = 1; // the comment itself
+                for (const r of commentReplies) totalDeleteCount += countRepliesInSubtree(r);
+                const _delBatch = writeBatch(db);
+                _delBatch.delete(_commentRef(postId, commentId));
+                _delBatch.update(doc(db, 'posts', postId), { commentCount: increment(-totalDeleteCount) });
+                await _delBatch.commit();
                 card.style.transition = 'opacity 0.3s, transform 0.3s';
                 card.style.opacity    = '0';
                 card.style.transform  = 'scale(0.97)';
@@ -1321,12 +1464,22 @@ export function setupComments() {
 
             btn.textContent = 'Deleting…'; btn.disabled = true;
             try {
-                const snap    = await getDoc(_commentRef(postId, parentId));
-                const replies = snap.data()?.replies || [];
-                deleteReplyFromTree(replies, replyId);
-                await updateDoc(_commentRef(postId, parentId), { replies });
+                const ref        = _commentRef(postId, parentId);
+                let deleteCount  = 1;
+                const replyCard  = e.target.closest('[data-reply-id]');
 
-                const replyCard = e.target.closest('[data-reply-id]');
+                // Use a transaction so the replies read and write are atomic —
+                // prevents a concurrent reply submission from losing its write.
+                await runTransaction(db, async (tx) => {
+                    const snap    = await tx.get(ref);
+                    const replies = snap.data()?.replies || [];
+                    const node    = findReplyInTree(replies, replyId);
+                    deleteCount   = node ? countRepliesInSubtree(node) : 1;
+                    deleteReplyFromTree(replies, replyId);
+                    tx.update(ref, { replies });
+                    tx.update(doc(db, 'posts', postId), { commentCount: increment(-deleteCount) });
+                });
+
                 if (replyCard) {
                     replyCard.style.transition = 'opacity 0.3s';
                     replyCard.style.opacity    = '0';

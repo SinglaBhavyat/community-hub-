@@ -316,6 +316,7 @@ function injectStyles() {
       gap: 8px;
       flex-wrap: wrap;
       margin-bottom: 18px;
+      row-gap: 10px;
     }
     .lf-filter-btn {
       padding: 6px 16px;
@@ -333,7 +334,7 @@ function injectStyles() {
     body.dark-mode .lf-filter-btn { border-color: #3f3f46; color: #71717a; }
     body.dark-mode .lf-filter-btn:hover,
     body.dark-mode .lf-filter-btn.active { background: rgba(99,102,241,0.15); border-color: #4338ca; color: #a5b4fc; }
-    .lf-search-wrap { margin-left: auto; position: relative; display: flex; align-items: center; }
+    .lf-search-wrap { margin-left: auto; position: relative; display: flex; align-items: center; min-width: 0; }
     .lf-search-wrap svg { position: absolute; left: 10px; color: #9ca3af; pointer-events: none; }
     .lf-search {
       background: #f9fafb;
@@ -344,7 +345,7 @@ function injectStyles() {
       padding: 7px 10px 7px 32px;
       outline: none;
       transition: border-color 0.15s, box-shadow 0.15s;
-      width: 200px;
+      width: clamp(120px, 30vw, 200px);
     }
     .lf-search:focus { border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.12); }
     .lf-search::placeholder { color: #9ca3af; }
@@ -1994,7 +1995,9 @@ export function setupLostFound() {
     _userUnsubscribe?.(); // guard against setupLostFound() being called more than once
     _userUnsubscribe = onCurrentUserChange(() => {
       rerenderFromCache();   // instant: refresh owner/admin buttons from cache
-      startFeedListener();   // robust: get a fresh, correctly-authenticated listener
+      // Only restart the feed listener if auth is already confirmed (i.e. after
+      // initial load). The onAuthStateChanged handler below covers the first start.
+      if (_feedUnsub) startFeedListener();
     });
 
     // FIX: wait for Firebase Auth to confirm the token before opening the first
@@ -2003,7 +2006,7 @@ export function setupLostFound() {
     // onAuthStateChanged is the canonical signal that the JWT is ready.
     const _unsubLFAuth = onAuthStateChanged(auth, firebaseUser => {
       _unsubLFAuth(); // one-shot
-      if (firebaseUser) startFeedListener();
+      startFeedListener(); // always start (signed-in or signed-out; rules enforce access)
     });
 
     // ── Delegated events ──────────────────────────────────────────────────

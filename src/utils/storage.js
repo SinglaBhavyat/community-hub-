@@ -45,25 +45,53 @@ async function getVideoThumbnail(file) {
         const video  = document.createElement('video');
         const canvas = document.createElement('canvas');
         const url    = URL.createObjectURL(file);
-        video.src    = url;
-        video.muted  = true;
-        video.playsInline = true;
 
-        video.addEventListener('loadeddata', () => {
-            video.currentTime = 0;
-        });
-        video.addEventListener('seeked', () => {
+        let settled = false;
+        function done(dataUrl) {
+            if (settled) return;
+            settled = true;
+            URL.revokeObjectURL(url);
+            resolve(dataUrl);
+        }
+
+        function capture() {
+            if (settled) return;
+            // Guard against zero-size video (metadata not yet ready)
+            if (!video.videoWidth || !video.videoHeight) { done(null); return; }
             canvas.width  = Math.min(video.videoWidth,  480);
             canvas.height = Math.round(canvas.width * (video.videoHeight / video.videoWidth));
-            canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-            URL.revokeObjectURL(url);
-            resolve(canvas.toDataURL('image/jpeg', 0.7));
-        });
-        video.addEventListener('error', () => {
-            URL.revokeObjectURL(url);
-            resolve(null);
+            try {
+                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                done(canvas.toDataURL('image/jpeg', 0.7));
+            } catch {
+                done(null);
+            }
+        }
+
+        // Timeout fallback — if events never fire (e.g. unsupported codec) resolve null
+        const timeout = setTimeout(() => done(null), 8000);
+
+        video.addEventListener('seeked', () => {
+            clearTimeout(timeout);
+            capture();
         });
 
+        video.addEventListener('loadedmetadata', () => {
+            // Seek to 0.1 s (not 0) so browsers that skip seeking to the
+            // already-current position still fire the 'seeked' event.
+            // Clamp to duration in case the video is very short.
+            video.currentTime = Math.min(0.1, (video.duration || 0) / 2);
+        });
+
+        video.addEventListener('error', () => {
+            clearTimeout(timeout);
+            done(null);
+        });
+
+        video.muted      = true;
+        video.playsInline = true;
+        video.preload    = 'metadata';
+        video.src        = url;
         video.load();
     });
 }
