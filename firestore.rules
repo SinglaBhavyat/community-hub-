@@ -26,6 +26,16 @@ service cloud.firestore {
         data.authorUid   == request.auth.uid
       );
     }
+    // BAN ENFORCEMENT: admin.js's "Suspend" button only ever set isBanned:true
+    // on the user's own doc — nothing server-side ever checked it, so a
+    // suspended user could keep posting/chatting/etc. through direct Firestore
+    // writes. isBanned() is the server-side backstop; it's required (OR'd with
+    // isAdmin() as an escape hatch) on every content-creation rule below.
+    function isBanned() {
+      let _doc = get(/databases/$(database)/documents/users/$(callerEmail()));
+      return isSignedIn() && _doc != null && _doc.data != null &&
+        _doc.data.get('isBanned', false) == true;
+    }
 
     // ── collectionGroup: comments ─────────────────────────────────────────
     // FIX: achievements.js uses collectionGroup(db, 'comments') to count all
@@ -39,7 +49,8 @@ service cloud.firestore {
     match /{path=**}/comments/{commentId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == callerEmail();
+        request.resource.data.authorEmail == callerEmail() &&
+        (!isBanned() || isAdmin());
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           request.resource.data.diff(resource.data).affectedKeys()
@@ -53,7 +64,8 @@ service cloud.firestore {
       allow create: if isSignedIn() &&
         request.resource.data.senderEmail == callerEmail() &&
         request.resource.data.isDeleted   == false &&
-        (request.resource.data.text is string || request.resource.data.text == null);
+        (request.resource.data.text is string || request.resource.data.text == null) &&
+        (!isBanned() || isAdmin());
       allow update: if isSignedIn() && (
         (resource.data.senderEmail == callerEmail() &&
           request.resource.data.diff(resource.data).affectedKeys()
@@ -94,7 +106,8 @@ service cloud.firestore {
         // pre-resolved document from being submitted at creation time.
         !request.resource.data.keys().hasAny(['isResolved', 'adminNote', 'resolvedBy']) &&
         request.resource.data.get('resolved', false) == false &&
-        request.resource.data.get('resolvedAtMs', null) == null;
+        request.resource.data.get('resolvedAtMs', null) == null &&
+        (!isBanned() || isAdmin());
       allow update, delete: if isOwner(resource.data) || isAdmin();
     }
     match /reports/{reportId} {
@@ -178,6 +191,7 @@ service cloud.firestore {
       allow create: if isSignedIn() && (
         (isAdmin() && request.resource.data.authorEmail == callerEmail()) ||
         (request.resource.data.authorEmail == callerEmail() &&
+         !isBanned() &&
          !request.resource.data.keys().hasAny(
            ['isBroadcast', 'broadcastCategory', 'broadcastTitle']))
       );
@@ -197,7 +211,8 @@ service cloud.firestore {
       match /comments/{commentId} {
         allow read: if isSignedIn();
         allow create: if isSignedIn() &&
-          request.resource.data.authorEmail == callerEmail();
+          request.resource.data.authorEmail == callerEmail() &&
+          (!isBanned() || isAdmin());
         allow update: if isOwner(resource.data) || isAdmin() ||
           (isSignedIn() &&
             request.resource.data.diff(resource.data).affectedKeys()
@@ -208,7 +223,8 @@ service cloud.firestore {
     match /events/{eventId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == callerEmail();
+        request.resource.data.authorEmail == callerEmail() &&
+        (!isBanned() || isAdmin());
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           request.resource.data.diff(resource.data).affectedKeys()
@@ -224,7 +240,8 @@ service cloud.firestore {
       );
       allow create: if isSignedIn() &&
         request.resource.data.members.hasAny([callerEmail()]) &&
-        request.resource.data.members.size() <= 200;
+        request.resource.data.members.size() <= 200 &&
+        (!isBanned() || isAdmin());
       allow update: if isSignedIn() && (
         isAdmin() ||
         (resource.data.members.hasAny([callerEmail()]) &&
@@ -325,7 +342,7 @@ service cloud.firestore {
                  request.resource.data.senderEmail == 'system';
         }
         allow read: if isSignedIn() && isChatMember();
-        allow create: if isSignedIn() && (
+        allow create: if isSignedIn() && (!isBanned() || isAdmin()) && (
           isChatMember()
             ? (request.resource.data.senderEmail == callerEmail() ||
                request.resource.data.senderEmail == 'system')

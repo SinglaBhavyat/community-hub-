@@ -2789,8 +2789,20 @@ async function submitReport(msgId, msg, category, comment) {
   if (!currentUser?.email) return;
   const reportId = makeReportKey(msgId, currentUser.email);
   try {
-    const existing = await getDoc(doc(db, 'reports', reportId));
-    if (existing.exists()) {
+    // NOTE: reads on the 'reports' collection are admin-only in firestore.rules
+    // (allow read: if isAdmin()), so a non-admin user's duplicate-check getDoc()
+    // here is *expected* to throw permission-denied. That's fine — we only use
+    // this to skip a duplicate submission when we're able to see one; we must
+    // not let a denied read block the report from being created at all. The
+    // deterministic reportId (reporter+msg) plus setDoc below still guarantees
+    // idempotency at the database level even when this check is skipped.
+    let existing = null;
+    try {
+      existing = await getDoc(doc(db, 'reports', reportId));
+    } catch (readErr) {
+      console.warn('[LiveChat] Duplicate-check read denied, proceeding to write:', readErr.code);
+    }
+    if (existing?.exists()) {
       showLCToast('You already reported this message', 'warning');
       return;
     }

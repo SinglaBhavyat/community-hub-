@@ -108,8 +108,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 overlay.remove();
                 _maintOverlayReady = false;
             }
-            if (header) header.style.display = '';
-            if (main)   main.style.display   = '';
+            // Don't restore header/main if the ban lock also needs them hidden
+            // (this listener can fire independently of the ban-lock poll below).
+            if (!(currentUser && currentUser.isBanned)) {
+                if (header) header.style.display = '';
+                if (main)   main.style.display   = '';
+            }
         }
     }
 
@@ -120,12 +124,114 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // ==========================================
+    // BAN LOCK
+    // ──────────────────────────────────────────
+    // firestore.rules now hard-blocks writes from banned users (isBanned()
+    // check on every create rule) — that's the actual security enforcement.
+    // This overlay is the UX layer on top of it: without it, a suspended user
+    // just sees confusing "Failed to..." toasts from permission-denied errors
+    // every time they try to post/comment/chat, with no explanation why.
+    //
+    // currentUser.isBanned is populated once at sign-in (auth.js fetches the
+    // Firestore profile then). Same convention as currentUser.role elsewhere
+    // in this file — a change made by an admin takes effect for the affected
+    // user on their next login/refresh, not instantly mid-session. The rules
+    // enforcement above is what actually stops writes in the meantime.
+    // ==========================================
+    let _banOverlayReady = false;
+
+    function enforceBanLock() {
+        const isBannedUser = !!(currentUser && currentUser.isBanned);
+        const header = document.getElementById('header');
+        const main   = document.querySelector('main');
+        let   overlay = document.getElementById('ban-overlay-lock');
+
+        if (isBannedUser) {
+            if (header) header.style.display = 'none';
+            if (main)   main.style.display   = 'none';
+
+            if (!overlay && !_banOverlayReady) {
+                _banOverlayReady = true;
+
+                overlay = document.createElement('div');
+                overlay.id = 'ban-overlay-lock';
+                overlay.style.cssText = [
+                    'position:fixed;inset:0;z-index:999999',
+                    'display:flex;flex-direction:column;align-items:center;justify-content:center',
+                    'background:#020617;color:white;padding:2rem;text-align:center',
+                    'font-family:"Inter",sans-serif',
+                ].join(';');
+
+                overlay.innerHTML = `
+                    <div style="width:80px;height:80px;background:rgba(248,113,113,.1);border-radius:50%;
+                                display:flex;align-items:center;justify-content:center;margin-bottom:2rem;
+                                border:1px solid rgba(248,113,113,.2);box-shadow:0 0 30px rgba(248,113,113,.2);">
+                        <svg style="width:40px;height:40px;color:#f87171;" fill="none" viewBox="0 0 24 24"
+                             stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                  d="M18.364 18.364A9 9 0 105.636 5.636a9 9 0 0012.728 12.728zM5.636 5.636l12.728 12.728"/>
+                        </svg>
+                    </div>
+                    <h1 style="font-size:2.5rem;font-weight:900;letter-spacing:-.05em;margin-bottom:1rem;">
+                        Account Suspended
+                    </h1>
+                    <p style="color:#94a3b8;font-size:1.1rem;max-width:500px;line-height:1.6;margin-bottom:2.5rem;">
+                        Your account has been suspended by a moderator for violating
+                        community guidelines. If you believe this is a mistake, please
+                        contact the community team.
+                    </p>
+                    <button id="ban-logout-btn"
+                            style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);
+                                   padding:14px 28px;border-radius:99px;color:white;font-weight:bold;
+                                   cursor:pointer;transition:all .3s;font-size:.9rem;
+                                   text-transform:uppercase;letter-spacing:.05em;">
+                        Log Out
+                    </button>`;
+
+                document.body.appendChild(overlay);
+
+                document.getElementById('ban-logout-btn').addEventListener('click', async (e) => {
+                    const btn = e.currentTarget;
+                    btn.textContent = 'Processing…';
+                    btn.disabled    = true;
+                    try {
+                        await signOut(auth);
+                        window.location.reload();
+                    } catch (err) {
+                        console.error('Ban-lock sign-out error:', err);
+                        btn.disabled = false;
+                        btn.textContent = 'Log Out';
+                    }
+                });
+            }
+        } else {
+            if (overlay) {
+                overlay.remove();
+                _banOverlayReady = false;
+            }
+            // Only restore header/main here if maintenance lock isn't also
+            // supposed to be hiding them right now.
+            if (!(window.isMaintenanceActive && !(currentUser && currentUser.role === 'admin'))) {
+                if (header) header.style.display = '';
+                if (main)   main.style.display   = '';
+            }
+        }
+    }
+
+    // Poll at a gentler cadence (1 s) to catch auth-state flips between Firestore snapshots.
+    // Cleared automatically if the page is hidden to avoid background CPU waste.
+    function _enforceAccessLocks() {
+        enforceMaintenanceLock();
+        enforceBanLock();
+    }
+
     // Listen to Firestore for the global maintenance flag
     onSnapshot(
         doc(db, 'platform_settings', 'global'),
         (docSnap) => {
             window.isMaintenanceActive = docSnap.exists() && docSnap.data().maintenanceMode === true;
-            enforceMaintenanceLock();
+            _enforceAccessLocks();
         },
         (error) => {
             console.error(
@@ -135,14 +241,12 @@ document.addEventListener('DOMContentLoaded', () => {
         },
     );
 
-    // Poll at a gentler cadence (1 s) to catch auth-state flips between Firestore snapshots.
-    // Cleared automatically if the page is hidden to avoid background CPU waste.
-    _maintInterval = setInterval(enforceMaintenanceLock, 1000);
+    _maintInterval = setInterval(_enforceAccessLocks, 1000);
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
             clearInterval(_maintInterval);
         } else {
-            _maintInterval = setInterval(enforceMaintenanceLock, 1000);
+            _maintInterval = setInterval(_enforceAccessLocks, 1000);
         }
     });
 
@@ -189,8 +293,10 @@ document.addEventListener('DOMContentLoaded', () => {
             // Reset init flag so modules re-initialise cleanly on next sign-in
             _modulesInitialised = false;
         }
+        if (!user) enforceBanLock(); // currentUser is null here, so this just clears any stale overlay
         if (user && !_modulesInitialised) {
             _modulesInitialised = true;
+            enforceBanLock();
             setupPosts();
             setupEventsAndPolls();
             setupComments();
