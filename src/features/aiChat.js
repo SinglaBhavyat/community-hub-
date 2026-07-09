@@ -39,10 +39,7 @@
  *                       AbortError because the delay ran before the error-type
  *                       check. Moved AbortError guard to the top of the catch
  *                       block so it breaks immediately with no sleep.
- *   [FIX-BUG-EMOJI-D]  localStorage key namespaced to 'echo_v2_recent_emojis'
- *                       so multiple Echo instances on the same origin don't
- *                       clobber each other. Accepts an optional `storageKey`
- *                       config option for explicit namespacing.
+ *   [FIX-BUG-EMOJI-D]  Recent emojis kept in memory only (no localStorage).
  *   [FIX-BUG-SUBMIT-E] form.requestSubmit fallback was
  *                       `form.dispatchEvent(new Event('submit', ...))` which
  *                       bypasses the handler's preventDefault in Safari <16.
@@ -116,7 +113,7 @@ export function setApiKey(key) {
 function resolveApiKey() {
   const key = _configApiKey
     || window.__GEMINI_KEY
-    || 'AQ.Ab8RN6Jx5AFXs_seMd4PR1ClcaEj36OLv7H6_36gM5PyAI3nrA';
+    || 'AQ.Ab8RN6KFuYw_tfXqVS-QU05FFeChuogxdIU11OiffxsXhz_a9w';
   return key;
 }
 
@@ -128,7 +125,7 @@ const RETRY_DELAYS      = [1000, 2000, 4000];
 // Gemini streaming endpoint.
 // AQ.Ab8... format keys work via the X-goog-api-key header (confirmed via curl).
 const GEMINI_BASE_URL =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:streamGenerateContent?alt=sse';
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse';
 // Key sent via x-goog-api-key header (proven to work with AQ.Ab8... format keys)
 const geminiUrl = () => GEMINI_BASE_URL;
 
@@ -270,8 +267,88 @@ function injectStyles() {
       }
     }
 
-    /* ── Dark theme (default) ── */
-    :root, .echo-theme-dark {
+    /* ── Light theme (default) ── */
+    :root {
+      --echo-bg-bubble-bot:     #ffffff;
+      --echo-bg-bubble-bot-h:   #f5f5f5;
+      --echo-border-bubble-bot: rgba(0, 0, 0, 0.1);
+      --echo-text-bubble-bot:   #111827;
+      --echo-bg-code-block:     #f6f8fa;
+      --echo-bg-code-header:    #eef0f2;
+      --echo-border-code:       rgba(0,0,0,0.12);
+      --echo-border-code-head:  rgba(0,0,0,0.08);
+      --echo-text-code:         #6d28d9;
+      --echo-text-code-lang:    #6b7280;
+      --echo-bg-inline-code:    #f0eeff;
+      --echo-text-meta-time:    #6b7280;
+      --echo-text-meta-action:  #4f46e5;
+      --echo-text-meta-hover:   #4338ca;
+      --echo-bg-meta-hover:     rgba(79,70,229,0.08);
+      --echo-bg-typing:         #ffffff;
+      --echo-border-typing:     rgba(0,0,0,0.1);
+      --echo-bg-scroll-btn:     #ffffff;
+      --echo-border-scroll-btn: rgba(0,0,0,0.15);
+      --echo-text-scroll-btn:   #374151;
+      --echo-bg-scroll-hover:   #f3f4f6;
+      --echo-text-empty:        #6b7280;
+      --echo-text-empty-h3:     #374151;
+      --echo-text-status:       #6b7280;
+      --echo-text-char:         #6b7280;
+      --echo-bg-copy-btn-hover: rgba(0,0,0,0.05);
+      --echo-text-copy-btn:     #6b7280;
+      --echo-text-copy-hover:   #374151;
+      --echo-hr-color:          rgba(0,0,0,0.12);
+      --echo-text-h1:           #111827;
+      --echo-text-h2:           #1f2937;
+      --echo-text-h3:           #374151;
+      --echo-bubble-cancelled-bg:     rgba(243,244,246,0.8);
+      --echo-bubble-cancelled-border: rgba(0,0,0,0.08);
+      --echo-bubble-cancelled-color:  #9ca3af;
+    }
+
+    /* ── Dark theme ── */
+    @media (prefers-color-scheme: dark) {
+      :root:not(.echo-theme-light) {
+        --echo-bg-bubble-bot:     rgba(28, 28, 32, 0.95);
+        --echo-bg-bubble-bot-h:   rgba(36, 36, 42, 0.98);
+        --echo-border-bubble-bot: rgba(63, 63, 70, 0.55);
+        --echo-text-bubble-bot:   #e4e4e7;
+        --echo-bg-code-block:     rgba(9, 9, 11, 0.65);
+        --echo-bg-code-header:    rgba(24, 24, 27, 0.85);
+        --echo-border-code:       rgba(63, 63, 70, 0.7);
+        --echo-border-code-head:  rgba(63, 63, 70, 0.5);
+        --echo-text-code:         #a78bfa;
+        --echo-text-code-lang:    #71717a;
+        --echo-bg-inline-code:    rgba(24, 24, 27, 0.7);
+        --echo-text-meta-time:    #71717a;
+        --echo-text-meta-action:  #6366f1;
+        --echo-text-meta-hover:   #a5b4fc;
+        --echo-bg-meta-hover:     rgba(99,102,241,0.1);
+        --echo-bg-typing:         rgba(28, 28, 32, 0.92);
+        --echo-border-typing:     rgba(63, 63, 70, 0.55);
+        --echo-bg-scroll-btn:     rgba(28, 28, 32, 0.95);
+        --echo-border-scroll-btn: rgba(63, 63, 70, 0.6);
+        --echo-text-scroll-btn:   #a1a1aa;
+        --echo-bg-scroll-hover:   rgba(63, 63, 70, 0.95);
+        --echo-text-empty:        #52525b;
+        --echo-text-empty-h3:     #a1a1aa;
+        --echo-text-status:       #52525b;
+        --echo-text-char:         #52525b;
+        --echo-bg-copy-btn-hover: rgba(255,255,255,0.05);
+        --echo-text-copy-btn:     #52525b;
+        --echo-text-copy-hover:   #a1a1aa;
+        --echo-hr-color:          rgba(63,63,70,0.7);
+        --echo-text-h1:           #e4e4e7;
+        --echo-text-h2:           #d4d4d8;
+        --echo-text-h3:           #a1a1aa;
+        --echo-bubble-cancelled-bg:     rgba(39, 39, 42, 0.5);
+        --echo-bubble-cancelled-border: rgba(63, 63, 70, 0.3);
+        --echo-bubble-cancelled-color:  #71717a;
+      }
+    }
+
+    /* ── Explicit dark class ── */
+    .echo-theme-dark {
       --echo-bg-bubble-bot:     rgba(28, 28, 32, 0.95);
       --echo-bg-bubble-bot-h:   rgba(36, 36, 42, 0.98);
       --echo-border-bubble-bot: rgba(63, 63, 70, 0.55);
@@ -307,47 +384,6 @@ function injectStyles() {
       --echo-bubble-cancelled-bg:     rgba(39, 39, 42, 0.5);
       --echo-bubble-cancelled-border: rgba(63, 63, 70, 0.3);
       --echo-bubble-cancelled-color:  #71717a;
-    }
-
-    /* ── Light theme ── [FIX-BUG-19] */
-    @media (prefers-color-scheme: light) {
-      :root:not(.echo-theme-dark) {
-        --echo-bg-bubble-bot:     #ffffff;
-        --echo-bg-bubble-bot-h:   #f5f5f5;
-        --echo-border-bubble-bot: rgba(0, 0, 0, 0.1);
-        --echo-text-bubble-bot:   #111827;
-        --echo-bg-code-block:     #f6f8fa;
-        --echo-bg-code-header:    #eef0f2;
-        --echo-border-code:       rgba(0,0,0,0.12);
-        --echo-border-code-head:  rgba(0,0,0,0.08);
-        --echo-text-code:         #6d28d9;
-        --echo-text-code-lang:    #6b7280;
-        --echo-bg-inline-code:    #f0eeff;
-        --echo-text-meta-time:    #6b7280;
-        --echo-text-meta-action:  #4f46e5;
-        --echo-text-meta-hover:   #4338ca;
-        --echo-bg-meta-hover:     rgba(79,70,229,0.08);
-        --echo-bg-typing:         #ffffff;
-        --echo-border-typing:     rgba(0,0,0,0.1);
-        --echo-bg-scroll-btn:     #ffffff;
-        --echo-border-scroll-btn: rgba(0,0,0,0.15);
-        --echo-text-scroll-btn:   #374151;
-        --echo-bg-scroll-hover:   #f3f4f6;
-        --echo-text-empty:        #6b7280;
-        --echo-text-empty-h3:     #374151;
-        --echo-text-status:       #6b7280;
-        --echo-text-char:         #6b7280;
-        --echo-bg-copy-btn-hover: rgba(0,0,0,0.05);
-        --echo-text-copy-btn:     #6b7280;
-        --echo-text-copy-hover:   #374151;
-        --echo-hr-color:          rgba(0,0,0,0.12);
-        --echo-text-h1:           #111827;
-        --echo-text-h2:           #1f2937;
-        --echo-text-h3:           #374151;
-        --echo-bubble-cancelled-bg:     rgba(243,244,246,0.8);
-        --echo-bubble-cancelled-border: rgba(0,0,0,0.08);
-        --echo-bubble-cancelled-color:  #9ca3af;
-      }
     }
 
     .echo-theme-light {
@@ -473,7 +509,7 @@ function injectStyles() {
       border-color: rgba(239,68,68,0.35) !important;
       color: #dc2626 !important;
     }
-    @media (prefers-color-scheme: dark) { .echo-bubble--error { color: #fca5a5 !important; } }
+    body.dark-mode .echo-bubble--error { color: #fca5a5 !important; }
     .echo-theme-dark .echo-bubble--error { color: #fca5a5 !important; }
     .echo-bubble--cancelled {
       background: var(--echo-bubble-cancelled-bg) !important;
@@ -551,7 +587,7 @@ function injectStyles() {
       cursor: pointer; margin: 8px auto; position: relative; overflow: hidden;
       transition: background 0.15s, border-color 0.15s, transform 0.1s;
     }
-    @media (prefers-color-scheme: dark) { .echo-stop-btn { color: #f87171; } }
+    body.dark-mode .echo-stop-btn { color: #f87171; }
     .echo-theme-dark .echo-stop-btn { color: #f87171; }
     .echo-stop-btn::before {
       content: ''; position: absolute; inset: 0; border-radius: inherit;
@@ -886,17 +922,14 @@ const EMOJI_CATEGORIES = [
              '💖','💘','💝','☮️','✝️','☪️','🕉️','✡️','☯️','✅','❎','💯','🔝','🔛','🔜'] },
 ];
 
-// [FIX-BUG-EMOJI-D] Namespaced key — callers can override via config.storageKey
-let _recentStorageKey = 'echo_v2_recent_emojis';
+// Recent emojis kept in memory only (no localStorage)
+let _recentEmojis = [];
 
 function loadRecentEmojis() {
-  try { return JSON.parse(localStorage.getItem(_recentStorageKey) ?? '[]'); } catch { return []; }
+  return _recentEmojis;
 }
 function saveRecentEmoji(emoji) {
-  try {
-    const list = [emoji, ...loadRecentEmojis().filter(e => e !== emoji)].slice(0, 24);
-    localStorage.setItem(_recentStorageKey, JSON.stringify(list));
-  } catch { /* private mode / quota */ }
+  _recentEmojis = [emoji, ..._recentEmojis.filter(e => e !== emoji)].slice(0, 24);
 }
 
 // ─── Emoji picker factory ────────────────────────────────────────────────────
@@ -1325,6 +1358,90 @@ function _injectShellStyles() {
       border-color: rgba(255,255,255,0.06);
     }
 
+    /* ── Day / light theme explicit overrides ── */
+    body:not(.dark-mode) .ai-chat-shell {
+      background: #ffffff;
+    }
+    body:not(.dark-mode) .ai-chat-header {
+      background: #ffffff;
+      border-color: rgba(0,0,0,0.08);
+    }
+    body:not(.dark-mode) .ai-chat-title {
+      color: #111827;
+    }
+    body:not(.dark-mode) .ai-chat-subtitle {
+      color: #6b7280;
+    }
+    body:not(.dark-mode) .ai-chat-clear-btn {
+      border-color: rgba(0,0,0,0.12);
+      color: #6b7280;
+      background: transparent;
+    }
+    body:not(.dark-mode) .ai-chat-clear-btn:hover {
+      background: rgba(239,68,68,0.06);
+      border-color: rgba(239,68,68,0.3);
+      color: #dc2626;
+    }
+    body:not(.dark-mode) .ai-chat-messages {
+      background: #f9fafb;
+    }
+    body:not(.dark-mode) .ai-chat-footer {
+      background: #ffffff;
+      border-color: rgba(0,0,0,0.08);
+    }
+    body:not(.dark-mode) .ai-chat-input {
+      background: #f9fafb !important;
+      border-color: rgba(0,0,0,0.12) !important;
+      color: #111827 !important;
+    }
+    body:not(.dark-mode) .ai-chat-input:focus {
+      border-color: #6366f1 !important;
+      background: #ffffff !important;
+      box-shadow: 0 0 0 3px rgba(99,102,241,0.12) !important;
+    }
+    body:not(.dark-mode) .ai-chat-hint {
+      color: #9ca3af;
+    }
+    body:not(.dark-mode) .ai-chat-footer .echo-suggestions {
+      border-color: rgba(0,0,0,0.06);
+    }
+    body:not(.dark-mode) .echo-suggestion-pill {
+      background: rgba(99,102,241,0.07);
+      border-color: rgba(99,102,241,0.22);
+      color: #4f46e5;
+    }
+    body:not(.dark-mode) .echo-suggestion-pill:hover {
+      background: rgba(99,102,241,0.14);
+    }
+    body:not(.dark-mode) .echo-bubble--bot {
+      background: #ffffff;
+      color: #111827;
+      border-color: rgba(0,0,0,0.09);
+    }
+    body:not(.dark-mode) .echo-bubble--bot:hover {
+      background: #f5f5f5;
+    }
+    body:not(.dark-mode) .echo-typing {
+      background: #ffffff;
+      border-color: rgba(0,0,0,0.09);
+    }
+    body:not(.dark-mode) .echo-scroll-btn {
+      background: #ffffff;
+      border-color: rgba(0,0,0,0.12);
+      color: #374151;
+    }
+    body:not(.dark-mode) .echo-scroll-btn:hover {
+      background: #f3f4f6;
+    }
+    body:not(.dark-mode) .echo-status-dot { background: #16a34a; }
+    body:not(.dark-mode) .echo-status-dot.generating { background: #d97706; }
+    body:not(.dark-mode) .echo-bubble--error { color: #dc2626 !important; }
+    body:not(.dark-mode) .echo-stop-btn { color: #dc2626; }
+    body:not(.dark-mode) .echo-error-retry { color: #dc2626; }
+    body:not(.dark-mode) .echo-copy-btn.copied { color: #16a34a; }
+    body:not(.dark-mode) .echo-char-counter.warn { color: #d97706; }
+    body:not(.dark-mode) .echo-char-counter.over { color: #dc2626; }
+
     /* ── Status bar inside footer ── */
     .ai-chat-footer .echo-status-bar {
       padding: 6px 14px 4px;
@@ -1367,97 +1484,6 @@ function _injectShellStyles() {
       .ai-chat-form { padding: 6px 8px; gap: 4px; }
     }
 
-    /* ── API Key Setup UI ── */
-    .echo-key-setup {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      text-align: center;
-      gap: 12px;
-      padding: 40px 28px;
-      max-width: 440px;
-      margin: auto;
-    }
-    .echo-key-setup-icon {
-      font-size: 36px;
-      width: 68px; height: 68px;
-      border-radius: 50%;
-      background: rgba(99,102,241,0.1);
-      border: 1px solid rgba(99,102,241,0.2);
-      display: flex; align-items: center; justify-content: center;
-    }
-    .echo-key-setup h3 {
-      font-size: 17px; font-weight: 700;
-      color: var(--ink, #111); margin: 0;
-    }
-    body.dark-mode .echo-key-setup h3 { color: #f4f4f5; }
-    .echo-key-setup p {
-      font-size: 13px; color: var(--ink-dim, #6b7280);
-      margin: 0; line-height: 1.55;
-    }
-    body.dark-mode .echo-key-setup p { color: #a1a1aa; }
-    .echo-key-error {
-      color: #dc2626 !important;
-      background: rgba(239,68,68,0.08);
-      border: 1px solid rgba(239,68,68,0.2);
-      border-radius: 8px;
-      padding: 8px 12px !important;
-      font-size: 13px;
-    }
-    body.dark-mode .echo-key-error { color: #f87171 !important; }
-    .echo-key-steps {
-      text-align: left;
-      font-size: 13px;
-      color: var(--ink-dim, #6b7280);
-      padding-left: 20px;
-      margin: 4px 0;
-      line-height: 1.8;
-    }
-    body.dark-mode .echo-key-steps { color: #a1a1aa; }
-    .echo-key-steps a { color: #6366f1; text-decoration: underline; }
-    .echo-key-steps strong { color: var(--ink, #111); }
-    body.dark-mode .echo-key-steps strong { color: #f4f4f5; }
-    .echo-key-input-row {
-      display: flex; gap: 8px; width: 100%;
-    }
-    .echo-key-input {
-      flex: 1;
-      padding: 10px 12px !important;
-      border-radius: 10px !important;
-      border: 1.5px solid var(--edge, rgba(0,0,0,0.12)) !important;
-      font-size: 13px !important;
-      font-family: ui-monospace, monospace !important;
-      background: var(--surface-2, #f9fafb) !important;
-      color: var(--ink, #111) !important;
-      letter-spacing: 0.03em;
-    }
-    .echo-key-input:focus {
-      outline: none !important;
-      border-color: #6366f1 !important;
-      box-shadow: 0 0 0 3px rgba(99,102,241,0.12) !important;
-    }
-    body.dark-mode .echo-key-input {
-      background: #11142a !important;
-      border-color: rgba(255,255,255,0.1) !important;
-      color: #f4f4f5 !important;
-    }
-    .echo-key-save-btn {
-      padding: 10px 18px;
-      border-radius: 10px;
-      background: linear-gradient(135deg, #6366f1, #4f46e5);
-      color: #fff;
-      font-size: 13px; font-weight: 600;
-      border: none; cursor: pointer;
-      white-space: nowrap;
-      transition: transform 0.15s, box-shadow 0.15s;
-      box-shadow: 0 4px 12px rgba(99,102,241,0.35);
-    }
-    .echo-key-save-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(99,102,241,0.5); }
-    .echo-key-save-btn:active { transform: scale(0.96); }
-    .echo-key-note {
-      font-size: 11px !important;
-      color: var(--ink-faint, #9ca3af) !important;
-    }
   `;
   document.head.appendChild(style);
 }
@@ -1468,7 +1494,6 @@ function _injectShellStyles() {
  *
  * @param {object} [config]
  * @param {string} [config.apiKey]     Gemini API key (preferred over window.__ECHO_API_KEY).
- * @param {string} [config.storageKey] localStorage key for recent emoji (default: 'echo_v2_recent_emojis').
  * @param {'dark'|'light'} [config.theme] Force a colour theme. Omit to follow OS preference.
  *
  * After calling setupAiChat(), the form element exposes:
@@ -1476,8 +1501,7 @@ function _injectShellStyles() {
  *   form.__echoSetTheme('light')  — switch theme at runtime
  */
 export function setupAiChat(config = {}) {
-  if (config.storageKey) _recentStorageKey = config.storageKey;
-  if (config.apiKey)    setApiKey(config.apiKey);
+  if (config.apiKey) setApiKey(config.apiKey);
 
   const container = document.getElementById('ai-chat-messages');
   const input     = document.getElementById('ai-chat-input');
@@ -1502,57 +1526,10 @@ export function setupAiChat(config = {}) {
 
   // ── API key gate ──────────────────────────────────────────────────────
   // Show setup UI if no key is available yet. User can enter one and it
-  // gets saved to localStorage so it persists across sessions.
-  function _showKeySetup(reason = '') {
-    container.innerHTML = `
-      <div class="echo-key-setup" id="echo-key-setup">
-        <div class="echo-key-setup-icon">🔑</div>
-        <h3>Gemini API Key Required</h3>
-        <p>Echo uses Google's Gemini API. You need a free API key to chat.</p>
-        ${reason ? `<p class="echo-key-error">${reason}</p>` : ''}
-        <ol class="echo-key-steps">
-          <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a></li>
-          <li>Click <strong>Create API key</strong></li>
-          <li>Copy and paste it below</li>
-        </ol>
-        <div class="echo-key-input-row">
-          <input type="password" id="echo-key-input" class="echo-key-input" placeholder="AQ. or AIza..." autocomplete="off" spellcheck="false" />
-          <button id="echo-key-save-btn" class="echo-key-save-btn">Save &amp; Start</button>
-        </div>
-        <p class="echo-key-note">Stored locally in your browser only — never sent anywhere except Google.</p>
-      </div>`;
 
-    document.getElementById('echo-key-save-btn')?.addEventListener('click', () => {
-      const val = (document.getElementById('echo-key-input')?.value || '').trim();
-      if (!val || (!val.startsWith('AI') && !val.startsWith('AQ.'))) {
-        const input = document.getElementById('echo-key-input');
-        if (input) { input.style.borderColor = '#ef4444'; input.focus(); }
-        return;
-      }
-      localStorage.setItem('echo_gemini_api_key', val);
-      setApiKey(val);
-      _initChat();
-    });
-
-    document.getElementById('echo-key-input')?.addEventListener('keydown', e => {
-      if (e.key === 'Enter') document.getElementById('echo-key-save-btn')?.click();
-    });
-  }
-
-  const hasKey = !!resolveApiKey();
-  if (!hasKey) {
-    _showKeySetup();
-    // Disable input until key is set
-    input.disabled = true;
-    if (submitBtn) submitBtn.disabled = true;
-    return; // Don't init chat until key is saved
-  }
-
-  _initChat();
-
-  function _initChat() {
-    input.disabled = false;
-    if (submitBtn) submitBtn.disabled = false;
+  // Chat initialises immediately — API key must be provided via config.apiKey or window.__GEMINI_KEY
+  input.disabled = false;
+  if (submitBtn) submitBtn.disabled = false;
 
   // ── Submit button: loading state ──────────────────────────────────────
   if (submitBtn && !submitBtn.querySelector('.echo-send-icon')) {
@@ -2077,7 +2054,6 @@ export function setupAiChat(config = {}) {
     if (response.status === 429) throw Object.assign(new Error('Rate limit reached. Please wait a moment.'), { status: 429 });
     if (response.status === 401 || response.status === 403) {
       // Invalid or expired key — clear it and show setup UI
-      localStorage.removeItem('echo_gemini_api_key');
       _configApiKey = null;
       throw Object.assign(new Error('Invalid or expired API key. Please enter a valid Gemini API key.'), { status: response.status, isAuthError: true });
     }
@@ -2192,12 +2168,27 @@ export function setupAiChat(config = {}) {
         // [FIX-BUG-SLEEP-C] AbortError exits immediately — no sleep
         if (err.name === 'AbortError') { lastErr = err; break; }
         lastErr = err;
+        // Auth errors are not retryable
+        if (err.isAuthError) break;
         if (attempt < RETRY_DELAYS.length) {
-          setStatus(`Retrying (${attempt + 1})…`, true);
-          // Reset stream bubble for retry
+          const isRateLimit = err.status === 429;
+          const delay = isRateLimit ? 15000 : RETRY_DELAYS[attempt];
           streamBubble?.bubbleEl.closest('.echo-row')?.remove();
           streamBubble = null;
-          await sleep(RETRY_DELAYS[attempt]);
+          if (isRateLimit) {
+            let secs = Math.ceil(delay / 1000);
+            setStatus(`Rate limited — retrying in ${secs}s…`, true);
+            const countdown = setInterval(() => {
+              secs--;
+              if (secs > 0) setStatus(`Rate limited — retrying in ${secs}s…`, true);
+              else clearInterval(countdown);
+            }, 1000);
+            await sleep(delay);
+            clearInterval(countdown);
+          } else {
+            setStatus(`Retrying (${attempt + 1})…`, true);
+            await sleep(delay);
+          }
         }
       }
     }
@@ -2224,11 +2215,11 @@ export function setupAiChat(config = {}) {
       if (didPushUser) chatHistory.pop();
 
       if (lastErr?.isAuthError) {
-        // Invalid/expired key — wipe and show setup UI
-        isGenerating = false;
-        currentAbortController = null;
-        setInputDisabled(false);
-        _showKeySetup('Your API key is invalid or expired. Please enter a new one.');
+        appendMessage({
+          text:    'API key rejected by Google (401/403). Please update `window.__GEMINI_KEY` in index.html with a valid key from https://aistudio.google.com/app/apikey',
+          sender:  'bot',
+          isError: true,
+        });
         return;
       }
 
@@ -2273,5 +2264,4 @@ export function setupAiChat(config = {}) {
 
   form.__echoCleanup = cleanup;
   form.__echoSetTheme = setTheme;
-  } // end _initChat
 }

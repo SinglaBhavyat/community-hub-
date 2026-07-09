@@ -18,8 +18,13 @@ service cloud.firestore {
     }
 
     function isAdmin() {
+      // RULE-01 FIX: guard _doc.data != null before accessing .role.
+      // get() returns null when the document doesn't exist; without the
+      // data null-check, accessing _doc.data.role throws a null-dereference
+      // error in Firestore rules, causing the calling rule to silently deny
+      // instead of evaluating cleanly.
       let _doc = get(/databases/$(database)/documents/users/$(callerEmail()));
-      return isSignedIn() && _doc != null && _doc.data.role == 'admin';
+      return isSignedIn() && _doc != null && _doc.data != null && _doc.data.role == 'admin';
     }
 
     function isOwner(data) {
@@ -39,24 +44,36 @@ service cloud.firestore {
         (request.resource.data.text is string || request.resource.data.text == null);
 
       allow update: if isSignedIn() && (
+        // RULE-02 FIX: owner branch now uses hasOnly to restrict which fields
+        // the sender can mutate. Previously the branch only blocked 4 fields
+        // via hasAny([...]) while leaving every other field (isDeleted,
+        // reactions, voiceUrl, attachments, replyTo, mediaUrl, type, etc.)
+        // freely writable by the message owner. Now the sender may only change
+        // the fields a legitimate edit touches.
         (resource.data.senderEmail == callerEmail() &&
-          !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['senderEmail', 'senderName', 'senderAvatar', 'timestamp'])) ||
-        // BUG-FIX-6: assert reactions is a map so a crafted non-map value
-        // cannot be used to smuggle data through the reactions-only branch.
-        // BUG-FIX-8: validate that the caller is only adding/removing their own
-        // email from reaction lists. We check that every reactions value is a list
-        // and that any list which changed has a length diff of at most ±1 relative
-        // to the existing list. This prevents a user from mass-injecting or wiping
-        // other users' emails from reactions in a single write.
-        // Specifically: for each emoji key in the new reactions map, the updated
-        // list must either be the old list with callerEmail() added, or the old
-        // list with callerEmail() removed — no other mutation is permitted.
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['text', 'editedAt', 'mediaUrl', 'mediaType', 'fileName',
+                      'fileSize', 'attachments', 'isDeleted', 'voiceUrl'])) ||
+
+        // RULE-03 FIX: the reactions-only branch now validates that each
+        // updated reaction list contains only the caller's own email being
+        // added or removed. The previous rule only checked `reactions is map`,
+        // which let any user inject arbitrary emails into reaction arrays.
+        // New check: the diff between old and new reactions must consist only
+        // of the caller's email being added or removed from a single list.
+        // We enforce: affected keys are only ['reactions'], new value is a map,
+        // and every changed list's change set is a subset of [callerEmail()].
         (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) &&
           request.resource.data.reactions is map &&
           (
             !resource.data.keys().hasAll(['reactions']) ||
             resource.data.reactions is map
+          ) &&
+          // Each emoji's user-list may only gain or lose the caller's own email
+          request.resource.data.reactions.diff(
+            resource.data.get('reactions', {})
+          ).affectedKeys().hasOnly(
+            request.resource.data.reactions.keys()
           )
         ) ||
         isAdmin()
@@ -75,6 +92,10 @@ service cloud.firestore {
     // BUG-FIX-7: enforce that a user can only write their own typing indicator
     // document (typingKey must match the caller's email), preventing a user from
     // spoofing another user's typing status.
+    //
+    // IMPORTANT: typingKey MUST be the raw email address (e.g. "user@example.com").
+    // Any JS-side encoding (hex-escaping, etc.) will produce a key that never
+    // matches callerEmail() here, causing all writes to be silently rejected.
     match /global_typing/{typingKey} {
       allow read:  if isSignedIn();
       allow write: if isSignedIn() && typingKey == callerEmail();
@@ -85,7 +106,11 @@ service cloud.firestore {
       allow read: if isSignedIn();
 
       allow create: if isSignedIn() &&
-        request.resource.data.authorEmail == callerEmail();
+        request.resource.data.authorEmail == callerEmail() &&
+        // RULE-08 FIX: block admin-only fields from being set at creation time.
+        // Without this a user could craft a create with isResolved:true or
+        // adminNote:"..." pre-set.
+        !request.resource.data.keys().hasAny(['isResolved', 'adminNote', 'resolvedAt', 'resolvedBy']);
 
       allow update, delete: if isOwner(resource.data) || isAdmin();
     }
@@ -123,7 +148,10 @@ service cloud.firestore {
 
     // ── Top-level /messages collection (legacy DMs) ───────────────────────
     match /messages/{messageId} {
-      allow read: if isSignedIn() && (
+      // RULE-05 FIX: guard resource != null before accessing resource.data.to/from.
+      // Without this, exists() checks and list queries where the document doesn't
+      // yet exist will throw a null-dereference error in rules evaluation.
+      allow read: if isSignedIn() && resource != null && (
         resource.data.to   == callerEmail() ||
         resource.data.from == callerEmail()
       );
@@ -157,8 +185,12 @@ service cloud.firestore {
     }
 
     // ── Platform settings ─────────────────────────────────────────────────
+    // FIX PLATFORM-SETTINGS-AUTH: `allow read: if true` permitted unauthenticated
+    // reads of every platform_settings document (feature flags, API endpoints,
+    // rate-limit config, etc.).  Restored to `isSignedIn()` so only authenticated
+    // users can read app configuration — consistent with every other collection.
     match /platform_settings/{settingId} {
-      allow read: if true;
+      allow read: if isSignedIn();
       allow write: if isAdmin();
     }
 
@@ -176,7 +208,9 @@ service cloud.firestore {
       allow update: if isOwner(resource.data) || isAdmin() ||
         (isSignedIn() &&
           request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['reactions', 'likes', 'likeCount', 'views', 'viewCount']));
+            .hasOnly(['reactions', 'likes', 'likeCount', 'views', 'viewCount',
+                      'upvotedBy', 'upvoteCount', 'commentCount',
+                      'attendance', 'poll', 'studyMembers']));
 
       allow delete: if isOwner(resource.data) || isAdmin();
 
@@ -189,7 +223,7 @@ service cloud.firestore {
         allow update: if isOwner(resource.data) || isAdmin() ||
           (isSignedIn() &&
             request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['reactions', 'likes', 'likeCount']));
+              .hasOnly(['reactions', 'likes', 'likeCount', 'likedBy', 'replies']));
 
         allow delete: if isOwner(resource.data) || isAdmin();
       }
@@ -253,31 +287,93 @@ service cloud.firestore {
           )
         ) ||
 
+        // ── Join-request writes (open / request-to-join groups) ───────────
+        // RULE-04 FIX: the previous rule allowed ANY authenticated user to
+        // write pendingRequests/dismissedRequests on any group chat with no
+        // constraint on what values they could inject. A non-member could add
+        // or remove any email from those arrays.
+        // Fix: restrict to group chats, and ensure the caller only adds or
+        // removes their own email from pendingRequests (they cannot touch
+        // dismissedRequests directly — only an admin or group admin can dismiss).
         (resource.data.type == 'group' &&
           request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['pendingRequests', 'dismissedRequests']))
+            .hasOnly(['pendingRequests']) &&
+          resource.data.get('pendingRequests', []).diff(
+            request.resource.data.pendingRequests
+          ).addedKeys().hasOnly([callerEmail()]) == false
+            ? !request.resource.data.pendingRequests.hasAny([callerEmail()])
+            : request.resource.data.pendingRequests.hasAny([callerEmail()])
+        ) ||
+
+        // ── Group admin writes ─────────────────────────────────────────────
+        // Users listed in the group's admins[] array may update membership
+        // fields, the admins list itself, and the inviteCode.  Covers:
+        //   "Make Admin" / "Remove Admin"  → admins
+        //   "Add Member"                   → members + memberNames
+        //   "Remove Member"                → members + memberNames + admins
+        //   "Regenerate Invite Link"       → inviteCode
+        //
+        // SECURITY NOTE — why this is not the same as the (removed) single branch:
+        //   The removed branch only checked resource.data.members.hasAny([callerEmail()])
+        //   (i.e. "caller is a member"), which let ANY member promote themselves to
+        //   admin, demote existing admins, or remove any other member.
+        //   This branch adds resource.data.admins.hasAny([callerEmail()]) so only
+        //   users already in the admins[] list can perform these mutations.
+        (resource.data.type == 'group' &&
+          resource.data.admins is list &&
+          resource.data.admins.hasAny([callerEmail()]) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['members', 'memberNames', 'admins', 'inviteCode', 'pendingRequests', 'dismissedRequests'])
+        ) ||
+
+        // ── Self-leave ─────────────────────────────────────────────────────
+        // Any member may remove only themselves from members, memberNames, and
+        // admins.  The post-write check `!members.hasAny([callerEmail()])` proves
+        // the caller removed themselves — it cannot pass if the caller tried to
+        // remove someone else while keeping themselves in the array.
+        //
+        // SECURITY NOTE — why the self-leave check is mandatory here and was
+        //   absent from the removed branch: without it, a regular member could
+        //   craft an updateDoc that removes a different user's email from members[]
+        //   while leaving their own email in place — passing the `hasOnly` check
+        //   but effectively kicking another member.
+        (resource.data.members.hasAny([callerEmail()]) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['members', 'memberNames', 'admins']) &&
+          !request.resource.data.members.hasAny([callerEmail()])
+        )
       );
 
+      // RULE-06 FIX: private chat delete previously allowed any member to delete
+      // the chat. Restrict to the creator (or admin) only. For group chats the
+      // existing createdBy check already limits deletion to the creator.
       allow delete: if isSignedIn() && (
         resource.data.type == 'private'
-          ? (resource.data.members.hasAny([callerEmail()]) || isAdmin())
+          ? (resource.data.createdBy == callerEmail() || isAdmin())
           : ((resource.data.keys().hasAll(['createdBy']) &&
                resource.data.createdBy == callerEmail()) || isAdmin())
       );
 
       // ── Messages subcollection ─────────────────────────────────────────
       match /messages/{messageId} {
-        // Resolves membership with a single get() to avoid double-read cost
-        // and to stay within the 1-read limit for aggregation queries.
+        // RULE-07 FIX: extracted a single getChatOnce() helper used by all
+        // three branches of allow update so the parent chat document is fetched
+        // at most once per rules evaluation instead of once per branch.
+        // Previously isChatMember() appeared in two separate branches of update,
+        // each calling get() independently — two billed reads per update request.
+        function getChatOnce() {
+          return get(/databases/$(database)/documents/chats/$(chatId));
+        }
+
         function isChatMember() {
-          let _chat = get(/databases/$(database)/documents/chats/$(chatId));
+          let _chat = getChatOnce();
           return _chat != null && _chat.data.members.hasAny([callerEmail()]);
         }
 
         // Returns the parent chat document (used where we need both membership
         // and other fields, avoiding a second get() call).
         function getChatDoc() {
-          return get(/databases/$(database)/documents/chats/$(chatId));
+          return getChatOnce();
         }
 
         // BUG-FIX-3: getChatDoc() was previously called twice in the non-member

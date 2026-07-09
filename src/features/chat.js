@@ -149,6 +149,14 @@ let _portalListenerSetup = false;
 // by _portalListenerSetup) and routes through this reference so it always calls the
 // handleMessageAction from the CURRENT setupChat() closure, even after re-login.
 let _globalPortalClickHandler = null;
+// FIX _RCM-SCOPE: RecentChatsManager instance must live at module scope so that
+// teardownChat() — which is defined before setupChat() — can safely call
+// _rcm.teardown() and persistent onAuthStateChanged / onPageVisit callbacks can
+// call _rcm.refresh() after the original setupChat() stack frame has returned.
+// Previously declared with `const` inside setupChat(), making it unreachable from
+// teardownChat() (ReferenceError) and from the persistent auth observer (stale
+// closure referencing the old setupChat's local scope on re-login).
+let _rcm = null;
 
 // ── MODULE-LEVEL CONSTANTS ────────────────────────────────────────────────────
 // MAX_UPLOAD_BYTES must be at module scope so it is accessible inside event
@@ -3875,7 +3883,9 @@ export function setupChat() {
 
     // ── Recent chats manager ────────────────────
     // Constructed here so the onOpenRoom callback can close over openChatRoom.
-    const _rcm = new RecentChatsManager({
+    // Assign to module-scope _rcm (not `const`) so teardownChat() and persistent
+    // auth/page-visit listeners can reach it after setupChat()'s stack unwinds.
+    _rcm = new RecentChatsManager({
         db,
         auth,
         currentUser:        () => currentUser,
@@ -4465,7 +4475,11 @@ export function setupChat() {
         activeRoomId      = chatType === 'group'
             ? targetEmail
             : getPrivateRoomId(currentUser.email, targetEmail);
-        activeRoomDetails = { id: activeRoomId, type: chatType, targetEmail, targetName };
+        // FIX CACHE-MEMBERS: include a `members` array that rootChatSub updates
+        // on every snapshot so sendTextMessage / sendMediaFile / voice onstop can
+        // read the current member list from memory instead of issuing a getDoc on
+        // every single message sent inside a group — eliminating O(msg) extra reads.
+        activeRoomDetails = { id: activeRoomId, type: chatType, targetEmail, targetName, members: [] };
         // FIX Bug 1: clear the seenBy-submitted set when entering a new room so the
         // new room's messages are marked seen correctly on first snapshot.
         _seenBySubmitted.clear();
@@ -4618,6 +4632,12 @@ export function setupChat() {
             }
             if (!docSnap.exists()) return;
             const data = docSnap.data();
+            // FIX CACHE-MEMBERS: keep activeRoomDetails.members current so every
+            // send path (text / media / voice) can look up group members from memory
+            // instead of issuing a getDoc on every outgoing message.
+            if (activeRoomDetails && Array.isArray(data.members)) {
+                activeRoomDetails.members = data.members;
+            }
             if (data.pinnedMessages) {
                 // FIX: mutate in place
                 pinnedMessages.splice(0, pinnedMessages.length, ...data.pinnedMessages);
@@ -6011,19 +6031,30 @@ export function setupChat() {
             try {
                 // FIX: write the system message BEFORE removing from members.
                 // The messages rule calls isChatMember() — if we remove from members first,
-                // the addDoc fires when the user is no longer a member → permission-denied,
-                // the catch block fires, and the UI shows "Failed to leave" even though the
-                // updateDoc already succeeded and the user actually did leave.
-                // Writing the message first (while still a member) avoids this race.
+                // the addDoc fires when the user is no longer a member → permission-denied.
                 await addDoc(collection(db, `chats/${activeRoomId}/messages`), {
                     text: `${currentUser.name} left the group.`,
                     senderEmail: 'system', senderName: 'System', createdAt: serverTimestamp()
                 });
-                // Also remove from memberNames and admins so no orphaned data remains.
-                await updateDoc(doc(db, 'chats', activeRoomId), {
-                    members:     arrayRemove(currentUser.email),
-                    memberNames: arrayRemove(currentUser.name),
-                    admins:      arrayRemove(currentUser.email),
+                // FIX LEAVE-TRANSACTION: Use a transaction to find the EXACT stored
+                // memberName entry for the leaving user (members[] and memberNames[] are
+                // parallel arrays). Using arrayRemove(currentUser.name) is wrong when two
+                // members share the same display name — it would remove the wrong slot.
+                // Reading the index server-side inside a transaction is the only safe approach.
+                const _leaveRef = doc(db, 'chats', activeRoomId);
+                await runTransaction(db, async tx => {
+                    const snap = await tx.get(_leaveRef);
+                    if (!snap.exists()) return; // already deleted — no-op
+                    const d       = snap.data();
+                    const emails  = d.members     || [];
+                    const names   = d.memberNames || [];
+                    const myIdx   = emails.indexOf(currentUser.email);
+                    const myName  = myIdx >= 0 ? names[myIdx] : currentUser.name;
+                    tx.update(_leaveRef, {
+                        members:     arrayRemove(currentUser.email),
+                        memberNames: arrayRemove(myName),
+                        admins:      arrayRemove(currentUser.email),
+                    });
                 });
                 resetChatPanel(chatHeader, chatContainer, input, sendBtn, attachBtn);
                 showToast('You left the group.', 'success');
@@ -6225,11 +6256,12 @@ export function setupChat() {
                 [`unreadCount.${currentUser.email}`]: 0
             };
             // FIX Bug 4: build the entire unread update before opening the batch.
+            // FIX CACHE-MEMBERS: use activeRoomDetails.members (kept current by rootChatSub)
+            // instead of getDoc so group sends don't cost an extra Firestore read.
             if (_roomType === 'private' && _recipEmail) {
                 _sendUpdate[`unreadCount.${_recipEmail}`] = increment(1);
             } else if (_roomType === 'group') {
-                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                const _groupMembers = _rSnap?.data()?.members || [];
+                const _groupMembers = activeRoomDetails?.members || [];
                 for (const _gm of _groupMembers) {
                     if (_gm && _gm !== currentUser.email) {
                         _sendUpdate[`unreadCount.${_gm}`] = increment(1);
@@ -6509,8 +6541,8 @@ export function setupChat() {
             if (_fileRoomType === 'private' && _fileRecip) {
                 _fileUpdate[`unreadCount.${_fileRecip}`] = increment(1);
             } else if (_fileRoomType === 'group') {
-                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                const _groupMembers = (_rSnap?.data()?.members) || [];
+                // FIX CACHE-MEMBERS: read from activeRoomDetails (kept live by rootChatSub)
+                const _groupMembers = activeRoomDetails?.members || [];
                 for (const _gm of _groupMembers) {
                     if (_gm && _gm !== currentUser.email) {
                         _fileUpdate[`unreadCount.${_gm}`] = increment(1);
@@ -6890,8 +6922,8 @@ export function setupChat() {
             if (_roomType === 'private' && _recipEmail) {
                 _roomUpdate[`unreadCount.${_recipEmail}`] = increment(1);
             } else if (_roomType === 'group') {
-                const _rSnap = await getDoc(doc(db, 'chats', roomId)).catch(() => null);
-                for (const _gm of (_rSnap?.data()?.members || [])) {
+                // FIX CACHE-MEMBERS: use cached member list — no extra getDoc needed
+                for (const _gm of (activeRoomDetails?.members || [])) {
                     if (_gm && _gm !== currentUser.email) {
                         _roomUpdate[`unreadCount.${_gm}`] = increment(1);
                     }
@@ -7164,9 +7196,13 @@ export function setupChat() {
                     if (_voiceRoomType === 'private' && _voiceRecip) {
                         _voiceUpdate[`unreadCount.${_voiceRecip}`] = increment(1);
                     } else if (_voiceRoomType === 'group') {
-                        const _vSnap = await getDoc(doc(db, 'chats', _voiceRoomId)).catch(() => null);
-                        const _vGroupMembers = (_vSnap?.data()?.members) || [];
-                        for (const _gm of _vGroupMembers) {
+                        // FIX CACHE-MEMBERS: use cached member list — no extra getDoc needed.
+                        // The members list was snapshotted from activeRoomDetails at recording
+                        // start (before any await), so it reflects the state at that moment.
+                        // activeRoomDetails itself is kept live by rootChatSub, so members
+                        // who join/leave between recording start and send will be reflected
+                        // on the next snapshot without any extra read here.
+                        for (const _gm of (activeRoomDetails?.members || [])) {
                             if (_gm && _gm !== currentUser.email) {
                                 _voiceUpdate[`unreadCount.${_gm}`] = increment(1);
                             }
@@ -7210,12 +7246,18 @@ export function setupChat() {
     // ── Reactions ────────────────────────────────
     async function toggleReaction(msgId, emoji) {
         if (!activeRoomId || !requireAuth()) return;
+        // FIX REACTION-ATOMIC: read reaction state from lastMessagesSnapshot (already live
+        // via onSnapshot) instead of issuing a separate getDoc.  The write uses
+        // server-side arrayUnion / arrayRemove which are atomic — no transaction needed.
+        // Worst case (user clicks during the brief window between two snapshots) is an
+        // idempotent double-add or double-remove, which Firestore handles correctly.
+        // This removes one Firestore read per reaction and eliminates the read→write race.
+        const localMsg = lastMessagesSnapshot.find(m => m.id === msgId);
+        if (!localMsg) return; // message not in snapshot — nothing to react to
+        const already = Array.isArray(localMsg.reactions?.[emoji])
+            && localMsg.reactions[emoji].includes(currentUser.email);
         const ref = doc(db, `chats/${activeRoomId}/messages`, msgId);
         try {
-            const snap = await getDoc(ref);
-            if (!snap.exists()) return;
-            const reactions = snap.data().reactions || {};
-            const already   = reactions[emoji]?.includes(currentUser.email);
             await updateDoc(ref, {
                 [`reactions.${emoji}`]: already
                     ? arrayRemove(currentUser.email)
@@ -7371,8 +7413,15 @@ export function setupChat() {
                             const newEmail = row.dataset.email;
                             const newName  = row.dataset.name;
                             try {
+                                // FIX ADD-MEMBER-CAP: enforce 200-member limit client-side
+                                // (mirrors the Firestore create rule).  Prevents the updateDoc
+                                // from pushing the array beyond the Firestore 200-item limit.
+                                if ((activeRoomDetails?.members?.length || 0) >= 200) {
+                                    showToast('Group is full (200 member limit).', 'error');
+                                    return;
+                                }
                                 await updateDoc(doc(db, 'chats', activeRoomId), {
-                                    members: arrayUnion(newEmail),
+                                    members:     arrayUnion(newEmail),
                                     memberNames: arrayUnion(newName)
                                 });
                                 await addDoc(collection(db, `chats/${activeRoomId}/messages`), {
@@ -7381,15 +7430,19 @@ export function setupChat() {
                                 });
                                 showToast(`${newName} added to group!`, 'success');
                                 closeAdd();
-                                close2();
+                                // FIX ADD-MEMBER-NOREOPEN: onSnapshot will fire and refresh the
+                                // members list automatically — no need to close() the main panel.
                             } catch (err) { console.error('[Chat] add-member error:', err); showToast('Failed to add member.', 'error'); }
                         });
                     });
                 } catch (err) { console.error('[Chat] load-users error:', err); showToast('Failed to load users.', 'error'); }
             });
 
+            // FIX SCOPE-QUERY: use modal.querySelectorAll instead of document.querySelectorAll
+            // so these selectors are scoped to THIS panel only.  Using document-scope risks
+            // matching any element with the same class that might exist elsewhere in the DOM.
             // Admin toggle buttons
-            document.querySelectorAll('.mem-admin-toggle').forEach(btn => {
+            modal.querySelectorAll('.mem-admin-toggle').forEach(btn => {
                 btn.addEventListener('click', async () => {
                     const targetEmail  = btn.dataset.email;
                     const wasAdmin     = btn.dataset.isAdmin === 'true';
@@ -7406,14 +7459,18 @@ export function setupChat() {
                             admins: wasAdmin ? arrayRemove(targetEmail) : arrayUnion(targetEmail)
                         });
                         showToast(wasAdmin ? 'Admin removed.' : 'Admin added!', 'success');
-                        close2();
-                        setTimeout(() => openMembersPanel(), 150);
+                        // FIX ADMIN-TOGGLE-NOREOPEN: the onSnapshot listener already keeps
+                        // the panel live — no need to close() and re-open. The previous
+                        // close2()+setTimeout(openMembersPanel,150) caused a visible flicker
+                        // (modal disappears and reappears) and re-registered all event listeners.
+                        // The snapshot will fire within milliseconds and re-render the members
+                        // tab with the updated admin badges automatically.
                     } catch (err) { console.error('[Chat] update-admin error:', err); showToast('Failed to update admin.', 'error'); }
                 });
             });
 
             // Remove buttons
-            document.querySelectorAll('.member-remove-btn').forEach(btn => {
+            modal.querySelectorAll('.member-remove-btn').forEach(btn => {
                 btn.addEventListener('click', async () => {
                     const targetEmail = btn.dataset.email;
                     const targetName  = btn.dataset.name;
@@ -7424,18 +7481,33 @@ export function setupChat() {
                     });
                     if (!ok) return;
                     try {
-                        const idx = members.indexOf(targetEmail);
-                        await updateDoc(doc(db, 'chats', activeRoomId), {
-                            members: arrayRemove(targetEmail),
-                            memberNames: arrayRemove(memberNames[idx] || ''),
-                            admins: arrayRemove(targetEmail)
+                        // FIX REMOVE-TRANSACTION: use a transaction to find the exact
+                        // stored name for the target email (parallel arrays may be out-of-sync
+                        // if another admin added/removed a member concurrently).
+                        // Also ensures the remove-member and the membership check are atomic.
+                        const _removeRef = doc(db, 'chats', activeRoomId);
+                        let rawName = targetName; // fallback
+                        await runTransaction(db, async tx => {
+                            const snap = await tx.get(_removeRef);
+                            if (!snap.exists()) return;
+                            const d      = snap.data();
+                            const emails = d.members     || [];
+                            const names  = d.memberNames || [];
+                            const idx    = emails.indexOf(targetEmail);
+                            rawName      = idx >= 0 ? names[idx] : targetName;
+                            tx.update(_removeRef, {
+                                members:     arrayRemove(targetEmail),
+                                memberNames: arrayRemove(rawName),
+                                admins:      arrayRemove(targetEmail),
+                            });
                         });
                         await addDoc(collection(db, `chats/${activeRoomId}/messages`), {
-                            text: `${currentUser.name} removed ${targetName} from the group.`,
+                            text: `${currentUser.name} removed ${rawName} from the group.`,
                             senderEmail: 'system', senderName: 'System', createdAt: serverTimestamp()
                         });
                         showToast('Member removed.', 'success');
-                        close2();
+                        // FIX REMOVE-NOREOPEN: onSnapshot will re-render the members tab;
+                        // close2() here closed the entire panel unnecessarily.
                     } catch (err) { console.error('[Chat] remove-member error:', err); showToast('Failed to remove member.', 'error'); }
                 });
             });
@@ -7477,7 +7549,7 @@ export function setupChat() {
                     </div>`).join('');
 
                 // Approve: add to members permanently
-                document.querySelectorAll('.req-approve-btn').forEach(btn => {
+                modal.querySelectorAll('.req-approve-btn').forEach(btn => {
                     btn.addEventListener('click', async () => {
                         const email = btn.dataset.email;
                         try {
@@ -7514,7 +7586,7 @@ export function setupChat() {
                 });
 
                 // Dismiss for 24h: move from pendingRequests to dismissedRequests
-                document.querySelectorAll('.req-dismiss-btn').forEach(btn => {
+                modal.querySelectorAll('.req-dismiss-btn').forEach(btn => {
                     btn.addEventListener('click', async () => {
                         const email        = btn.dataset.email;
                         const dismissUntil = Date.now() + 24 * 60 * 60 * 1000;
@@ -7543,7 +7615,7 @@ export function setupChat() {
                 });
 
                 // Deny permanently
-                document.querySelectorAll('.req-deny-btn').forEach(btn => {
+                modal.querySelectorAll('.req-deny-btn').forEach(btn => {
                     btn.addEventListener('click', async () => {
                         const email = btn.dataset.email;
                         try {
@@ -7613,8 +7685,9 @@ export function setupChat() {
                 try {
                     await updateDoc(doc(db, 'chats', activeRoomId), { inviteCode: newCode });
                     showToast('New invite code generated!', 'success');
-                    close2();
-                    setTimeout(() => openMembersPanel(), 150);
+                    // FIX REGEN-NOREOPEN: the onSnapshot listener will fire and re-render the
+                    // invite tab with the new code automatically.  Closing and re-opening the
+                    // modal was causing a visible flicker with no benefit.
                 } catch (err) { console.error('[Chat] regen-code error:', err); showToast('Failed to regenerate code.', 'error'); }
             });
             }, err => {

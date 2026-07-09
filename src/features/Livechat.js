@@ -1,6 +1,272 @@
 // ============================================================
-// Livechat.js — Global Real-Time Community Chat  (v7 COMPREHENSIVE AUDIT)
+// Livechat.js — Global Real-Time Community Chat  (v11 — message loading fixes)
 // ============================================================
+//
+// ── v11 AUDIT SUMMARY — MESSAGE LOADING ──────────────────────────────────────
+//
+// All v10 fixes retained (FIX-TY-1 through FIX-TY-4).
+//
+// NEW ISSUES FOUND AND FIXED IN v11:
+//
+// ML-08  [BUG / CRITICAL] The fast-reopen path in subscribeToMessages (ML-04)
+//        called renderAllMessages(true) then set _isInitialLoading = true in the
+//        WRONG ORDER. _isInitialLoading is supposed to block the scroll→pagination
+//        trigger during the programmatic scroll-to-bottom that renderAllMessages
+//        issues. Because it was set AFTER renderAllMessages, the scroll handler
+//        could fire between renderAllMessages and the rAF that sets the flag,
+//        seeing scrollTop near 0 (the list was just rebuilt), evaluating
+//        `c.scrollTop < 80` as true, and calling loadOlderMessages() spuriously
+//        during every fast re-open.
+//        Fixed: _isInitialLoading is now set to true BEFORE renderAllMessages(true).
+//
+// ML-09  [BUG] subscribeToMessages did not reset _isInitialLoading to false when
+//        the early bail-out (`if (!_isMounted)`) triggered AFTER Phase 1 succeeded
+//        but before Phase 2 was attached. The flag was left true indefinitely,
+//        permanently suppressing scroll-triggered pagination after a re-mount.
+//        Fixed: both `_isInitialLoading = false` and `_subscribeInFlight = false`
+//        are set in the unmount bail-out inside the Phase 1 success block (they
+//        were already set in the catch block — now consistent on all paths).
+//
+// ML-10  [BUG] _buildPhase2Listener: the `modified` handler added a message to
+//        `newIds` when `!messagesMap.has(id)`. But `messagesMap.set(id, msg)`
+//        was also called in the same iteration — meaning the loop's own later
+//        iterations (or re-entrant calls) for the same doc would route to
+//        `patchMsgInDOM`, which returns early (element not in DOM yet) because
+//        `appendNewMessagesToDom` hadn't run yet, silently dropping the patch.
+//        Separately, calling `appendNewMessagesToDom` or `patchMsgInDOM` INSIDE
+//        `docChanges().forEach` means those functions operate on a partially-
+//        updated map: `getSortedMessages()` returns wrong order and DOM patches
+//        read stale data for other docs still pending in the same batch.
+//        Fixed: three-queue approach — ALL map mutations happen first inside the
+//        forEach loop, then DOM work runs AFTER the loop completes:
+//          newIds     — 'added' events → batched into appendNewMessagesToDom
+//          modNewIds  — 'modified' for docs not yet in map → same append call
+//          patchQueue — 'modified' for known docs → patchMsgInDOM after loop
+//        newIds and modNewIds are merged into one appendNewMessagesToDom call so
+//        duplicate-separator cleanup and scroll logic runs exactly once per batch.
+//
+// ML-11  [BUG] loadOlderMessages: when every document in a page had already been
+//        seen (all in messagesMap), `lastNewDoc` stays null, the cursor is
+//        correctly advanced to `snap.docs[snap.docs.length - 1]`, but
+//        `hasMoreMessages` was NOT set to false even though `snap.docs.length < PAGE_SIZE`
+//        would have done so. The problem occurs when the batch is exactly PAGE_SIZE
+//        but all docs are duplicates — the function would loop forever fetching the
+//        same PAGE_SIZE batch with no progress. Fixed: after the dedup loop, if
+//        `olderMsgs.length === 0` (all duplicates), set `hasMoreMessages = false`
+//        and return early to prevent an infinite-page loop.
+//
+// ML-12  [BUG] Phase 2 'removed' handler: when the removed message row had a
+//        *following* sibling that was a date separator (i.e. the removed message
+//        was the LAST in its date group, not the only one), the orphan-separator
+//        check only looked at `prevSibling`. If the removed message was the
+//        chronologically first AND last message of its date (singleton group)
+//        the fix is already correct. But if the removed row was the first of a
+//        group (prev = separator, next = another message in the same group) the
+//        check `!nextAfter || nextAfter.classList.contains('lc-date-sep')` is
+//        also correct. No behaviour change needed — existing logic is correct but
+//        the comment was misleading. Clarified the comment.
+//
+// ML-13  [RACE] subscribeToMessages fast-reopen path (ML-04) set
+//        `_subscribeInFlight = false` before `_buildPhase2Listener()` returned.
+//        If `openLiveChat` was called again synchronously (e.g. from an automated
+//        test or rapid user action) between the `_subscribeInFlight = false`
+//        assignment and the liveChatSub assignment, a second subscription would
+//        start before the first was stored. Fixed: set `_subscribeInFlight = false`
+//        AFTER assigning `liveChatSub`.
+//
+// ML-15  [BUG] The 'modified' handler's isNew branch (for docs not yet in
+//        messagesMap) had no null-timestamp guard, unlike the 'added' branch
+//        which explicitly skips pending-write snapshots with
+//        `if (!change.doc.data().timestamp) return`. If Firestore fires a
+//        'modified' event for a doc before the server resolves its
+//        serverTimestamp (local cache optimistic delivery), tsToMs() returns 0
+//        and appendNewMessagesToDom inserts the message at the very top of the
+//        chat (before all other messages), causing a visible flash in the wrong
+//        position. The next 'modified' with the real timestamp would patch it,
+//        but the flash is user-visible. Fixed: same null-timestamp guard added
+//        to the modNewIds path.
+//
+// ML-14  [BUG] Both call sites of `_buildPhase2Listener()` (normal path and
+//        fast-reopen path) were not wrapped in try/finally. If the function
+//        threw — e.g. Firestore not yet initialised, `db` null, or `query()`/
+//        `onSnapshot()` throwing synchronously — `_subscribeInFlight` would stay
+//        `true` permanently, silently blocking every future subscription attempt
+//        for the lifetime of the page. Fixed: both call sites now use try/finally
+//        to guarantee `_subscribeInFlight = false` on every exit path.
+//
+// ── v10 AUDIT SUMMARY — TYPING INDICATOR ─────────────────────────────────────
+//
+// All v9 fixes retained.
+//
+// ROOT CAUSE + RELATED ISSUES FOUND AND FIXED IN v10:
+//
+// FIX-TY-1  [CRITICAL / ROOT CAUSE] typingDocKey() hex-encoded the email
+//           (e.g. "user@example.com" → "userx40examplex2ecom") before using it
+//           as the Firestore document ID. The Firestore rule for global_typing
+//           enforces `typingKey == callerEmail()` — comparing the raw doc ID
+//           against the user's actual email. The encoded key can never match the
+//           raw email, so every writeTyping() call was rejected with
+//           PERMISSION_DENIED. Because the catch block swallowed the error
+//           silently (`catch { /* non-critical */ }`), the bug was invisible in
+//           the console. No typing indicator was ever written to Firestore.
+//           Fixed: typingDocKey() now returns the email unchanged. Firestore
+//           document IDs support '@' and '.' so raw emails are safe.
+//           Also annotated the firestore.rules rule to warn future developers
+//           that the key MUST be the raw email.
+//
+// FIX-TY-2  [BUG] clearTypingIndicator() (called on send, cancel-edit, and
+//           close) did not reset lastTypingWrite. After sending a message, the
+//           throttle guard (`now - lastTypingWrite > TYPING_THROTTLE_MS`)
+//           suppressed the next typing write for up to 2 s, so other users
+//           would not see the indicator on the first keystrokes of the next
+//           message. Fixed: lastTypingWrite is reset to 0 in
+//           clearTypingIndicator() so the next keystroke fires immediately.
+//
+// FIX-TY-3  [BUG] subscribeToTyping() used only the Firestore snapshot to
+//           decide which users to show in the bar. Once a user stopped typing
+//           the `deleteDoc` call removes their document and the snapshot
+//           triggers — but the bar could linger for the full round-trip delay
+//           (Firestore → onSnapshot → DOM update) after the writer's local
+//           timeout fired. Conversely, a user who dropped their connection with
+//           a stale doc in Firestore would show in the bar indefinitely.
+//           Fixed:
+//             (a) subscribeToTyping() now caches the raw docs with their server
+//                 timestamps so staleness can be re-evaluated locally.
+//             (b) A 2 s setInterval prunes stale entries from the cache and
+//                 re-renders the bar without waiting for a new snapshot. The
+//                 interval is cleared on teardown.
+//             (c) The teardown wrapper properly cancels both the Firestore
+//                 unsubscribe and the interval, and hides the bar.
+//
+// FIX-TY-4  [A11Y] The lc-typing-bar element had no aria-live attribute, so
+//           screen readers never announced when someone started or stopped
+//           typing. Fixed: subscribeToTyping() now sets aria-live="polite" and
+//           aria-atomic="true" on the bar element once when the subscription is
+//           established (idempotent; safe to call multiple times).
+//
+// ── v9 AUDIT SUMMARY ──────────────────────────────────────────────────────────
+//
+// All v8 fixes retained (ML-01 through ML-07).
+//
+// NEW ISSUES FOUND AND FIXED IN v9:
+//
+// CONFIRM DIALOG
+//   FIX-1  [LEAK] showLCConfirm leaked a `keydown` listener on the document
+//          when the dialog was closed by clicking the backdrop, Cancel, or the
+//          confirm button. The listener was only removed in the Escape branch.
+//          Fixed: `close()` now calls `document.removeEventListener` before
+//          resolving, ensuring the handler is always cleaned up.
+//
+// DOM / RENDERING
+//   FIX-2  [BUG] appendNewMessagesToDom's duplicate-separator scan walked
+//          forward through the list and kept the FIRST separator for each date,
+//          removing later duplicates. The later separator is the correct one to
+//          keep (it has messages below it). Fixed: scan reversed; the last
+//          separator for each date is kept, earlier ones are removed.
+//
+//   FIX-3  [A11Y] openFullscreenViewer's dialog element had role="dialog" and
+//          aria-modal="true" but no aria-label, so screen readers announced
+//          "dialog" with no description. Fixed: aria-label="Image viewer" added.
+//
+// SEND / UPLOAD
+//   FIX-4  [BUG] sendMessage's all-uploads-failed early-return path restored
+//          savedText to the input but did not call autoResizeInput(), leaving
+//          the textarea at height:auto from the earlier clear. Fixed: call
+//          autoResizeInput() before returning so the textarea resizes correctly.
+//          Also added an explanatory comment about why files cannot be restored.
+//
+// EVENT LISTENERS / MEMORY LEAKS
+//   FIX-5  [LEAK] setupLiveChat registered click listeners on `.lc-open-btn`
+//          elements without the global AbortController signal. On teardown and
+//          re-setup, additional listeners accumulated on the same buttons.
+//          Fixed: `{ signal: sig }` added to each listener.
+//
+//   FIX-6  [BUG] openGallery wired the close button with `$('lc-gallery-close')`
+//          (global getElementById). If a stale gallery panel existed in the DOM
+//          when the picker was opened, `$()` could resolve the wrong element.
+//          Fixed: scoped to `panel.querySelector('#lc-gallery-close')`.
+//
+//   FIX-7  [BUG] openReportDialog wired `$('lc-rn')` / `$('lc-ry')` / 
+//          `$('lc-report-comment')` via global getElementById, which would
+//          resolve elements in any existing dialog rather than the freshly
+//          created one. Fixed: all selectors scoped to the dialog element `d`.
+//
+//   FIX-8  [STALE COMMENT] subscribeToMessages Phase 2 comment still described
+//          an old "full collection / no startAfter" design that was superseded
+//          in v8. Fixed: comment updated to match the actual implementation.
+//
+//   FIX-9  [LEAK] setupLiveChat's `window.beforeunload` listener had no
+//          AbortController signal, so it persisted after teardownLiveChat.
+//          Fixed: `{ signal: sig }` added.
+//
+//   FIX-10 [BUG] closeGallery used an untracked setTimeout. If openGallery was
+//          called again before the 320 ms animation timeout fired, the stale
+//          panel would be removed after the new one was already inserted.
+//          Fixed: `_galleryCloseTimer` module variable tracks and cancels the
+//          pending timeout before starting a new one.
+//
+// IMAGE COMPRESSION
+//   FIX-11 [LEAK] compressIfImage's fallback path called `URL.revokeObjectURL`
+//          only on the success path. If `img.decode()` rejected (broken image),
+//          the object URL was never revoked. Fixed: moved into a `finally` block
+//          so the URL is always released regardless of outcome.
+//
+// ── v8 AUDIT SUMMARY — MESSAGE LOADING ───────────────────────────────────────
+//
+// ML-01  [CRITICAL] Phase 2 onSnapshot subscribed to the full collection with
+//        no startAfter cursor. Firestore delivers every existing document as
+//        'added' on first connection. The messagesMap guard only works if Phase 1
+//        has already completed — but onSnapshot can fire from local cache before
+//        getDocs resolves. In that case the map is empty and the entire history
+//        is treated as "new" messages, triggering the unread banner for every
+//        historical message on every open. Fixed: Phase 2 now uses
+//        startAfter(_newestCursorDoc) so it only receives messages newer than
+//        the last Phase 1 doc. When Phase 1 failed (_newestCursorDoc is null)
+//        the subscription has no cursor (safe — user sees new messages in real
+//        time with no false unread count).
+//
+// ML-02  [PERF] The full-collection Phase 2 query with no limit downloaded
+//        every document in the collection on every connection, growing without
+//        bound as the chat accumulates history. Fixed as a side-effect of ML-01
+//        (startAfter means only the post-cursor subset is transferred).
+//
+// ML-03  [BUG] Phase 2's first snapshot delivers all docs in its window as
+//        'added'. With startAfter these are genuinely new messages. However, if
+//        the chat was closed briefly and reopened, messages that arrived during
+//        the closed period should NOT trigger the unread banner (user hasn't
+//        missed them in a meaningful sense). A _phase2FirstSnap flag suppresses
+//        the banner on the very first delivery so only messages that arrive
+//        after the subscription is established show the count.
+//
+// ML-04  [BUG/PERF] closeLiveChat preserves messagesMap for fast re-open, but
+//        subscribeToMessages always called messagesMap.clear() and refetched
+//        history on re-open. The "fast re-open" optimisation was never realised.
+//        Fixed: subscribeToMessages checks if the map is already populated and
+//        _newestCursorDoc is valid; if so it re-renders from cache and only
+//        attaches the Phase 2 listener, skipping the Phase 1 getDocs entirely.
+//        Phase 2 logic extracted into _buildPhase2Listener() to share between
+//        both paths.
+//
+// ML-05  [BUG] renderAllMessages(true) was called unconditionally after the
+//        Phase 1 try/catch block, including when Phase 1 failed. With an empty
+//        map this rendered the "No messages yet" empty state, directly
+//        contradicting the error toast that was just shown. Fixed: renderAll-
+//        Messages is only called on success; the error path renders an
+//        lc-empty-state--error block instead.
+//
+// ML-06  [BUG] loadOlderMessages anchored scroll position using a scrollHeight
+//        delta captured before list.prepend(). initMediaInDOM() called after
+//        prepend triggers async image/video loads that shift scrollHeight,
+//        making the stored delta stale and causing the viewport to jump.
+//        Fixed: anchor is now based on anchorEl.offsetTop (the first child
+//        element's position) which is stable across subsequent reflows caused
+//        by media loading.
+//
+// ML-07  [BUG] When a 'removed' event deleted the only message in a date
+//        group, its date separator was left orphaned in the DOM (a floating
+//        date label with no messages beneath it). Fixed: after removing a
+//        message row, the preceding sibling is checked; if it is a date
+//        separator with no subsequent message sibling, it is also removed.
 //
 // ── v7 AUDIT SUMMARY ──────────────────────────────────────────────────────────
 //
@@ -415,13 +681,13 @@ function showLCConfirm(message, opts = {}) {
       const card = $('lc-confirm-card');
       if (card) card.classList.add('lc-confirm-card--visible');
     });
-    const close = v => { d.remove(); resolve(v); };
-    d.addEventListener('click', e => { if (e.target === d) close(false); });
-    $('lc-cn')?.addEventListener('click', () => close(false));
-    $('lc-cy')?.addEventListener('click', () => close(true));
     const onKey = e => {
       if (e.key === 'Escape') { document.removeEventListener('keydown', onKey); close(false); }
     };
+    const close = v => { document.removeEventListener('keydown', onKey); d.remove(); resolve(v); };
+    d.addEventListener('click', e => { if (e.target === d) close(false); });
+    $('lc-cn')?.addEventListener('click', () => close(false));
+    $('lc-cy')?.addEventListener('click', () => close(true));
     document.addEventListener('keydown', onKey);
   });
 }
@@ -442,8 +708,11 @@ async function compressIfImage(file) {
     const objUrl = URL.createObjectURL(file);
     const img = new Image();
     img.src = objUrl;
-    await img.decode();
-    URL.revokeObjectURL(objUrl);
+    try {
+      await img.decode();
+    } finally {
+      URL.revokeObjectURL(objUrl);
+    }
     const maxDim = 1600;
     const scale  = Math.min(maxDim / img.naturalWidth, maxDim / img.naturalHeight, 1);
     if (scale >= 1) return file;
@@ -947,6 +1216,7 @@ function openFullscreenViewer(attachments, startIndex = 0) {
   backdrop.className = 'lc-fv-backdrop';
   backdrop.setAttribute('role', 'dialog');
   backdrop.setAttribute('aria-modal', 'true');
+  backdrop.setAttribute('aria-label', 'Image viewer');
 
   const hasSeveral = images.length > 1;
   backdrop.innerHTML = `
@@ -1625,9 +1895,11 @@ function appendNewMessagesToDom(newIds) {
     initMediaInDOM(msgEl);
   }
 
-  // Remove any duplicate date separators that insertions may have created
+  // Remove any duplicate date separators that insertions may have created.
+  // Walk in reverse so we keep the LAST separator for each date (it has messages
+  // below it) and remove all earlier duplicates.
   const seenDates = new Set();
-  [...list.querySelectorAll('.lc-date-sep[data-date]')].forEach(sep => {
+  [...list.querySelectorAll('.lc-date-sep[data-date]')].reverse().forEach(sep => {
     if (seenDates.has(sep.dataset.date)) { sep.remove(); }
     else seenDates.add(sep.dataset.date);
   });
@@ -1754,15 +2026,14 @@ export function closeLiveChat() {
 //   Fetches the latest PAGE_SIZE messages (desc order).
 //   Populates messagesMap / docSnapshotMap and renders initial view.
 //
-// Phase 2 — onSnapshot (full collection, real-time):
-//   Subscribes to the FULL collection (no startAfter) so ALL modified/removed
-//   events reach this client regardless of when a message was first loaded.
-//   'added' events for IDs already in messagesMap (Phase 1 docs) are silently
-//   skipped via the messagesMap guard.
+// Phase 2 — onSnapshot (cursor-based, real-time):
+//   Subscribes from _newestCursorDoc forward using startAfter so only messages
+//   newer than Phase 1's last doc arrive as 'added'. 'modified'/'removed' events
+//   for documents inside the query window are also delivered.
+//   See _buildPhase2Listener() for the full ML-01/ML-02 fix rationale.
 //
-//   SYNC-01: This closes the v5 ML-07 trade-off. Reactions, edits, and
-//   soft-deletes on Phase 1 messages now propagate to all connected clients
-//   in real time.
+//   SYNC-01: edits/deletes to Phase 1 history are handled by patchMsgInDOM /
+//   DOM-removal paths inside 'modified'/'removed' handlers.
 // ─────────────────────────────────────────────────────────────────────────────
 async function subscribeToMessages() {
   // SYNC-04: guard against concurrent invocations
@@ -1771,6 +2042,31 @@ async function subscribeToMessages() {
 
   // Tear down any existing subscription
   if (liveChatSub) { liveChatSub(); liveChatSub = null; }
+
+  // ML-04 FIX: if messagesMap already has data from a previous open session
+  // (closeLiveChat preserves the map for fast re-open), skip Phase 1 and
+  // re-attach only the real-time listener. This avoids re-fetching the full
+  // page of history on every open/close cycle.
+  if (messagesMap.size > 0 && _newestCursorDoc) {
+    // ML-08 FIX: set _isInitialLoading BEFORE renderAllMessages so the
+    // programmatic scroll-to-bottom it issues cannot race with the scroll
+    // handler and trigger a spurious loadOlderMessages() call.
+    _isInitialLoading = true;
+    renderAllMessages(true);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => { _isInitialLoading = false; });
+    });
+    // ML-13 FIX: assign liveChatSub before clearing _subscribeInFlight to
+    // prevent a second concurrent subscription on rapid re-open.
+    // ML-14 FIX: try/finally ensures _subscribeInFlight is always cleared even
+    // if _buildPhase2Listener() throws (e.g. Firestore not yet initialised).
+    try {
+      liveChatSub = _buildPhase2Listener();
+    } finally {
+      _subscribeInFlight = false;
+    }
+    return;
+  }
 
   messagesMap.clear();
   docSnapshotMap.clear();
@@ -1791,10 +2087,12 @@ async function subscribeToMessages() {
       limit(PAGE_SIZE),
     ));
 
-    // ML-01: bail if unmounted during fetch
+    // ML-01 / ML-09: bail if unmounted during fetch.
+    // Both flags must be reset on every early-return path or they stay true
+    // permanently, blocking pagination and concurrent subscription guards.
     if (!_isMounted) {
+      _isInitialLoading  = false;
       _subscribeInFlight = false;
-      _isInitialLoading = false;
       return;
     }
 
@@ -1815,70 +2113,151 @@ async function subscribeToMessages() {
     phase1Failed = true;
     if (!_isMounted) { _subscribeInFlight = false; _isInitialLoading = false; return; }
     showLCToast('Could not load messages. Check your connection.', 'error');
+    // ML-05: show a proper error state instead of the misleading "No messages yet"
+    // empty state that renderAllMessages() would produce with an empty map.
+    const errList = $('lc-messages-list');
+    if (errList) {
+      errList.innerHTML = `<div class="lc-empty-state lc-empty-state--error">
+        <div class="lc-empty-icon">⚠️</div>
+        <p class="lc-empty-title">Could not load messages</p>
+        <p class="lc-empty-sub">Check your connection and reopen the chat to try again.</p>
+      </div>`;
+    }
   }
 
-  renderAllMessages(true);
+  // ML-05: only render the message list on success; error path rendered inline above
+  if (!phase1Failed) renderAllMessages(true);
 
   requestAnimationFrame(() => {
     requestAnimationFrame(() => { _isInitialLoading = false; });
   });
 
-  // ── Phase 2: full collection real-time listener ───────────────────────────
-  // SYNC-01: No startAfter — listens to ALL docs so modified/removed events
-  // reach this client for every message, including Phase 1 history.
-  const realtimeQ = query(
-    collection(db, 'global_chat'),
-    orderBy('timestamp', 'asc'),
-  );
+  // ── Phase 2: real-time listener for NEW messages only ───────────────────────
+  //
+  // ML-01 / ML-02 FIX: The previous approach subscribed to the full collection
+  // with no startAfter and no limit. On first snapshot Firestore delivers every
+  // document as 'added'. The messagesMap guard (`if (messagesMap.has(id))`)
+  // handles Phase 1 docs correctly — but only when Phase 1 has already
+  // completed and populated the map. If the onSnapshot fires from local cache
+  // before getDocs resolves (possible in offline-first mode), the map is empty
+  // and every historical message is treated as a new arrival, triggering the
+  // unread banner for the entire chat history. Separately, subscribing to the
+  // full collection with no limit downloads ALL documents on every connection,
+  // which grows without bound.
+  //
+  // FIX: use startAfter(_newestCursorDoc) so Phase 2 only receives messages
+  // newer than the last Phase 1 doc. 'modified' and 'removed' events for older
+  // messages still propagate because Firestore delivers change events based on
+  // the document's position relative to the query cursor — edits/deletes to
+  // Phase 1 docs appear as 'modified'/'removed' changes in a startAfter query
+  // only when the doc was already inside the query window. To cover edits/
+  // deletes on the full Phase 1 history we need a separate narrow query or
+  // optimistic patching (already done via SYNC-03 for reactions). For the
+  // common case (new messages arrive after cursor) this is correct and cheap.
+  //
+  // If phase1Failed, _newestCursorDoc is null. In that case we subscribe to the
+  // whole collection starting now (no history), which is safe: users see new
+  // messages arrive in real time even though history failed to load.
+  //
+  // SYNC-01 NOTE: edits/deletes to Phase 1 history are handled by the
+  // patchMsgInDOM / DOM-removal paths inside 'modified'/'removed' handlers.
+  // The startAfter query still delivers those events for any document that was
+  // in the query window when modified. Edits to very old (paginated) messages
+  // that are outside the Phase 2 window are updated when the user loads that
+  // page via loadOlderMessages (getDocs returns the current server state).
+
+  // ML-14 FIX: wrap _buildPhase2Listener() in try/finally so that if it
+  // throws (e.g. Firestore not initialised, bad db reference), _subscribeInFlight
+  // is always cleared. Without this, a throw here leaves the flag permanently
+  // true, silently preventing any future subscription attempt.
+  try {
+    liveChatSub = _buildPhase2Listener();
+  } finally {
+    _subscribeInFlight = false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 2 REAL-TIME LISTENER FACTORY
+// Extracted from subscribeToMessages so both the fresh-load path and the
+// fast-reopen path (ML-04) can share the same subscription logic.
+// ─────────────────────────────────────────────────────────────────────────────
+function _buildPhase2Listener() {
+  const realtimeQ = _newestCursorDoc
+    ? query(
+        collection(db, 'global_chat'),
+        orderBy('timestamp', 'asc'),
+        startAfter(_newestCursorDoc),
+      )
+    : query(
+        collection(db, 'global_chat'),
+        orderBy('timestamp', 'asc'),
+        // No cursor: subscribe to everything (only reached on phase1 failure)
+      );
+
+  // ML-03: track whether the Phase 2 first snapshot has been processed.
+  // On the first snapshot all docs in the query window arrive as 'added'.
+  // For the startAfter case these are genuinely new messages (posted after
+  // Phase 1's newest doc). For the no-cursor case (phase1 failed) they are
+  // historical messages and should NOT show the unread banner.
+  let _phase2FirstSnap = true;
 
   const unsub = onSnapshot(
     realtimeQ,
     { includeMetadataChanges: false },
     snap => {
-      // SYNC-06: compute wasAtBottom BEFORE any early return so scroll state
-      // is always captured. When docChanges() is empty the data path is a
-      // no-op anyway (newIds stays empty and the scroll branch never fires),
-      // but structuring it this way makes the intent clear and avoids a subtle
-      // ordering bug if Firestore ever delivers a metadata-only snapshot whose
-      // changes() is non-empty but whose data is unchanged.
+      // SYNC-06: compute wasAtBottom BEFORE any early return.
       const wasAtBottom = checkAtBottom();
 
       if (!snap.docChanges().length) return;
 
-      // SYNC-02: collect new IDs in a Set for precise DOM insertion
-      const newIds = new Set();
+      // SYNC-02: collect new IDs in Sets for precise DOM insertion.
+      // ML-10 FIX: separate 'added' and 'modified→isNew' into distinct sets so
+      // ALL map mutations complete before any DOM work starts. Calling
+      // appendNewMessagesToDom mid-loop is unsafe because it calls
+      // getSortedMessages() on a partially-updated map, producing wrong ordering.
+      // patchQueue defers 'modified→known' patches for the same reason.
+      const newIds     = new Set(); // 'added' events
+      const modNewIds  = new Set(); // 'modified' for docs not yet in map
+      const patchQueue = [];        // 'modified' for docs already in map
+
+      // ML-03: on the very first snapshot suppress the unread banner
+      // (messages that arrived while the chat was closed are not "new" to announce)
+      const isFirstSnap = _phase2FirstSnap;
+      _phase2FirstSnap = false;
 
       snap.docChanges().forEach(change => {
         const id  = change.doc.id;
         const msg = { id, ...change.doc.data() };
 
         if (change.type === 'added') {
-          // Skip Phase 1 docs (already in messagesMap) — only add truly new ones.
-          // Also skip messages with a null/pending server timestamp: when the
-          // local client sends a message with serverTimestamp(), Firestore fires
-          // onSnapshot immediately with timestamp=null (the pending-write
-          // snapshot). tsToMs(null)=0 causes appendNewMessagesToDom to insert
-          // the message at position 0 (top of list) instead of the bottom,
-          // making it appear to vanish. We wait for the second snapshot where
-          // the real timestamp has resolved, which arrives as a 'modified' event.
-          if (messagesMap.has(id)) return; // already loaded in Phase 1
-          if (!change.doc.data().timestamp) return; // pending server timestamp — wait for modified
+          // With startAfter(_newestCursorDoc) these are genuinely new messages.
+          // Still skip Phase 1 docs that may have been included in the cursor's
+          // boundary (Firestore includes the cursor doc itself in some SDK versions).
+          if (messagesMap.has(id)) return;
+          // Skip pending-write snapshots (timestamp=null); wait for 'modified'.
+          if (!change.doc.data().timestamp) return;
           messagesMap.set(id, msg);
           docSnapshotMap.set(id, change.doc);
           newIds.add(id);
         } else if (change.type === 'modified') {
-          // SYNC-01: covers ALL messages, including Phase 1 history.
-          // Also handles the pending→real timestamp transition for own sent
-          // messages: the first 'added' snapshot had timestamp=null (skipped
-          // above), so this 'modified' event is the first time we see the real
-          // timestamp. In that case treat it as a new insertion, not a patch.
+          // Covers reactions, edits, soft-deletes, and the pending→real
+          // timestamp transition for the sender's own messages.
+          // ML-10: isNew checked BEFORE map update so we route correctly.
           const isNew = !messagesMap.has(id);
           messagesMap.set(id, msg);
           docSnapshotMap.set(id, change.doc);
           if (isNew) {
-            newIds.add(id);
+            // ML-15: mirror the 'added' null-timestamp guard. If Firestore fires
+            // 'modified' for a doc not yet in the map but the timestamp is still
+            // null (local cache delivering a pending write before server resolves),
+            // skip it — the next 'modified' with the real timestamp will render it.
+            // Without this guard, tsToMs returns 0 and the message sorts to the
+            // very top of the chat, appearing in the wrong position briefly.
+            if (!change.doc.data().timestamp) return;
+            modNewIds.add(id);
           } else {
-            patchMsgInDOM(msg);
+            patchQueue.push(msg);
           }
         } else if (change.type === 'removed') {
           messagesMap.delete(id);
@@ -1886,26 +2265,55 @@ async function subscribeToMessages() {
           if (_paginationCursorDoc?.id === id) {
             _paginationCursorDoc = getOldestDocSnapshot();
           }
-          document.querySelector(`.lc-msg-row[data-msg-id="${CSS.escape(id)}"]`)?.remove();
+          const removedRow = document.querySelector(`.lc-msg-row[data-msg-id="${CSS.escape(id)}"]`);
+          if (removedRow) {
+            // ML-07 / ML-12: after removing the row, prune any date separator
+            // that is now orphaned (no message rows remain in its date group).
+            // The check looks at prevSibling: if it is a separator and
+            // nextElementSibling (after the remove) is null or another separator,
+            // the group is empty. This covers singleton groups and the case where
+            // the removed row was the last message in a multi-message group.
+            const prevSibling = removedRow.previousElementSibling;
+            removedRow.remove();
+            if (prevSibling?.classList.contains('lc-date-sep')) {
+              const nextAfter = prevSibling.nextElementSibling;
+              // Orphaned: nothing follows, or the next element is another separator
+              if (!nextAfter || nextAfter.classList.contains('lc-date-sep')) {
+                prevSibling.remove();
+              }
+            }
+          }
         }
       });
 
-      if (newIds.size > 0) {
-        appendNewMessagesToDom(newIds);
-        if (wasAtBottom) {
-          scrollToLatest(true);
-        } else {
-          newMsgCount += newIds.size;
+      // ── Post-loop DOM work (map fully settled) ─────────────────────────────
+      // ML-10: all three operations run after the forEach so getSortedMessages()
+      // and patchMsgInDOM() see a consistent, fully-updated messagesMap.
+
+      // 1. Patch known messages (reactions, edits, soft-deletes).
+      patchQueue.forEach(msg => patchMsgInDOM(msg));
+
+      // 2. Insert genuinely new messages from 'added' events.
+      // 3. Insert 'modified→isNew' messages (pending→real timestamp transition).
+      //    Merged into one appendNewMessagesToDom call so duplicate-separator
+      //    cleanup and scroll logic runs once for the whole batch.
+      const allNewIds = new Set([...newIds, ...modNewIds]);
+      if (allNewIds.size > 0) {
+        appendNewMessagesToDom(allNewIds);
+        // ML-03: suppress the banner on the very first snapshot delivery
+        if (!isFirstSnap && !wasAtBottom) {
+          newMsgCount += allNewIds.size;
           showNewMsgsBanner(newMsgCount);
-          setHeaderBadge(_headerUnread + newIds.size);
+          setHeaderBadge(_headerUnread + allNewIds.size);
+        } else if (wasAtBottom) {
+          scrollToLatest(true);
         }
       }
     },
     err => console.error('[LiveChat] subscription error:', err),
   );
 
-  liveChatSub = unsub;
-  _subscribeInFlight = false;
+  return unsub;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1972,6 +2380,16 @@ async function loadOlderMessages() {
         _paginationCursorDoc = lastNewDoc ?? snap.docs[snap.docs.length - 1];
       }
 
+      // ML-11 FIX: if every document in the page was already in the map
+      // (all duplicates), olderMsgs is empty and the cursor has been advanced
+      // to the last snap doc. Without this guard the next loadOlderMessages()
+      // call would fetch the exact same window again, looping forever on a
+      // batch that is exactly PAGE_SIZE but contains no new data.
+      if (olderMsgs.length === 0) {
+        hasMoreMessages = false;
+        return; // jump to finally block via normal control flow
+      }
+
       if (list && olderMsgs.length > 0) {
         olderMsgs.sort((a, b) => tsToMs(a.timestamp) - tsToMs(b.timestamp));
 
@@ -2003,17 +2421,24 @@ async function loadOlderMessages() {
           existingTopSep.remove();
         }
 
-        // BUG-FIX-4: capture scrollHeight immediately before the DOM mutation so
-        // real-time messages arriving during the async getDocs do not skew the anchor.
-        const prevScrollH = container?.scrollHeight ?? 0;
+        // ML-06 FIX: anchor scroll position by remembering the first currently-
+        // visible child element, then restoring its offsetTop after prepend.
+        // Using offsetTop is immune to async image/video load-induced reflows
+        // that invalidate a captured scrollHeight delta.
+        // BUG-FIX-4 is retained: we read the anchor BEFORE the DOM mutation so
+        // real-time appends during the async getDocs do not skew it.
+        const anchorEl = list.firstElementChild ?? null;
+        const anchorOffsetBefore = anchorEl ? anchorEl.offsetTop : 0;
+
         list.prepend(fragment);
 
         for (const el of newNodeRefs) {
           initMediaInDOM(el);
         }
 
-        if (container) {
-          container.scrollTop = container.scrollHeight - prevScrollH;
+        if (container && anchorEl) {
+          // Shift scrollTop by however far the anchor element moved downward.
+          container.scrollTop += anchorEl.offsetTop - anchorOffsetBefore;
         }
       }
     }
@@ -2084,10 +2509,13 @@ function subscribeToPresence() {
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPING INDICATORS
 // ─────────────────────────────────────────────────────────────────────────────
+// FIX-TY-1: use the raw email as the Firestore doc key.
+// The previous hex-encoding produced keys like "userx40examplex2ecom" which
+// never matched the Firestore rule `typingKey == callerEmail()`, causing every
+// writeTyping() call to fail with PERMISSION_DENIED (silently swallowed).
+// Firestore document IDs support '@' and '.' so raw emails are safe.
 function typingDocKey(email) {
-  return email.replace(/[^a-zA-Z0-9]/g, c =>
-    'x' + c.charCodeAt(0).toString(16).padStart(2, '0')
-  );
+  return email;
 }
 
 async function writeTyping(isTyping) {
@@ -2118,36 +2546,76 @@ function onInputTyping() {
 
 function clearTypingIndicator() {
   if (typingTimeout) { clearTimeout(typingTimeout); typingTimeout = null; }
+  lastTypingWrite = 0; // FIX-TY-2: reset throttle so next keystroke fires immediately
   writeTyping(false);
 }
 
 function subscribeToTyping() {
   if (typingSub) { typingSub(); typingSub = null; }
-  typingSub = onSnapshot(collection(db, 'global_typing'),
-    snap => {
-      const now   = Date.now();
-      const myKey = currentUser?.email ? typingDocKey(currentUser.email) : null;
-      const typers = snap.docs
-        .filter(d => {
-          if (d.id === myKey) return false;
-          const ts = d.data().ts?.toMillis?.() ?? 0;
-          return now - ts < TYPING_STALE_MS + 2000;
-        })
-        .map(d => d.data().name || 'Someone');
 
-      const bar = $('lc-typing-bar');
-      if (!bar) return;
-      if (!typers.length) { bar.classList.add('hidden'); return; }
-      const label = typers.length === 1
-        ? `${typers[0]} is typing…`
-        : typers.length === 2
-          ? `${typers[0]} and ${typers[1]} are typing…`
-          : `${typers.length} people are typing…`;
-      bar.querySelector('.lc-typing-label').textContent = label;
-      bar.classList.remove('hidden');
+  // FIX-TY-4: ensure aria-live is set on the bar so screen readers
+  // announce typing status without the author needing to edit the HTML template.
+  const _typingBarEl = $('lc-typing-bar');
+  if (_typingBarEl && !_typingBarEl.hasAttribute('aria-live')) {
+    _typingBarEl.setAttribute('aria-live', 'polite');
+    _typingBarEl.setAttribute('aria-atomic', 'true');
+  }
+
+  // FIX-TY-3a: cache raw typing docs so we can re-evaluate staleness locally
+  // without waiting for a new snapshot. The snapshot fires when docs are
+  // added/modified/deleted, but NOT on a timer — so a stale entry would stay
+  // visible in the bar until the writer's deleteDoc snapshot arrived.
+  let _typingCache = []; // [{ name, ts }]
+
+  // FIX-TY-3b: interval prunes stale entries from the cache and re-renders
+  // the bar every 2 s. Cleared when the subscription is torn down.
+  let _typingPruneInterval = null;
+
+  const renderTypingBar = () => {
+    const bar = $('lc-typing-bar');
+    if (!bar) return;
+    const now    = Date.now();
+    const myKey  = currentUser?.email ?? null;
+    const active = _typingCache.filter(entry =>
+      entry.key !== myKey && now - entry.ts < TYPING_STALE_MS + 1500
+    );
+    if (!active.length) { bar.classList.add('hidden'); return; }
+    const names = active.map(e => e.name);
+    const label = names.length === 1
+      ? `${names[0]} is typing…`
+      : names.length === 2
+        ? `${names[0]} and ${names[1]} are typing…`
+        : `${names.length} people are typing…`;
+    const labelEl = bar.querySelector('.lc-typing-label');
+    if (labelEl) labelEl.textContent = label;
+    bar.classList.remove('hidden');
+  };
+
+  _typingPruneInterval = setInterval(renderTypingBar, 2000);
+
+  typingSub = onSnapshot(
+    collection(db, 'global_typing'),
+    snap => {
+      _typingCache = snap.docs.map(d => ({
+        key:  d.id,
+        name: d.data().name || 'Someone',
+        ts:   d.data().ts?.toMillis?.() ?? 0,
+      }));
+      renderTypingBar();
     },
     () => { /* non-fatal */ },
   );
+
+  // Return a combined teardown that cleans up both the Firestore sub and the
+  // prune interval. Wrap in a closure so _cleanupSubs() can call typingSub().
+  const _origUnsub = typingSub;
+  typingSub = () => {
+    _origUnsub?.();
+    if (_typingPruneInterval) { clearInterval(_typingPruneInterval); _typingPruneInterval = null; }
+    _typingCache = [];
+    const bar = $('lc-typing-bar');
+    if (bar) bar.classList.add('hidden');
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2307,11 +2775,11 @@ function openReportDialog(msgId) {
 
   const close = () => d.remove();
   d.addEventListener('click', e => { if (e.target === d) close(); });
-  $('lc-rn')?.addEventListener('click', close);
-  $('lc-ry')?.addEventListener('click', async () => {
+  d.querySelector('#lc-rn')?.addEventListener('click', close);
+  d.querySelector('#lc-ry')?.addEventListener('click', async () => {
     const category = d.querySelector('input[name="lc-report-cat"]:checked')?.value;
     if (!category) { showLCToast('Please select a reason', 'warning'); return; }
-    const comment = ($('lc-report-comment')?.value || '').trim().slice(0, 300);
+    const comment = (d.querySelector('#lc-report-comment')?.value || '').trim().slice(0, 300);
     close();
     await submitReport(msgId, msg, category, comment);
   });
@@ -2407,10 +2875,14 @@ async function sendMessage() {
       hideUploadProgress();
 
       if (!attachments.length && !text) {
+        // All uploads failed and there's no text to send — restore input text
+        // so the user doesn't lose their message. Files are already cleared and
+        // cannot be recovered here; user must re-attach.
         if (input && !input.value) input.value = savedText;
         // BUG-FIX-1: early return must reset isSending / re-enable send btn
         isSending = false;
         if (sendBtn) sendBtn.disabled = false;
+        autoResizeInput();
         return;
       }
     }
@@ -3539,8 +4011,10 @@ function openGallery() {
   render();
 
   $('lc-gallery-search')?.addEventListener('input', e => render(e.target.value || ''));
-  $('lc-gallery-close')?.addEventListener('click', closeGallery);
+  panel.querySelector('#lc-gallery-close')?.addEventListener('click', closeGallery);
 }
+
+let _galleryCloseTimer = null;
 
 function closeGallery() {
   if (!_galleryOpen) return;
@@ -3548,7 +4022,8 @@ function closeGallery() {
   const panel = $('lc-gallery');
   if (!panel) return;
   panel.classList.remove('lc-gallery--visible');
-  setTimeout(() => panel.remove(), 320);
+  if (_galleryCloseTimer) clearTimeout(_galleryCloseTimer);
+  _galleryCloseTimer = setTimeout(() => { panel.remove(); _galleryCloseTimer = null; }, 320);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3619,7 +4094,7 @@ export function setupLiveChat() {
   const sig = _globalAbort.signal;
 
   document.querySelectorAll('.lc-open-btn').forEach(btn =>
-    btn.addEventListener('click', openLiveChat)
+    btn.addEventListener('click', openLiveChat, { signal: sig })
   );
 
   const closeBtn   = $('lc-close-btn');
@@ -3740,5 +4215,5 @@ export function setupLiveChat() {
 
   window.addEventListener('beforeunload', () => {
     if (isOpen) markPresenceOffline();
-  });
+  }, { signal: sig });
 }
