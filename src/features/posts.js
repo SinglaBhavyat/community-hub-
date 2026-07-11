@@ -5,7 +5,7 @@
 import { db, auth } from '../config/firebase.js';
 import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js';
 import { addDocument, currentUser } from '../store/db.js';
-import { uploadImage, uploadMediaFiles, getVideoThumbnail } from '../utils/storage.js';
+import { uploadMediaFiles, getVideoThumbnail } from '../utils/storage.js';
 import {
     createPostCardHTML,
     handleAiSummarize,
@@ -201,6 +201,15 @@ function initVideoPlayer(wrapper) {
     toggleBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePlay(); });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) togglePlay(); });
 
+
+    // Fallback for old posts without a thumbnailUrl/poster: seek to 0.01s
+    // once metadata loads so the browser paints a frame instead of black.
+    if (!video.poster) {
+        video.addEventListener("loadedmetadata", () => {
+            if (video.currentTime === 0) video.currentTime = 0.01;
+        }, { once: true });
+    }
+
     video.muted = true;
     syncMuteIcons(true);
     muteBtn.addEventListener('click', (e) => {
@@ -250,6 +259,7 @@ function renderMediaItems(mediaItems) {
                 <div class="carousel-slide" data-index="${i}">
                     <div class="vid-wrapper">
                         <video src="${m.url}" preload="metadata" playsinline muted
+                               ${m.thumbnailUrl ? `poster="${m.thumbnailUrl}"` : ''}
                                style="width:100%;object-fit:contain;display:block;"></video>
                     </div>
                 </div>`;
@@ -305,6 +315,7 @@ function openMediaLightbox(mediaItems, startIndex = 0) {
                     ${isVideo ? `
                         <div class="vid-wrapper vid-wrapper--lightbox">
                             <video src="${m.url}" controls autoplay
+                                   ${m.thumbnailUrl ? `poster="${m.thumbnailUrl}"` : ''}
                                    style="max-width:90vw;max-height:80vh;border-radius:10px;"></video>
                         </div>
                     ` : `
@@ -529,8 +540,9 @@ async function aiSummarizePost(postCard, postData) {
     const btn = postCard.querySelector('.ai-summarize-btn');
     let summaryEl = postCard.querySelector('.ai-summary-box');
 
+    // Toggle existing summary open/closed
     if (summaryEl) {
-        summaryEl.style.maxHeight = summaryEl.style.maxHeight === '0px' ? '200px' : '0px';
+        summaryEl.style.maxHeight = summaryEl.style.maxHeight === '0px' ? '300px' : '0px';
         return;
     }
 
@@ -551,15 +563,29 @@ async function aiSummarizePost(postCard, postData) {
     summaryEl.append(header, body);
     const contentArea = postCard.querySelector('.post-content') || postCard.querySelector('p');
     contentArea?.after(summaryEl);
-    requestAnimationFrame(() => { summaryEl.style.maxHeight = '200px'; });
+    requestAnimationFrame(() => { summaryEl.style.maxHeight = '300px'; });
 
     try {
-        const raw       = (postData.content || '').trim();
-        const sentences = raw.match(/[^.!?\n]+[.!?]+/g) || [];
-        let text = sentences.length >= 2
-            ? sentences.slice(0, 2).join(' ').trim()
-            : raw.slice(0, 280).trim() + (raw.length > 280 ? '…' : '');
-        if (!text) text = 'No content to summarise.';
+        const raw = [postData.title, postData.content].filter(Boolean).join('\n\n').trim();
+        if (!raw) { body.textContent = 'No content to summarise.'; return; }
+
+        const res = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model:      'claude-sonnet-4-6',
+                max_tokens: 150,
+                messages: [{
+                    role:    'user',
+                    content: `Summarise this community post in 1–2 clear sentences. Be concise and neutral. Do not start with "This post".\n\n${raw}`,
+                }],
+            }),
+        });
+
+        const data = await res.json();
+        const text = data?.content?.[0]?.text?.trim() || 'Unable to summarise this post right now.';
+
+        // Typewriter effect
         let i = 0;
         const type = () => { if (i < text.length) { body.textContent += text[i++]; requestAnimationFrame(type); } };
         type();
@@ -1748,6 +1774,12 @@ export function setupPosts() {
             return;
         }
 
+        if (e.target.closest('.view-user-profile-btn')) {
+            const email = e.target.closest('.view-user-profile-btn').dataset.userEmail;
+            if (email) window.openUserProfile?.(email);
+            return;
+        }
+
         if (e.target.closest('.hashtag-link')) {
             const tag         = e.target.closest('.hashtag-link').dataset.tag;
             const filterInput = document.getElementById('hashtag-filter-input');
@@ -1954,6 +1986,31 @@ export function setupPosts() {
         if (firebaseUser) {
             loadFeed();
             startCacheListener();
+        }
+
+        // Fix 4: deep-link — open the post referenced by ?post=<id> in the URL.
+        // We do this after the first feed render so the cache is populated.
+        const deepPostId = new URLSearchParams(location.search).get('post');
+        if (deepPostId) {
+            // Wait for the feed snapshot to populate the cache, then open comments.
+            // Use a short poll so we don't depend on snapshot timing.
+            let attempts = 0;
+            const tryOpen = setInterval(() => {
+                attempts++;
+                const post = _postCache.get(deepPostId);
+                if (post) {
+                    clearInterval(tryOpen);
+                    // Scroll to the post card if it exists in the feed
+                    const card = document.querySelector(`.post-card[data-post-id="${deepPostId}"]`);
+                    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    // Open comments panel
+                    window.openComments?.(deepPostId);
+                    // Clean the URL so refreshing doesn't re-open the panel
+                    history.replaceState(null, '', location.pathname);
+                } else if (attempts > 20) {
+                    clearInterval(tryOpen); // give up after ~2s
+                }
+            }, 100);
         }
     });
 

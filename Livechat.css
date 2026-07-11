@@ -18,8 +18,13 @@
   padding: 0;
   pointer-events: none;
 }
-.lc-overlay--hidden { visibility: hidden; }
-.lc-overlay--visible { pointer-events: auto; }
+/* Hidden: use both visibility:hidden AND pointer-events:none for iOS compatibility.
+   visibility:hidden alone can still receive pointer events on some WebKit versions. */
+.lc-overlay--hidden {
+  visibility: hidden;
+  /* Keep display:flex so the panel keeps its layout context for the open animation */
+}
+.lc-overlay--visible { pointer-events: auto; visibility: visible; }
 
 /* ─── Backdrop ───────────────────────────────────────────────────────────── */
 .lc-backdrop {
@@ -48,6 +53,13 @@
   transform: translateX(100%);
   transition: transform 0.38s var(--ease-spring);
   overflow: hidden;
+  /* Pre-promote to compositor layer to avoid jank on first open */
+  will-change: transform;
+  /* contain removed entirely:
+     - contain:layout traps position:fixed children (fullscreen overlay, native fullscreen API)
+     - contain:style blocks CSS custom property (var(--token)) inheritance into children,
+       breaking all design-system colour/spacing tokens used throughout the panel.
+     Performance gain is negligible compared to the breakage cost. */
 }
 .lc-overlay--visible .lc-panel { transform: translateX(0); }
 
@@ -165,8 +177,11 @@
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch; /* smooth momentum scroll on iOS */
   padding: 8px 0 4px;
-  scroll-behavior: smooth;
+  /* scroll-behavior intentionally omitted — controlled entirely by JS
+     (scrollToLatest passes smooth:true/false). CSS smooth-scroll overrides
+     programmatic auto-scroll and causes a visible slide on initial render. */
 }
 .lc-messages-list {
   display: flex;
@@ -239,13 +254,17 @@
   transition: opacity var(--t-fast);
   flex-shrink: 0;
 }
+/* On touch-primary devices (no hover) keep action buttons visible since
+   hover:opacity transition never fires. Long-press or tap reveals them. */
+@media (hover: none) and (pointer: coarse) {
+  .lc-msg-actions { opacity: 1; pointer-events: auto; }
+}
 .lc-action-btn {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  border: none;
-  background: var(--surface-2);
   border: 1px solid var(--edge);
+  background: var(--surface-2);
   color: var(--ink-dim);
   cursor: pointer;
   display: flex;
@@ -449,7 +468,9 @@
   border: none;
   cursor: pointer;
   border-radius: 8px;
-  padding: 4px;
+  /* 4px padding on all sides = ~28px hit area. Increase to 8px for a ~36px
+     tap target (closer to WCAG 44px minimum on touch screens). */
+  padding: 8px;
   transition: transform var(--t-fast);
   line-height: 1;
 }
@@ -476,13 +497,12 @@
   margin-bottom: 4px;
   width: 100%;
   max-width: 100%;
-  /* Total wrap height = video area + controls bar.
-     We use min-height so the wrap always has room for both the video
-     (at 16:9 of its width) and the ~80px controls panel below it.
-     max-height caps the whole block so a very wide bubble doesn't
-     produce a massive player. */
-  min-height: 140px;
-  max-height: 340px; /* 260px video + 80px controls */
+  /* FIX: height:100% on .lc-media-video ONLY resolves when the parent has an
+     *explicit* height — min-height/max-height alone don't satisfy it.
+     Without an explicit height, calc(100% - 80px) collapses to 0 and the video
+     (and controls) become invisible. We set a concrete height here.
+     260px (video) + 80px (controls) = 340px matches the old max-height intent. */
+  height: 340px;
   background: #000;
   border-radius: 10px;
   /* overflow:hidden clips all absolutely-positioned children (controls,
@@ -508,6 +528,12 @@
   object-fit: contain;
   object-position: center;
   background: #000;
+}
+
+/* Responsive: on narrow screens the bubble is narrower so 340px looks too tall.
+   We drop to a height that gives ~16:9 at ~240px bubble width + controls bar. */
+@media (max-width: 400px) {
+  .lc-media-video-wrap { height: 220px; }
 }
 
 /* VP-28: shown while a video has no poster/thumbnail (preload="none").
@@ -568,7 +594,9 @@
 /* ─── New messages banner ────────────────────────────────────────────────── */
 .lc-new-msgs-bar {
   position: absolute;
-  bottom: 130px;
+  /* Use a CSS custom property with a safe fallback. JS can set
+     --lc-input-h on .lc-panel to override; static fallback is 80px. */
+  bottom: calc(var(--lc-input-h, 80px) + 12px);
   left: 50%;
   transform: translateX(-50%);
   background: var(--signal-violet);
@@ -583,9 +611,19 @@
   box-shadow: var(--shadow-glow);
   white-space: nowrap;
   transition: all var(--t-fast);
+  /* Prevent the banner from being wider than the container on very narrow screens */
+  max-width: calc(100% - 32px);
 }
-.lc-new-msgs-bar.hidden { display: none; }
 .lc-new-msgs-bar:hover { transform: translateX(-50%) scale(1.04); }
+.lc-new-msgs-bar.hidden {
+  opacity: 0;
+  pointer-events: none;
+  /* Don't use display:none — it cuts off the transition. Use opacity so the
+     banner fades out smoothly. visibility:hidden is added so it's not reachable
+     by keyboard navigation while hidden. */
+  visibility: hidden;
+  transform: translateX(-50%) translateY(6px);
+}
 
 /* ─── Upload progress bar ────────────────────────────────────────────────── */
 .lc-upload-bar {
@@ -631,12 +669,14 @@
   width: 44px;
   height: 44px;
   border-radius: 8px;
-  overflow: hidden;
+  /* overflow:hidden removed — it clips the .lc-fp-thumb--new::before badge.
+     Images use object-fit:cover so they don't overflow without the clip. */
   background: var(--surface-3);
   flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
 }
 .lc-fp-img { width: 100%; height: 100%; object-fit: cover; }
 .lc-fp-icon { font-size: 22px; }
@@ -781,7 +821,10 @@
   align-items: flex-end;
   gap: 6px;
   padding: 10px 12px;
+  flex: 1;
+  min-width: 0;
 }
+#lc-input-area-inner.hidden { display: none; }
 .lc-input-icon-btn {
   width: 36px;
   height: 36px;
@@ -814,6 +857,9 @@
   outline: none;
   transition: border-color var(--t-fast), box-shadow var(--t-fast);
   overflow-y: auto;
+  /* Ensure min-height:36px includes padding (content-box would make content
+     area = 36 - 16px padding = 20px, less than one line of text). */
+  box-sizing: border-box;
 }
 .lc-textarea:focus {
   border-color: var(--signal-violet);
@@ -863,7 +909,7 @@
   border: none;
   cursor: pointer;
   border-radius: 8px;
-  padding: 4px;
+  padding: 8px;
   transition: transform var(--t-fast), background var(--t-fast);
   line-height: 1;
 }
@@ -907,6 +953,10 @@
 .lc-empty-icon { font-size: 48px; }
 .lc-empty-title { font-size: 16px; font-weight: 700; color: var(--ink); margin: 0; }
 .lc-empty-sub { font-size: 14px; color: var(--ink-faint); margin: 0; }
+/* Error variant of the empty state (shown when Phase 1 getDocs fails — ML-05) */
+.lc-empty-state--error .lc-empty-icon { filter: grayscale(0.3); }
+.lc-empty-state--error .lc-empty-title { color: var(--signal-danger, #ff4f4f); }
+.lc-empty-state--error .lc-empty-sub { color: var(--ink-dim); }
 
 /* ─── Header button ──────────────────────────────────────────────────────── */
 .lc-header-btn {
@@ -1147,6 +1197,9 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   align-items: center;
   cursor: pointer;
   user-select: none;
+  -webkit-user-select: none;
+  /* Prevent page scroll while seeking on touch devices */
+  touch-action: none;
 }
 .lc-vp-progress-bg {
   position: absolute;
@@ -1311,8 +1364,11 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
    The old .lc-gallery rule used position:absolute which positioned it relative
    to the live-chat panel, clipping/hiding content outside the panel bounds.
    New canonical class: .lc-gallery-panel (position:fixed, right edge of viewport).
-   .lc-gallery--visible is kept as the transform-to-zero trigger. */
-.lc-gallery-panel {
+   .lc-gallery is kept as an alias — JS openGallery creates an element with
+   id="lc-gallery" and class="lc-gallery", so both selectors must match.
+   .lc-gallery--visible is the transform-to-zero trigger. */
+.lc-gallery-panel,
+.lc-gallery {
   position: fixed;
   top: 0;
   right: 0;
@@ -1327,8 +1383,10 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   transform: translateX(100%);
   transition: transform 0.3s var(--ease-spring);
   overflow: hidden;
+  will-change: transform;
 }
-.lc-gallery-panel.lc-gallery--visible { transform: translateX(0); }
+.lc-gallery-panel.lc-gallery--visible,
+.lc-gallery.lc-gallery--visible { transform: translateX(0); }
 
 /* Header and close button inside the gallery panel */
 .lc-gallery-panel__header {
@@ -1911,7 +1969,7 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   justify-content: center;
   line-height: 1;
 }
-.lc-fp-thumb { position: relative; }
+/* .lc-fp-thumb position:relative is set in the canonical rule above */
 
 /* ─── FEAT-F / FIX-33: Fullscreen image viewer ────────────────────────────── */
 .lc-fv-backdrop {
@@ -1969,6 +2027,8 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  /* Prevent browser scroll/zoom interference during pinch-zoom and pan */
+  touch-action: none;
 }
 
 .lc-fv-img {
@@ -2110,14 +2170,8 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 #lc-vn-panel.hidden { display: none; }
 
 /* Inner text/textarea row that gets hidden during recording */
-#lc-input-area-inner {
-  display: flex;
-  align-items: flex-end;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-#lc-input-area-inner.hidden { display: none; }
+/* NOTE: #lc-input-area-inner canonical rule (with padding) is defined above
+   in the input-area section. Only the hidden state is needed here. */
 
 /* ─── Recording timer ─────────────────────────────────────────────────────── */
 .lc-vn-timer {
@@ -2256,9 +2310,13 @@ body.dark-mode .lc-reaction-pill { color: var(--ink); }
 .lc-vb-wave-seek {
   position: relative;
   height: 28px;
+  /* Expand the tappable area to 44px minimum without changing the visual height.
+     Use padding to extend the hit target while keeping overflow:hidden for the bars. */
+  min-height: 44px;
   cursor: pointer;
   -webkit-user-select: none;
   user-select: none;
+  touch-action: none;
   display: flex;
   align-items: center;
   border-radius: 4px;
@@ -2469,12 +2527,12 @@ body.dark-mode .lc-vb-speed { background: var(--surface-2); }
    ========================================================================== */
 
 /* ─── CSS-FIX-01: Video player mute icon toggles ────────────────────────── */
-/* JS calls  iconVol.style.display / iconMuted.style.display to toggle these.
-   No rule is needed for the toggle itself (it's inline-style driven), but we
-   set a sane default so the correct icon shows on first render before any
-   volumechange event fires. */
-.lc-vp-mute .icon-vol   { display: inline; }
-.lc-vp-mute .icon-muted { display: none;   }
+/* JS calls syncMuteIcons() via style.display to toggle these. These rules
+   establish the *initial* state before the first volumechange / user interaction.
+   SVGs default to display:inline in some browsers and display:block in others;
+   using display:block here is consistent and prevents the double-icon flash. */
+.lc-vp-mute .icon-vol   { display: block; }
+.lc-vp-mute .icon-muted { display: none;  }
 
 /* ─── CSS-FIX-02: Voice-bubble play/pause icon toggles ──────────────────── */
 /* JS sets style.display directly; these rules establish initial visibility

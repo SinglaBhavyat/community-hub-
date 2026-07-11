@@ -106,10 +106,12 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
+// ✅ Confirm this import includes arrayUnion:
 import {
-    collection, doc, setDoc, query, orderBy,
+    collection, doc, setDoc, updateDoc, query, orderBy,
     onSnapshot, serverTimestamp, where,
-    getDocs, deleteDoc, writeBatch, increment,
+    getDoc, getDocs, deleteDoc, writeBatch, increment, deleteField,
+    arrayUnion, FieldPath,
 } from 'https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js';
 
 // ─── Typing TTL constant (must match chat.js) ────────────────────────────────
@@ -205,6 +207,11 @@ export class RecentChatsManager {
         this._onContextMenu    = this._onContextMenu.bind(this);
         this._onTouchStart     = this._onTouchStart.bind(this);
         this._onTouchEnd       = this._onTouchEnd.bind(this);
+        // Q-7 FIX: bind the search input handler once so it can be removed in
+        // _removeInteractions(). Without this, every re-login stacks an additional
+        // 'input' listener on the same element since _interactionsWired is reset
+        // to false in _removeInteractions(), causing _wireInteractions() to run again.
+        this._onSearchInput    = () => this._applySearchFilter();
         // Per-item swipe tracking
         this._swipe            = null; // { el, roomId, startX, currentX, anim }
     }
@@ -247,18 +254,50 @@ export class RecentChatsManager {
     }
 
     /**
+     * Optimistically remove a room from the sidebar immediately — before the
+     * Firestore snapshot confirms the hiddenFor write. Called by chat.js after
+     * the delete handler writes hiddenFor so the user sees instant feedback.
+     * The next snapshot will confirm and keep it gone; if the write failed the
+     * snapshot will restore it.
+     */
+    removeRoom(roomId) {
+        // Remove DOM element
+        const el = this._elements.get(roomId);
+        if (el) {
+            el.remove();
+            this._elements.delete(roomId);
+            this._teardownTypingSub(roomId);
+        }
+        // Purge from internal caches so refresh() doesn't re-insert it
+        this._lastChats  = (this._lastChats  || []).filter(c => c.id !== roomId);
+        this._lastParams = (this._lastParams || []).filter(p => p.id !== roomId);
+        // Clear unread state for this room
+        this._unread?.rooms?.delete(roomId);
+        this._unread?.pending?.delete(roomId);
+        this._recomputeNavBadge?.();
+        // Show empty state if no rooms remain
+        if (!this._lastChats.length) this._renderEmpty();
+    }
+
+    /**
      * Full teardown: cancel all subscriptions, clear all DOM caches,
      * stop intervals. Call on logout / teardownChat().
      */
     teardown() {
         this._teardownSub();
-        this._teardownSubs();
+        this._teardownSubs();   // clears _elements Map and all sub-listeners
         this._stopTimestampRefresh();
         this._subOwner = null;
         this._lastParams = [];
         this._lastChats  = [];
         this._removeContextMenu();
         this._removeInteractions();
+        // FIX CROSS-SESSION-DOM: _teardownSubs() clears the _elements Map but the
+        // DOM nodes remain physically in _recentList. When a new user signs in and
+        // refresh() fires, _applyDelta finds _elements empty and appends new rows
+        // alongside the old user's still-mounted nodes, causing duplicate rows.
+        // Wipe _recentList here to guarantee a clean slate for the next session.
+        if (this._recentList) this._recentList.innerHTML = '';
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -307,7 +346,20 @@ export class RecentChatsManager {
         if (!user || user.email !== ownerEmail) return;
 
         const chats = [];
-        snap.forEach(d => chats.push({ id: d.id, ...d.data() }));
+        // FIX DUPLICATE-CHAT-3: deduplicate by document ID before processing.
+        // In theory Firestore never returns two docs with the same ID in one snapshot,
+        // but a TOCTOU race in openChatRoom (two concurrent setDoc calls on the same
+        // roomId) can occasionally cause the listener to receive two separate "added"
+        // change events for the same document ID within a short window — one for the
+        // locally-committed write and one for the server confirmation.  Keep only the
+        // last-seen entry so _applyDelta never sees two params objects sharing an ID,
+        // which would otherwise create two sidebar rows mapped to a single roomId key.
+        const _seenIds = new Set();
+        snap.forEach(d => {
+            if (_seenIds.has(d.id)) return; // skip duplicate
+            _seenIds.add(d.id);
+            chats.push({ id: d.id, ...d.data() });
+        });
 
         // [RC-4] — sort: pinned first, then by lastUpdated desc
         chats.sort((a, b) => {
@@ -317,21 +369,90 @@ export class RecentChatsManager {
             return (b.lastUpdated?.toMillis?.() || 0) - (a.lastUpdated?.toMillis?.() || 0);
         });
 
-        this._lastChats = chats;
+        // Filter out rooms the user has hidden ("Delete for me").
+        // A room is un-hidden automatically when the other person sends a new
+        // message after the deletion — we detect this by comparing lastUpdated
+        // against the hiddenAt timestamp stored on the room doc.
+        const visibleChats = chats.filter(chat => {
+            const hiddenForMe = chat.hiddenFor?.[user.email];
+            if (!hiddenForMe) return true; // not hidden
+            // FIX: serverTimestamp() resolves to null on the local optimistic
+            // snapshot that fires immediately after updateDoc() — before the server
+            // confirms. The old || 0 fallback made lastUpdated > 0+5000 always true,
+            // instantly un-hiding the room on the very first snapshot after deletion.
+            // Use ?? Date.now() instead: an unresolved hiddenAt is treated as "right
+            // now", which is always >= any pre-existing lastUpdated in the doc.
+            const rawHiddenAt = chat.hiddenAt?.[user.email];
+            const hiddenAt    = rawHiddenAt?.toMillis?.() ?? Date.now();
+            const lastUpdated = chat.lastUpdated?.toMillis?.() || 0;
+            // If a new message arrived AFTER the user deleted, un-hide the room.
+            // A small 2 s grace window avoids a race where the hiddenAt write and
+            // the lastUpdated write land in the same server batch.
+            if (lastUpdated > hiddenAt + 5000 && chat.lastSenderEmail !== user.email) {
+                // BUG-6 FIX: use deleteField() instead of writing false/null.
+                // Writing false/null left stale map entries that accumulated over
+                // time; deleteField() removes the key entirely, keeping the doc
+                // clean. The filter above uses falsy-check so both approaches
+                // work for filtering, but deleteField() is semantically correct.
+                // FIX: use variadic FieldPath form so dots in the email address
+                // (e.g. user@gmail.com) are not parsed as nested Firestore path
+                // segments. Template-literal dot-notation keys like
+                // `hiddenFor.user@gmail.com` are silently mis-written to
+                // hiddenFor.user@gmail → com (two levels deep), so hiddenFor
+                // is never set under the correct top-level email key and the
+                // room is never filtered out on the next snapshot.
+                updateDoc(
+                    doc(this._db, 'chats', chat.id),
+                    new FieldPath('hiddenFor', user.email), deleteField(),
+                    new FieldPath('hiddenAt',  user.email), deleteField(),
+                ).catch(() => {});
+                return true; // show immediately; the next snapshot will confirm
+            }
+            return false;
+        });
 
-        if (!chats.length) {
+        this._lastChats = visibleChats;
+
+        if (!visibleChats.length) {
             this._renderEmpty();
             this._resetAllUnread(user);
             return;
         }
 
         // Build params and update unread map
-        const paramsList = chats.map(chat => {
-            const params = this._buildItemParams(chat, user);
-            // [RC-3] — only write to unread map if NOT in pending set
-            if (!this._unread.pending.has(chat.id)) {
-                this._unread.rooms.set(chat.id, params._unreadForMap);
+        // Q-5 FIX: hoist cachedUsers resolution outside the per-room loop.
+        // _getCachedUsers() returns the same array reference for every room in a
+        // given snapshot; calling it once here avoids O(rooms) redundant calls and
+        // the linear find() inside _buildItemParams becomes O(rooms × contacts)
+        // only once per snapshot instead of O(rooms² × contacts) over many snapshots.
+        const cachedUsers = this._getCachedUsers?.() || [];
+        const paramsList = visibleChats.map(chat => {
+            const params = this._buildItemParams(chat, user, cachedUsers);
+            // [RC-3] — pending-read guard: when markRoomRead() has fired but not
+            // yet ACK'd, the server counter may still be non-zero (write in-flight).
+            // We must NOT let the snapshot restore the old count, so we keep the
+            // room at 0 in the map while pending.
+            //
+            // HOWEVER: if a *new* message arrives while the read-ACK is in-flight
+            // (i.e. someone sends a message right as you open the chat), the server
+            // counter will jump UP again. In that case we DO want to update the map
+            // so the badge reflects the new incoming count rather than staying at 0
+            // forever. We detect this by comparing against the current map value:
+            // if the new server count is higher than what we have, it's a new message.
+            const isPending      = this._unread.pending.has(chat.id);
+            const currentInMap   = this._unread.rooms.get(chat.id) ?? 0;
+            const newCount       = params._unreadForMap;
+            if (!isPending) {
+                // Normal case: always write the server count
+                this._unread.rooms.set(chat.id, newCount);
+            } else if (newCount > currentInMap) {
+                // New message arrived while read-ACK was in-flight:
+                // accept the higher count and remove from pending (the old
+                // mark-read will be a no-op once it ACKs since count > 0 again)
+                this._unread.rooms.set(chat.id, newCount);
+                this._unread.pending.delete(chat.id);
             }
+            // else: pending and count didn't increase → keep map at 0 (optimistic)
             return params;
         });
 
@@ -340,6 +461,64 @@ export class RecentChatsManager {
         this._startTimestampRefresh();
         this._applySearchFilter();
         this._recomputeNavBadge();
+
+        // Async enrichment: for private chats where the other user isn't in the
+        // local contacts cache (contacts tab never opened), fetch their Firestore
+        // user doc and patch the sidebar so the correct name + photo appear.
+        // This runs after render so it never blocks the snapshot path.
+        this._enrichMissingUsers(visibleChats, user, cachedUsers);
+    }
+
+    async _enrichMissingUsers(chats, user, cachedUsers) {
+        const missing = chats.filter(c =>
+            c.type !== 'group' &&
+            !cachedUsers.find(u => u.email === (c.members?.find(e => e !== user.email) || ''))
+        );
+        if (!missing.length) return;
+
+        for (const chat of missing) {
+            const otherEmail = chat.members?.find(e => e !== user.email);
+            if (!otherEmail) continue;
+            try {
+                const snap = await getDoc(doc(this._db, 'users', otherEmail));
+                if (!snap.exists()) continue;
+                const ud = snap.data();
+
+                // Push into the shared cache so subsequent snapshots don't re-fetch
+                const cache = this._getCachedUsers?.();
+                if (Array.isArray(cache) && !cache.find(u => u.email === otherEmail)) {
+                    cache.push(ud);
+                }
+
+                // Also update memberNames in Firestore at the correct index so both
+                // sides see the right name from the Firestore doc going forward
+                const otherIdx = (chat.members || []).indexOf(otherEmail);
+                const myIdx    = (chat.members || []).indexOf(user.email);
+                const names    = (chat.memberNames || []).slice();
+                let changed    = false;
+                if (otherIdx !== -1 && names[otherIdx] !== (ud.name || '')) {
+                    names[otherIdx] = ud.name || names[otherIdx];
+                    changed = true;
+                }
+                if (myIdx !== -1 && names[myIdx] !== (user.name || '')) {
+                    names[myIdx] = user.name || names[myIdx];
+                    changed = true;
+                }
+                if (changed) {
+                    updateDoc(doc(this._db, 'chats', chat.id), { memberNames: names }).catch(() => {});
+                }
+
+                // Patch the existing sidebar row immediately (no full re-render)
+                const freshCache = this._getCachedUsers?.() || [];
+                const params = this._buildItemParams(chat, user, freshCache);
+                const el = this._elements?.get(chat.id);
+                if (el) this._patchRow(el, { ...params, typingLabel: this._typingLabels?.get(chat.id) || null });
+                // Also update data-name so clicking the row passes the correct name
+                if (el) el.dataset.name = this._sanitize(params.name);
+            } catch (e) {
+                // Non-critical: sidebar will still show email prefix as fallback
+            }
+        }
     }
 
     _onError(err, ownerEmail) {
@@ -380,37 +559,73 @@ export class RecentChatsManager {
      * Derive all rendering params from a raw Firestore chat doc.
      * Centralised so the initial render and patch path share identical logic.
      */
-    _buildItemParams(chat, user) {
+    // Q-5: cachedUsers is now passed in from _onSnapshot (hoisted outside the loop)
+    // to avoid O(rooms) redundant _getCachedUsers() calls per snapshot.
+    // Falls back to fetching internally for any direct call sites outside _onSnapshot.
+    _buildItemParams(chat, user, cachedUsers = this._getCachedUsers?.() || []) {
         const isGroup      = chat.type === 'group';
         const email        = isGroup
             ? chat.id
             : (chat.members?.find(e => e !== user.email) || '');
-        const cachedUsers  = this._getCachedUsers?.() || [];
         const cachedUser   = !isGroup
             ? cachedUsers.find(u => u.email === email)
+            : null;
+
+        // Resolve the other person's display name for private chats.
+        // Use index-based lookup: find the position of the other person's email
+        // in members[], then read memberNames[same index]. This is safe even when
+        // both users share the same display name (the old find(n => n !== user.name)
+        // approach would return the wrong entry in that case).
+        // Fall back to the email prefix (part before @) so users always see a
+        // human-readable label derived from their actual identifier.
+        const otherMemberIdx = !isGroup && chat.members
+            ? chat.members.indexOf(email)
+            : -1;
+        const nameFromMemberNames = otherMemberIdx !== -1
+            ? (chat.memberNames?.[otherMemberIdx] || null)
             : null;
 
         const name = isGroup
             ? (chat.name || 'Group')
             : (cachedUser?.name
-               || chat.memberNames?.find(n => n && n !== user.name)
+               || nameFromMemberNames
                || email.split('@')[0]
                || 'Unknown');
 
-        // [PERF-5] — photoURL from in-memory cache; no extra Firestore reads
-        const photoURL  = (!isGroup && cachedUser?.photoURL) || null;
+        // [PERF-5] — photo from in-memory cache; no extra Firestore reads
+        // FIX: user doc stores the profile photo under 'picture' (set from
+        // firebaseUser.photoURL in auth.js) — not 'photoURL'.
+        const photoURL  = (!isGroup && (cachedUser?.picture || cachedUser?.photoURL)) || null;
 
         const isBlocked    = chat.blockedBy?.length > 0;
+        const clearedAtMs   = chat.clearedAt?.[user.email]?.toMillis?.() || 0;
+        const lastUpdatedMs = chat.lastUpdated?.toMillis?.() || 0;
+        const isClearedForMe = clearedAtMs > 0 && lastUpdatedMs <= clearedAtMs + 2000;
         const rawLastMsg   = isBlocked
             ? '🔒 Chat Blocked'
-            : (chat.lastMessage || 'New Chat');
+            : isClearedForMe
+                ? 'No messages'
+                : (chat.lastMessage || 'New Chat');
 
-        // ── Sender prefix (group chats) ───────────────────────────────────
+        // ── Sender prefix ─────────────────────────────────────────────────
+        // Show for both group and private chats so the recipient always sees
+        // whose message is previewed in the recents list.
+        // • Private: "You: …" when you sent it — nothing when they sent it
+        //   (their name is already the row title, so repeating it is redundant).
+        // • Group: "You: …" or "Alice: …" for every message.
         let senderPrefix = '';
-        if (isGroup && chat.lastSenderEmail && !isBlocked) {
-            senderPrefix = chat.lastSenderEmail === user.email
-                ? 'You: '
-                : `${chat.lastSenderName || chat.lastSenderEmail.split('@')[0]}: `;
+        if (chat.lastSenderEmail && !isBlocked && !isClearedForMe) {
+            if (chat.lastSenderEmail === 'system') {
+                // Group-event messages (admin change, member added/removed, joined, left).
+                // The lastMessage already contains a descriptive emoji + text; no prefix needed.
+                senderPrefix = '';
+            } else if (chat.lastSenderEmail === user.email) {
+                senderPrefix = 'You: ';
+            } else if (isGroup) {
+                senderPrefix = `${chat.lastSenderName || chat.lastSenderEmail.split('@')[0]}: `;
+            }
+            // Private chat where the other person sent — no prefix needed;
+            // their name is already the row heading.
         }
 
         const time           = this._formatRelativeTime(chat.lastUpdated);
@@ -419,26 +634,104 @@ export class RecentChatsManager {
         const isPendingRead  = this._unread.pending.has(chat.id);
         const unreadFromServer = chat.unreadCount?.[user.email];
 
-        // Auto-heal stale server counter for the open / pending-read room
+        // Auto-heal stale server counter ONLY for the currently-open room.
+        // Restriction: do NOT fire for isPendingRead rooms — markRoomRead() already
+        // issued the zero-write for those rooms and added them to _unread.pending.
+        // Firing here too creates a duplicate updateDoc that races with the ACK
+        // and can accidentally zero the counter for a room the user hasn't opened
+        // yet (e.g. you receive a message in room B while room A is open; room B
+        // is not in pending, but if anything ever puts it in pending prematurely
+        // this guard ensures we never clobber the real count).
+        //
+        // Additionally, only fire when the last message was sent by someone ELSE —
+        // our own send batch already writes unreadCount.us = 0 atomically, so
+        // firing here for our own messages would be a redundant no-op at best and
+        // a race condition at worst.
+        // FIX UNREAD-ACTIVE-ROOM: zero the server counter whenever the user is
+        // actively reading the room and the server still shows unread > 0.
+        // The previous version skipped this when lastSenderEmail === user.email,
+        // which was meant to avoid a redundant write after the user sends a message
+        // (their own send batch already zeros their counter). But that condition also
+        // blocked the heal when a snapshot arrived in a race where lastSenderEmail
+        // was the current user even though recipients had bumped the counter.
+        // Removing that condition is safe: writing unreadCount=0 when it's already 0
+        // is a no-op from the server's perspective and the security rule allows it.
         if (
-            (isActiveRoom || isPendingRead) &&
+            isActiveRoom &&           // ← only the room the user is actively reading
+            !isPendingRead &&         // ← markRoomRead() handles pending rooms
             typeof unreadFromServer === 'number' &&
             unreadFromServer > 0
         ) {
-            setDoc(
+            // FIX: FieldPath prevents the email (e.g. user@gmail.com) being
+            // interpreted as a nested dot-path by Firestore. Without it, the
+            // security rule rejects the write because affectedKeys() sees
+            // 'user@gmail' not 'user@gmail.com'.
+            updateDoc(
                 doc(this._db, 'chats', chat.id),
-                { [`unreadCount.${user.email}`]: 0 },
-                { merge: true },
+                new FieldPath('unreadCount', user.email), 0,
             ).catch(() => {});
         }
 
-        const unread = (isActiveRoom || isPendingRead)
+        // Unread count resolution — priority order:
+        //   1. Room is open or pending-read → always 0 (user is reading it)
+        //   2. Server unreadCount field present → use it (authoritative)
+        //   3. No server counter (old doc / first message) → derive from lastRead:
+        //      if lastUpdated > lastRead and someone else sent last → 1 unread
+        //      (This fallback only triggers for docs written before unreadCount
+        //       was introduced; new messages always write the counter.)
+        //
+        // NOTE: unreadFromServer can legitimately be 0 (read), so we must check
+        // typeof === 'number' (not just truthiness) to distinguish 0 from undefined.
+        //
+        // FIX UNREAD-PERSIST-ON-REFRESH: cross-check lastRead as a secondary guard.
+        // _unread.pending is in-memory only — it is wiped on every page refresh or
+        // app reopen.  On a cold load the snapshot may arrive before the previous
+        // session's unreadCount=0 write has fully propagated through Firestore's CDN,
+        // so unreadFromServer can still be non-zero even though the user already read
+        // the room.  markRoomRead() always writes lastRead=serverTimestamp() in the
+        // same updateDoc, so lastRead is the durable, cross-session source of truth.
+        // If lastRead >= lastUpdated (±2 s clock-skew grace) the room is definitively
+        // read regardless of what unreadCount says right now.
+        // The 2 s window mirrors the same tolerance used for clearedAt / hiddenAt
+        // elsewhere in this file and avoids false-zero when the lastUpdated write and
+        // the lastRead write land in the same server batch.
+        const lastReadMs    = chat.lastRead?.[user.email]?.toMillis?.() || 0;
+        // FIX: compare lastRead against lastMessageAt (written only on real message
+        // sends) instead of lastUpdated (which was also bumped by openChatRoom on
+        // every room open, making lastRead ≈ lastUpdated and isDefinitelyRead always
+        // true — suppressing all unread badges even for genuinely unread messages).
+        //
+        // CRITICAL: only activate the isDefinitelyRead guard when lastMessageAt is
+        // explicitly present. When absent (rooms predating this field), falling back
+        // to lastUpdatedMs makes lastRead ≈ lastUpdated (because openChatRoom also
+        // bumped lastUpdated), causing isDefinitelyRead to be permanently true and
+        // suppressing all unread badges. Without lastMessageAt, skip this guard and
+        // let unreadFromServer (the authoritative server counter) decide instead.
+        const lastMessageAtMs = chat.lastMessageAt?.toMillis?.() ?? 0;
+        // FIX UNREAD-GRACE: both markRoomRead (lastRead=serverTimestamp()) and incoming
+        // messages (lastMessageAt=serverTimestamp()) write server timestamps that can land
+        // within milliseconds of each other. A strict > check (1ms gap) is insufficient —
+        // if the user opens the room and a message arrives concurrently, the lastRead
+        // serverTimestamp can still end up slightly AFTER the message's lastMessageAt,
+        // making isDefinitelyRead=true even though the user never saw the new message.
+        //
+        // Fix: require lastRead to be at least 5 seconds AFTER lastMessageAt.
+        // 5 s is long enough to distinguish "user opened room, then message arrived" (the
+        // problematic race) from "user genuinely read a message sent minutes/hours ago"
+        // (the normal case). markRoomRead is called on room open, so lastRead always
+        // reflects the most recent open; a message arriving within 5 s of that open is
+        // treated as unread and shown with a badge. A message that arrived more than 5 s
+        // before the last open is treated as read (correct — the user saw it).
+        const DEFINITELY_READ_GRACE_MS = 5_000;
+        const isDefinitelyRead = lastMessageAtMs > 0
+            && lastReadMs > lastMessageAtMs + DEFINITELY_READ_GRACE_MS;
+
+        const unread = (isActiveRoom || isPendingRead || isDefinitelyRead)
             ? 0
             : typeof unreadFromServer === 'number'
                 ? Math.max(0, unreadFromServer)
                 : (
-                    chat.lastUpdated?.toMillis?.() >
-                    (chat.lastRead?.[user.email]?.toMillis?.() || 0) &&
+                    lastMessageAtMs > lastReadMs &&
                     chat.lastSenderEmail &&
                     chat.lastSenderEmail !== user.email
                         ? 1 : 0
@@ -470,11 +763,18 @@ export class RecentChatsManager {
         // ── Delivery / read ticks ─────────────────────────────────────────
         // [RT-3] isMine: current user sent the last message
         //        isRead: for private chats, recipient's unread counter is 0
-        const isMine      = !!chat.lastSenderEmail && chat.lastSenderEmail === user.email;
+        const isMine      = !isClearedForMe && !!chat.lastSenderEmail && chat.lastSenderEmail === user.email;
         const recipEmail  = !isGroup ? email : null;
         const isRead      = isMine && recipEmail
             ? (chat.unreadCount?.[recipEmail] === 0)
             : false;
+
+        // System event: group notification (admin change, member added/removed, left, joined).
+        // Show a distinct dot indicator even when unread count is 0 (e.g. actor's own action).
+        const isSystemEvent = !isActiveRoom
+            && !isClearedForMe
+            && chat.lastSenderEmail === 'system'
+            && lastMessageAtMs > lastReadMs;
 
         return {
             id:          chat.id,
@@ -491,8 +791,14 @@ export class RecentChatsManager {
             photoURL,
             isMine,
             isRead,
-            // Internal: written to _unread.rooms
-            _unreadForMap: effectiveUnread,
+            isSystemEvent,
+            // Internal: written to _unread.rooms for nav badge summation.
+            // Use the raw message `unread` count, NOT effectiveUnread — effectiveUnread
+            // is inflated by pendingCount (join requests) for sidebar display purposes,
+            // but join-request badges are admin UX, not unread messages. Writing
+            // effectiveUnread here causes the nav badge to count join requests as
+            // unread messages, making it show incorrect totals.
+            _unreadForMap: unread,
         };
     }
 
@@ -503,14 +809,46 @@ export class RecentChatsManager {
     _applyDelta(paramsList) {
         const newIds = new Set(paramsList.map(p => p.id));
 
-        // Remove rooms that left the list
-        for (const [id, el] of this._elements) {
-            if (!newIds.has(id)) {
-                el.remove();
-                this._elements.delete(id);
-                this._typingLabels.delete(id);
-                this._teardownTypingSub(id);
+        // Remove rooms that left the list.
+        // Collect IDs first — mutating a Map while iterating it with for...of is
+        // unsafe: deleting an entry mid-iteration causes the iterator to skip the
+        // immediately following entry on V8. Snapshot the departed keys, then delete
+        // after the loop finishes.
+        const toRemove = [];
+        for (const id of this._elements.keys()) {
+            if (!newIds.has(id)) toRemove.push(id);
+        }
+        for (const id of toRemove) {
+            // Q-4 FIX: tear down presence sub for private rooms that leave the
+            // visible list, if no other visible room still references that email.
+            // Without this, the presence listener for a contact whose chat was
+            // hidden/deleted stays open indefinitely, accumulating over long sessions.
+            const el = this._elements.get(id);
+            if (el?.dataset.type === 'private') {
+                const email = el.dataset.email;
+                if (email) {
+                    const stillNeeded = [...this._elements.values()]
+                        .some(e => e !== el && e.dataset.type === 'private' && e.dataset.email === email);
+                    if (!stillNeeded) {
+                        const unsub = this._presenceSubs.get(email);
+                        if (unsub) {
+                            try { unsub(); } catch (_) {}
+                            this._presenceSubs.delete(email);
+                        }
+                        this._online.delete(email);
+                    }
+                }
             }
+            el?.remove();
+            this._elements.delete(id);
+            this._typingLabels.delete(id);
+            this._teardownTypingSub(id);
+            // Remove from the unread map so this room stops contributing to the
+            // nav badge total.  Without this, deleted / left rooms accumulate in
+            // _unread.rooms forever and the badge never reaches zero even after
+            // every visible chat has been read.
+            this._unread.rooms.delete(id);
+            this._unread.pending.delete(id);
         }
 
         // Create or patch each row
@@ -522,6 +860,7 @@ export class RecentChatsManager {
                 this._elements.set(params.id, el);
                 this._recentList.appendChild(el);
                 this._wireSwipe(el, params.id);
+                this._wireSwipeActionTap(el, params.id);
             } else {
                 // Existing row — patch in place [PERF-1]
                 const typingLabel = this._typingLabels.get(params.id) || null;
@@ -570,9 +909,11 @@ export class RecentChatsManager {
         unread = 0, online = false, isActive = false,
         senderPrefix = '', isPinned = false,
         photoURL = null, isMine = false, isRead = false,
+        isSystemEvent = false,
     }) {
         const s          = this._sanitize;
         const safeName   = s(name || email?.split('@')[0] || 'Unknown');
+        const safeEmail  = type !== 'group' ? s(email || '') : '';
         const dataEmail  = type === 'group' ? id : email;
         const isBlocked  = lastMessage === '🔒 Chat Blocked';
         const preview    = s(senderPrefix + lastMessage);
@@ -583,27 +924,35 @@ export class RecentChatsManager {
             : '';
         const badgeHTML  = unread > 0
             ? `<span class="wa-badge" data-count="${unread}" title="${unread} unread">${unread > 99 ? '99+' : unread}</span>`
-            : '';
+            : isSystemEvent
+                ? `<span class="wa-badge wa-badge--system" title="Group update">!</span>`
+                : '';
         const previewCls = isBlocked
             ? 'wa-sidebar-preview wa-blocked'
-            : unread > 0
+            : (unread > 0 || isSystemEvent)
                 ? 'wa-sidebar-preview wa-sidebar-preview--unread'
                 : 'wa-sidebar-preview';
+        const emailSubHTML = safeEmail
+            ? `<span class="wa-sidebar-email">${safeEmail}</span>`
+            : '';
 
         return `
 <div class="wa-sidebar-item${isActive ? ' wa-sidebar-item--active' : ''}"
-     data-room-id="${s(id)}"
-     data-email="${s(dataEmail)}"
+     data-room-id="${id}"
+     data-email="${dataEmail}"
      data-name="${safeName}"
      data-type="${s(type)}"
      data-last-preview="${preview.replace(/"/g, '&quot;')}"
      role="button" tabindex="0" aria-label="Conversation with ${safeName}">
     <div class="wa-sidebar-avatar">
-        ${this._avatarEl(name, type, online, 46, photoURL)}
+        ${this._avatarEl(name, type, online, 46, photoURL, type !== 'group' ? email : null)}
     </div>
     <div class="wa-sidebar-body">
         <div class="wa-sidebar-top">
-            <span class="wa-sidebar-name${unread ? ' wa-sidebar-name--unread' : ''}">${safeName}${pinHTML}</span>
+            <div class="wa-sidebar-name-wrap">
+                <span class="wa-sidebar-name${unread ? ' wa-sidebar-name--unread' : ''}">${safeName}${pinHTML}</span>
+                ${emailSubHTML}
+            </div>
             <span class="wa-sidebar-time${unread ? ' wa-sidebar-time--unread' : ''}">${s(time)}</span>
         </div>
         <div class="wa-sidebar-bottom">
@@ -628,6 +977,23 @@ export class RecentChatsManager {
         // Active state
         el.classList.toggle('wa-sidebar-item--active', !!d.isActive);
         el.dataset.name = this._sanitize(d.name || d.email?.split('@')[0] || 'Unknown');
+
+        // Email subtitle (private chats only)
+        const emailEl = el.querySelector('.wa-sidebar-email');
+        if (d.type !== 'group' && d.email) {
+            if (emailEl) {
+                emailEl.textContent = d.email;
+            } else {
+                // Element missing (e.g. row created before this update) — inject it
+                const nameWrap = el.querySelector('.wa-sidebar-name-wrap');
+                if (nameWrap) {
+                    const span = document.createElement('span');
+                    span.className   = 'wa-sidebar-email';
+                    span.textContent = d.email;
+                    nameWrap.appendChild(span);
+                }
+            }
+        }
 
         // Name
         const nameEl = el.querySelector('.wa-sidebar-name');
@@ -665,7 +1031,7 @@ export class RecentChatsManager {
             } else {
                 const cls = isBlocked
                     ? 'wa-sidebar-preview wa-blocked'
-                    : d.unread > 0
+                    : (d.unread > 0 || d.isSystemEvent)
                         ? 'wa-sidebar-preview wa-sidebar-preview--unread'
                         : 'wa-sidebar-preview';
                 previewEl.className = cls;
@@ -675,7 +1041,7 @@ export class RecentChatsManager {
             }
         }
 
-        // Unread badge
+        // Unread badge / system-event dot
         const bottom  = el.querySelector('.wa-sidebar-bottom');
         let badgeEl   = el.querySelector('.wa-badge');
         if (d.unread > 0) {
@@ -684,9 +1050,20 @@ export class RecentChatsManager {
                 badgeEl.className = 'wa-badge';
                 bottom?.appendChild(badgeEl);
             }
+            // Clear any system-event variant so it doesn't linger
+            badgeEl.classList.remove('wa-badge--system');
             badgeEl.dataset.count = d.unread;
             badgeEl.title         = `${d.unread} unread`;
             badgeEl.textContent   = d.unread > 99 ? '99+' : String(d.unread);
+        } else if (d.isSystemEvent) {
+            if (!badgeEl) {
+                badgeEl = document.createElement('span');
+                bottom?.appendChild(badgeEl);
+            }
+            badgeEl.className     = 'wa-badge wa-badge--system';
+            badgeEl.dataset.count = '0';
+            badgeEl.title         = 'Group update';
+            badgeEl.textContent   = '!';
         } else {
             badgeEl?.remove();
         }
@@ -743,6 +1120,17 @@ export class RecentChatsManager {
     // ═══════════════════════════════════════════════════════════════════════════
 
     _renderEmpty() {
+        // FIX BUG-6: tear down per-room typing subs before clearing the element
+        // cache. Without this, _typingSubs entries for every previously-visible room
+        // remain open as live Firestore onSnapshot listeners — accumulating over time,
+        // billing read bandwidth, and holding memory — whenever the list temporarily
+        // becomes empty (e.g. during a snapshot race where visibleChats.length === 0).
+        // Presence subs are keyed by email, not roomId, and are cheap to re-open;
+        // they will be torn down correctly via Q-4's fix in _applyDelta when rooms
+        // depart. Typing subs are the ones that must be cleaned up here.
+        for (const roomId of this._elements.keys()) {
+            this._teardownTypingSub(roomId);
+        }
         this._elements.forEach(el => el.remove());
         this._elements.clear();
         this._recentList.innerHTML = `
@@ -765,13 +1153,18 @@ export class RecentChatsManager {
             this._recentList.innerHTML =
                 `<div class="wa-list-loading">Reconnecting…</div>`;
             this._subOwner = ownerEmail;
-            setTimeout(() => this.start(), 300);
+            setTimeout(() => this.refresh(), 300);
         });
     }
 
     _resetAllUnread(user) {
         this._unread.rooms.clear();
-        this._unread.pending.clear();
+        // DO NOT clear _unread.pending here.  pending is a write-in-flight guard
+        // owned by markRoomRead() in chat.js: it prevents an incoming snapshot from
+        // restoring a non-zero badge while the setDoc ACK is still in-flight.
+        // Clearing it here (triggered when the chat list momentarily becomes empty,
+        // e.g. the first snapshot fires before index propagation) destroys that guard
+        // and causes the badge to flicker back to its old count on the next snapshot.
         this._unread.total = 0;
         const navDot = document.getElementById('chat-nav-indicator');
         if (navDot) {
@@ -796,7 +1189,12 @@ export class RecentChatsManager {
             snap.forEach(d => {
                 if (d.id === user?.email) return;
                 if (!d.data().typing)    return;
-                const updatedMs = d.data().updatedAt?.toMillis?.() || 0;
+                // FIX: use ?? Date.now() so a pending serverTimestamp (null before
+                // server ACK) is treated as "just written" rather than epoch 0.
+                // With || 0, now - 0 >> TYPING_TTL_MS → indicator is immediately
+                // discarded before it ever appears.  Same fix applied to
+                // subscribeTypingIndicator in chat.js.
+                const updatedMs = d.data().updatedAt?.toMillis?.() ?? Date.now();
                 if (now - updatedMs > TYPING_TTL_MS) return;
                 name = d.data().name || d.id;
             });
@@ -926,9 +1324,53 @@ export class RecentChatsManager {
     // SIDEBAR INTERACTIONS  [UX-1] [UX-2]
     // ═══════════════════════════════════════════════════════════════════════════
 
+    _injectStyles() {
+        if (document.getElementById('rcm-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'rcm-styles';
+        style.textContent = `
+.wa-sidebar-item {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+.wa-swipe-action {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 72px;
+    background: #ef4444;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+.wa-swipe-action.rcm-tap-visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+.wa-swipe-delete-icon {
+    font-size: 20px;
+    pointer-events: none;
+}
+`;
+        document.head.appendChild(style);
+    }
+
     _wireInteractions() {
         if (this._interactionsWired) return;
         this._interactionsWired = true;
+
+        this._injectStyles();
 
         const list = this._recentList;
 
@@ -961,8 +1403,8 @@ export class RecentChatsManager {
         // Close context menu on outside click
         document.addEventListener('click', this._onDocClick);
 
-        // Search filter re-apply
-        this._searchInput?.addEventListener('input', () => this._applySearchFilter());
+        // Search filter re-apply (Q-7: use bound ref so it can be removed in _removeInteractions)
+        this._searchInput?.addEventListener('input', this._onSearchInput);
     }
 
     _removeInteractions() {
@@ -975,13 +1417,25 @@ export class RecentChatsManager {
             list.removeEventListener('touchcancel', this._onTouchEnd);
         }
         document.removeEventListener('click', this._onDocClick);
+        // Q-7 FIX: remove the search input listener so re-login doesn't stack
+        // an additional handler on every _wireInteractions() call.
+        this._searchInput?.removeEventListener('input', this._onSearchInput);
     }
 
     _openItem(item) {
         const email    = item.dataset.email;
-        const name     = item.dataset.name;
+        // FIX ENTITY-DECODE: dataset.name was written via sanitize() which HTML-encodes
+        // special characters (e.g. "O'Brien" → "O&#39;Brien"). Passing the encoded string
+        // directly to openChatRoom stored it in Firestore and showed garbled names in the
+        // chat header. Decode via a temporary element so the raw name is passed instead.
+        const rawName  = item.dataset.name || '';
+        const _tmp     = document.createElement('span');
+        _tmp.innerHTML = rawName;
+        const name     = _tmp.textContent;
         const chatType = item.dataset.type;
         if (!email) return;
+        const currentActive = this._getActiveRoom?.();
+        if (currentActive && currentActive === item.dataset.roomId) return;
         this._getOpenRoom()?.(email, name, chatType);
     }
 
@@ -995,12 +1449,27 @@ export class RecentChatsManager {
     }
 
     _onTouchStart(e) {
+        // Don't start long-press from a swipe-action button tap
+        if (e.target.closest('.wa-swipe-action')) return;
         const item = e.target.closest('.wa-sidebar-item');
         if (!item) return;
         const touch = e.touches[0];
+        const startX = touch.clientX;
+        const startY = touch.clientY;
         this._lpTimer = setTimeout(() => {
             this._showContextMenu(item, touch.clientX, touch.clientY);
         }, LONG_PRESS_MS);
+        // Cancel long-press if the finger moves (swipe gesture)
+        const onMove = mv => {
+            const dx = Math.abs(mv.touches[0].clientX - startX);
+            const dy = Math.abs(mv.touches[0].clientY - startY);
+            if (dx > 8 || dy > 8) {
+                clearTimeout(this._lpTimer);
+                this._lpTimer = null;
+                item.removeEventListener('touchmove', onMove);
+            }
+        };
+        item.addEventListener('touchmove', onMove, { passive: true });
     }
 
     _onTouchEnd() {
@@ -1018,9 +1487,9 @@ export class RecentChatsManager {
     _showContextMenu(item, x, y) {
         this._removeContextMenu();
 
-        const roomId    = item.dataset.roomId || item.dataset.email;
-        const chatData  = this._lastChats.find(c => c.id === roomId);
-        const user      = this._getUser();
+        const roomId   = item.dataset.roomId;
+        const chatData = this._lastChats.find(c => c.id === roomId);
+        const user     = this._getUser();
         if (!chatData || !user) return;
         this._ctxRoomId = roomId;
 
@@ -1092,10 +1561,16 @@ export class RecentChatsManager {
         if (action === 'ctx-pin') {
             const isPinned = !!(chatData.pinnedBy?.[user.email] || chatData.pinned === true);
             try {
-                await setDoc(
+                // FIX BUG-3: setDoc+merge with a dot-notation key like
+                // `pinnedBy.user@gmail.com` treats the whole string as a literal
+                // top-level field name, not a nested path. The security rule's
+                // affectedKeys() check then sees 'pinnedBy.user@gmail.com' instead
+                // of 'pinnedBy', so the pinnedBy guard never matches → silent deny.
+                // updateDoc + FieldPath writes the correct nested map entry AND
+                // satisfies the security rule.
+                await updateDoc(
                     doc(this._db, 'chats', roomId),
-                    { [`pinnedBy.${user.email}`]: !isPinned },
-                    { merge: true },
+                    new FieldPath('pinnedBy', user.email), !isPinned,
                 );
                 this._showToast(!isPinned ? 'Conversation pinned 📌' : 'Conversation unpinned', 'success');
             } catch (err) {
@@ -1106,7 +1581,13 @@ export class RecentChatsManager {
         }
 
         if (action === 'ctx-mark-read') {
-            // Optimistic clear then server write
+            // Snapshot pre-read count before zeroing — needed to restore the badge
+            // correctly if the Firestore write fails (e.g. user goes offline).
+            // Without this, a failed write leaves _unread.rooms at 0 permanently
+            // and the badge shows 0 even though the server never confirmed the read.
+            const prevCount = this._unread.rooms.get(roomId) ?? 0;
+
+            // Optimistic clear
             this._unread.rooms.set(roomId, 0);
             this._unread.pending.add(roomId);
             this._recomputeNavBadge();
@@ -1118,17 +1599,23 @@ export class RecentChatsManager {
                 el.querySelector('.wa-sidebar-preview')?.classList.remove('wa-sidebar-preview--unread');
             }
             try {
-                await setDoc(
+                // FIX BUG-4: dot-notation template keys like `lastRead.user@gmail.com`
+                // cause Firestore to split on dots, writing lastRead["user@gmail"]["com"]
+                // instead of lastRead["user@gmail.com"]. The security rule's
+                //   request.resource.data.get('lastRead', {}).keys().hasOnly([callerEmail()])
+                // check then sees a path the rule doesn't allow → permission-denied.
+                // Use variadic FieldPath form to match the pattern in markRoomRead() in chat.js.
+                await updateDoc(
                     doc(this._db, 'chats', roomId),
-                    {
-                        [`lastRead.${user.email}`]:   serverTimestamp(),
-                        [`unreadCount.${user.email}`]: 0,
-                    },
-                    { merge: true },
+                    new FieldPath('lastRead',    user.email), serverTimestamp(),
+                    new FieldPath('unreadCount', user.email), 0,
                 );
                 this._unread.pending.delete(roomId);
             } catch (err) {
+                // Rollback: restore pre-read count immediately — don't rely on a future
+                // snapshot to repair the badge (may never arrive if user is offline).
                 console.warn('[RecentChatsManager] mark-read error:', err);
+                this._unread.rooms.set(roomId, prevCount);
                 this._unread.pending.delete(roomId);
                 this._recomputeNavBadge();
             }
@@ -1136,35 +1623,66 @@ export class RecentChatsManager {
         }
 
         if (action === 'ctx-delete') {
+            // FIX CTX-DELETE: previously this did a hard-delete of every message
+            // AND the room doc, which also destroyed the other participant's chat.
+            // For private chats that is clearly wrong — the other person should
+            // keep their conversation history.  For group chats it was even worse:
+            // a regular member could hard-delete the room for all members.
+            //
+            // New behaviour mirrors the "Delete Chat" action inside openChatRoom:
+            //   1. Stamp deletedFor.currentUser on every message   → "delete for me"
+            //   2. Set hiddenFor/hiddenAt on the room doc          → hide from sidebar
+            // The other participant's messages and room doc are fully preserved.
+            // The room will un-hide automatically if the other person sends a new
+            // message after the deletion (RecentChatsManager._onSnapshot handles this).
+            const isGroupChat = chatData?.type === 'group';
             const ok = await this._showConfirm({
                 title:        'Delete chat?',
-                body:         'All messages will be permanently removed. This cannot be undone.',
+                body:         isGroupChat
+                    ? 'This conversation will be removed from your chat list. Other members will not be affected.'
+                    : 'This conversation will be removed from your chat list. The other person will not be affected.',
                 confirmLabel: 'Delete',
                 tone:         'danger',
             });
             if (!ok) return;
 
+            const user = this._getUser();
+            if (!user?.email) return;
+
             try {
+                // Step 1: stamp deletedFor on every message (delete for me)
                 const msgsSnap   = await getDocs(collection(this._db, `chats/${roomId}/messages`));
                 const BATCH_SIZE = 499;
-                const docs       = msgsSnap.docs;
-                for (let i = 0; i < docs.length; i += BATCH_SIZE) {
+                const msgDocs    = msgsSnap.docs;
+                for (let i = 0; i < msgDocs.length; i += BATCH_SIZE) {
                     const wb = writeBatch(this._db);
-                    docs.slice(i, i + BATCH_SIZE).forEach(d => wb.delete(d.ref));
+                    msgDocs.slice(i, i + BATCH_SIZE).forEach(d =>
+                        wb.update(d.ref, { deletedFor: arrayUnion(user.email) }),
+                    );
                     await wb.commit();
                 }
-                await deleteDoc(doc(this._db, 'chats', roomId));
 
-                // Remove from DOM immediately — snapshot removal will also fire
-                const el = this._elements.get(roomId);
-                if (el) {
-                    el.remove();
-                    this._elements.delete(roomId);
-                }
+                // Step 2: mark room hidden for this user only
+                // FIX: use variadic FieldPath form — dot-notation template keys
+                // like `hiddenFor.user@gmail.com` are mis-parsed by Firestore as
+                // nested paths (hiddenFor → user@gmail → com), writing the flag
+                // to the wrong key. FieldPath('hiddenFor', email) writes the
+                // correct top-level map entry keyed by the full email string.
+                await updateDoc(
+                    doc(this._db, 'chats', roomId),
+                    new FieldPath('hiddenFor', user.email), true,
+                    new FieldPath('hiddenAt',  user.email), serverTimestamp(),
+                );
+
+                // Step 3: clean up local state
                 this._unread.rooms.delete(roomId);
+                this._unread.pending.delete(roomId);
                 this._recomputeNavBadge();
-
-                this._showToast('Chat deleted.', 'success');
+                // The hiddenFor filter in _onSnapshot will remove the row from the
+                // sidebar on the next snapshot delivery.  Remove it immediately from
+                // the DOM so the user sees instant feedback.
+                this.removeRoom(roomId);
+                this._showToast('Conversation deleted.', 'success');
             } catch (err) {
                 console.error('[RecentChatsManager] delete error:', err);
                 this._showToast('Failed to delete chat.', 'error');
@@ -1175,6 +1693,38 @@ export class RecentChatsManager {
     // ═══════════════════════════════════════════════════════════════════════════
     // SWIPE-TO-DELETE  [UX-2]
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Tap-to-delete on the .wa-swipe-action button (mobile UX).
+     * First tap reveals the button (shows red delete zone).
+     * Second tap (or any tap while revealed) calls _handleContextAction.
+     * Tapping anywhere else hides it.
+     */
+    _wireSwipeActionTap(el, roomId) {
+        const action = el.querySelector('.wa-swipe-action');
+        if (!action) return;
+
+        // Make the action area tappable
+        action.style.pointerEvents = 'auto';
+        action.setAttribute('aria-hidden', 'false');
+        action.setAttribute('role', 'button');
+        action.setAttribute('aria-label', 'Delete conversation');
+        action.setAttribute('tabindex', '-1');
+
+        action.addEventListener('click', async e => {
+            e.stopPropagation();
+            const chatData = this._lastChats.find(c => c.id === roomId);
+            await this._handleContextAction('ctx-delete', roomId, chatData, el);
+        });
+
+        // Hide the action panel when user taps elsewhere
+        el.addEventListener('click', e => {
+            if (!e.target.closest('.wa-swipe-action') && action.classList.contains('rcm-tap-visible')) {
+                action.classList.remove('rcm-tap-visible');
+                el.style.transform = '';
+            }
+        });
+    }
 
     _wireSwipe(el, roomId) {
         let startX    = 0;
@@ -1214,21 +1764,17 @@ export class RecentChatsManager {
             if (!active) return;
             active = false;
             if (confirmed) {
-                // Confirm before deleting
-                el.style.transform   = 'translateX(-80px)';
-                el.style.transition  = 'transform .15s';
-                const chatData = this._lastChats.find(c => c.id === roomId);
-                const ok = await this._showConfirm({
-                    title:        'Delete chat?',
-                    body:         'All messages will be permanently removed. This cannot be undone.',
-                    confirmLabel: 'Delete',
-                    tone:         'danger',
-                });
-                if (ok) {
-                    await this._handleContextAction('ctx-delete', roomId, chatData, el);
-                } else {
-                    this._resetSwipe(el);
+                // Swipe threshold reached: reveal the delete zone and wait for a tap.
+                // This is consistent with the _wireSwipeActionTap tap-to-delete UX.
+                el.style.transform  = 'translateX(-72px)';
+                el.style.transition = 'transform .15s';
+                const action = el.querySelector('.wa-swipe-action');
+                if (action) {
+                    action.style.opacity = '1';
+                    action.classList.add('rcm-tap-visible');
                 }
+                // Tapping the action area is handled by _wireSwipeActionTap's click listener.
+                // Tapping elsewhere resets via the el click listener in _wireSwipeActionTap.
             } else {
                 this._resetSwipe(el);
             }
@@ -1244,7 +1790,10 @@ export class RecentChatsManager {
         el.style.transition = 'transform .2s';
         el.style.transform  = 'translateX(0)';
         const action = el.querySelector('.wa-swipe-action');
-        if (action) action.style.opacity = '0';
+        if (action) {
+            action.style.opacity = '0';
+            action.classList.remove('rcm-tap-visible');
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1267,111 +1816,3 @@ export class RecentChatsManager {
         this._elements.clear();
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CSS ADDITIONS
-// Paste this block into Livechat.css (or any global stylesheet).
-// The existing .wa-sidebar-item, .wa-badge, .wa-sidebar-* rules remain intact;
-// these are new selectors only.
-// ═══════════════════════════════════════════════════════════════════════════════
-/*
-────────────────────────────────────────
-  Swipe-to-delete
-────────────────────────────────────────
-.wa-sidebar-item {
-    position: relative;
-    overflow: hidden;
-    transition: transform .2s;
-}
-.wa-swipe-action {
-    position: absolute;
-    right: 0; top: 0; bottom: 0;
-    width: 80px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #dc2626;
-    color: #fff;
-    font-size: 20px;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity .1s;
-    border-radius: 0 10px 10px 0;
-}
-
-────────────────────────────────────────
-  Pin indicator inside name
-────────────────────────────────────────
-.wa-pin-indicator {
-    font-size: 11px;
-    margin-left: 4px;
-    opacity: .7;
-}
-
-────────────────────────────────────────
-  Sidebar typing preview
-────────────────────────────────────────
-.wa-sidebar-preview--typing em {
-    color: #6366f1;
-    font-style: normal;
-    font-size: 12px;
-}
-
-────────────────────────────────────────
-  Context menu (scoped to document)
-────────────────────────────────────────
-.wa-ctx-menu {
-    user-select: none;
-}
-.wa-ctx-menu button:focus-visible {
-    outline: 2px solid #6366f1;
-    outline-offset: -2px;
-}
-
-────────────────────────────────────────
-  Empty / error / loading list states
-────────────────────────────────────────
-.wa-list-empty,
-.wa-list-error {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 64px 16px;
-    text-align: center;
-    gap: 10px;
-}
-.wa-list-empty__icon,
-.wa-list-error__icon {
-    width: 56px; height: 56px;
-    border-radius: 50%;
-    background: #f3f4f6;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 24px;
-}
-.wa-list-error__icon { background: #fef2f2; }
-.wa-list-empty__title,
-.wa-list-error__title {
-    font-size: 14px; font-weight: 600; color: #374151;
-}
-.wa-list-empty__sub,
-.wa-list-error__sub {
-    font-size: 12px; color: #9ca3af; line-height: 1.5;
-}
-.wa-list-error__btn {
-    margin-top: 4px;
-    padding: 8px 20px;
-    border-radius: 8px;
-    background: #4f46e5;
-    color: #fff;
-    font-size: 12px; font-weight: 700;
-    border: none; cursor: pointer;
-    transition: background .15s;
-}
-.wa-list-error__btn:hover { background: #4338ca; }
-.wa-list-loading {
-    display: flex; justify-content: center;
-    padding: 40px 0;
-    font-size: 14px; color: #9ca3af;
-}
-*/

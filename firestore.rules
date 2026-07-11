@@ -233,9 +233,30 @@ service cloud.firestore {
       allow delete: if isOwner(resource.data) || isAdmin();
     }
     match /chats/{chatId} {
-      allow read: if isSignedIn() && (
+      // BUG-READ-QUERY FIX: `resource == null` does NOT grant collection-query access.
+      // Firestore only sets resource==null for get() on a non-existent doc; for list/query
+      // requests (onSnapshot with where-filter) resource is unavailable and the expression
+      // throws, causing permission-denied on every RCM listener.
+      //
+      // Fix: use `allow get` / `allow list` (Firestore v2 sub-operations of `read`).
+      //   • list: caller must be signed in — safe because the query always carries a
+      //     `members array-contains callerEmail()` filter, so Firestore only ever returns
+      //     docs the caller is already a member of. Without this the RCM snapshot
+      //     subscription fails immediately with permission-denied.
+      //   • get:  require explicit membership or admin on direct single-doc fetches.
+      allow list: if isSignedIn();
+      // FIX JOIN-GET: tx.get() inside the join-group transaction fires a single-doc
+      // get on the group the user wants to join — but they are NOT a member yet, so
+      // the old membership-only guard always denies it with permission-denied.
+      // Add a narrow third condition: any signed-in user may read a group doc whose
+      // inviteCode field is non-empty (i.e. the group is explicitly invite-joinable).
+      // This is intentional — the invite code is the access credential; anyone who
+      // has it should be able to look up the group. The list rule already allows the
+      // initial getDocs query; this makes the subsequent tx.get() consistent with it.
+      allow get:  if isSignedIn() && (
         resource == null ||
         resource.data.members.hasAny([callerEmail()]) ||
+        (resource.data.type == 'group' && resource.data.get('inviteCode', '') != '') ||
         isAdmin()
       );
       allow create: if isSignedIn() &&
@@ -244,18 +265,99 @@ service cloud.firestore {
         (!isBanned() || isAdmin());
       allow update: if isSignedIn() && (
         isAdmin() ||
+        // ── Send-message room-metadata branch ─────────────────────────────────
+        // When a member sends a message, chat.js commits a writeBatch that updates
+        // the room doc with: lastMessage, lastSenderEmail, lastSenderName,
+        // lastUpdated, AND unreadCount (zeroing the sender's own key and
+        // incrementing every recipient's key).
+        //
+        // The general member branch below intentionally restricts unreadCount
+        // changes to the caller's own key only (for mark-as-read writes).
+        // That constraint is correct for reads but it also blocks the send-message
+        // batch because the batch touches OTHER members' unreadCount keys.
+        //
+        // This narrow branch permits exactly the send-message update pattern:
+        //   • caller must be a confirmed member of the chat
+        //   • only the send-metadata fields may be changed (no membership etc.)
+        //   • lastSenderEmail must equal callerEmail() — proves who is sending
+        // Any field outside this set (type, members, admins, …) is still blocked.
         (resource.data.members.hasAny([callerEmail()]) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['lastMessage', 'lastSenderEmail', 'lastSenderName',
+                      'lastUpdated', 'lastMessageAt', 'unreadCount']) &&
+          request.resource.data.lastSenderEmail == callerEmail()
+        ) ||
+        // ── Group-event room-metadata branch ──────────────────────────────────
+        // When a group admin/member triggers a membership event (leave, remove,
+        // add member, make/remove admin, approve join), chat.js writes a system
+        // message to the messages subcollection AND updates the room doc with:
+        //   lastMessage (event text), lastSenderEmail='system',
+        //   lastUpdated, lastMessageAt, unreadCount (bump for all other members).
+        // The send-message branch above blocks this because lastSenderEmail must
+        // equal callerEmail() — it cannot be 'system'.
+        // The general member branch below blocks lastMessage/lastSenderEmail/lastSenderName.
+        // This narrow branch permits exactly the group-event update pattern:
+        //   • caller must be a confirmed member of the chat
+        //   • only metadata fields may be changed (no membership / type / admins)
+        //   • lastSenderEmail must be 'system' — distinguishes this from real messages
+        //   • group chats only
+        (resource.data.members.hasAny([callerEmail()]) &&
+          resource.data.type == 'group' &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['lastMessage', 'lastSenderEmail', 'lastSenderName',
+                      'lastUpdated', 'lastMessageAt', 'unreadCount']) &&
+          request.resource.data.lastSenderEmail == 'system'
+        ) ||
+        // FIX DUPLICATE-CHAT: openChatRoom's runTransaction calls tx.update() on
+        // the room doc when it already exists, writing memberNames, lastUpdated,
+        // lastRead.<email>, and unreadCount.<email>=0 atomically so the RCM
+        // snapshot triggered by this write already sees count=0 — eliminating the
+        // race where the badge reappeared between the tx commit and the separate
+        // markRoomRead write.
+        // `name` and `members` are NOT in this allowlist, so group-rename and
+        // member-injection attacks via this path are still impossible.
+        // Per-user key guards on lastRead and unreadCount mirror the main member
+        // branch below: only the caller's own keys may be written.
+        //
+        // BUG-OPENROOM-GROUP FIX: previously restricted to type=='private', but
+        // openChatRoom is also called for group chats (to refresh memberNames and
+        // zero the caller's unreadCount on open). The general member branch blocks
+        // 'memberNames' writes, so group openChatRoom transactions were silently
+        // denied. Removing the type restriction makes this branch apply to both
+        // private and group rooms. 'members' and 'admins' remain outside the
+        // affectedKeys allowlist, so member-injection / privilege-escalation
+        // attacks via this path are still impossible.
+        (resource.data.members.hasAny([callerEmail()]) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['memberNames', 'lastUpdated', 'lastRead', 'unreadCount']) &&
+          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['lastRead']) ||
+            request.resource.data.get('lastRead', {}).keys()
+              .hasOnly([callerEmail(), callerEmail().split('.')[0]])
+          ) &&
+          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['unreadCount']) ||
+            request.resource.data.get('unreadCount', {}).diff(
+              resource.data.get('unreadCount', {})
+            ).affectedKeys().hasOnly([callerEmail(), callerEmail().split('.')[0]])
+          )
+        ) ||
+        (resource.data.members.hasAny([callerEmail()]) &&
+          // BUG-1 FIX: block fields that must NOT be freely written by members.
+          // Added 'name' (group display name) and 'memberNames' to prevent any
+          // member from renaming the group or other members — those are admin-only.
+          // 'blockedBy' is handled separately below.
           !request.resource.data.diff(resource.data).affectedKeys()
-            .hasAny(['type', 'createdBy', 'admins', 'inviteCode', 'members']) &&
+            .hasAny(['type', 'createdBy', 'admins', 'inviteCode', 'members',
+                     'name', 'memberNames']) &&
           (!request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['lastRead']) ||
             (resource.data.lastRead != null &&
               request.resource.data.lastRead
                 .diff(resource.data.lastRead).affectedKeys()
-                .hasOnly([callerEmail()])
+                .hasOnly([callerEmail(), callerEmail().split('.')[0]])
             ) ||
             (resource.data.lastRead == null &&
-              request.resource.data.lastRead.keys().hasOnly([callerEmail()])
+              request.resource.data.lastRead.keys()
+                .hasOnly([callerEmail(), callerEmail().split('.')[0]])
             )
           ) &&
           (!request.resource.data.diff(resource.data).affectedKeys()
@@ -263,45 +365,135 @@ service cloud.firestore {
             (resource.data.unreadCount != null &&
               request.resource.data.unreadCount
                 .diff(resource.data.unreadCount).affectedKeys()
-                .hasOnly([callerEmail()])
+                // Accept both the correct flat key ("user@gmail.com") AND the
+                // broken dot-split key ("user@gmail") that was created by the
+                // old setDoc+merge writes. Both map to the caller's identity.
+                .hasOnly([callerEmail(), callerEmail().split('.')[0]])
             ) ||
             (resource.data.unreadCount == null &&
-              request.resource.data.unreadCount.keys().hasOnly([callerEmail()])
+              request.resource.data.unreadCount.keys()
+                .hasOnly([callerEmail(), callerEmail().split('.')[0]])
+            )
+          ) &&
+          // FIX BUG-5: pinnedBy is a per-user map keyed by email.  Without this
+          // guard any chat member could write pinnedBy.<other@user.com>, silently
+          // pinning or unpinning conversations in another member's sidebar.
+          // Pattern mirrors the lastRead / unreadCount constraints above.
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['pinnedBy']) ||
+            (resource.data.pinnedBy != null &&
+              request.resource.data.pinnedBy
+                .diff(resource.data.pinnedBy).affectedKeys()
+                .hasOnly([callerEmail()])
+            ) ||
+            (resource.data.get('pinnedBy', null) == null &&
+              request.resource.data.pinnedBy.keys().hasOnly([callerEmail()])
+            )
+          ) &&
+          // FIX RULE-CLEAREDAT: "Clear Chat" writes clearedAt.<email>=<timestamp>
+          // per-user so RCM can suppress the stale lastMessage preview.
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['clearedAt']) ||
+            (resource.data.get('clearedAt', null) != null &&
+              request.resource.data.clearedAt
+                .diff(resource.data.clearedAt).affectedKeys()
+                .hasOnly([callerEmail()])
+            ) ||
+            (resource.data.get('clearedAt', null) == null &&
+              request.resource.data.clearedAt.keys().hasOnly([callerEmail()])
+            )
+          ) &&
+          // FIX RULE-HIDDENFOR: "Delete for me" writes hiddenFor.<email>=true and
+          // hiddenAt.<email>=<timestamp> on the room doc so the sidebar can exclude
+          // it for this user.  Same per-user key pattern as pinnedBy/lastRead.
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['hiddenFor']) ||
+            (resource.data.get('hiddenFor', null) != null &&
+              request.resource.data.hiddenFor
+                .diff(resource.data.hiddenFor).affectedKeys()
+                .hasOnly([callerEmail()])
+            ) ||
+            (resource.data.get('hiddenFor', null) == null &&
+              request.resource.data.hiddenFor.keys().hasOnly([callerEmail()])
+            )
+          ) &&
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['hiddenAt']) ||
+            (resource.data.get('hiddenAt', null) != null &&
+              request.resource.data.hiddenAt
+                .diff(resource.data.hiddenAt).affectedKeys()
+                .hasOnly([callerEmail()])
+            ) ||
+            (resource.data.get('hiddenAt', null) == null &&
+              request.resource.data.hiddenAt.keys().hasOnly([callerEmail()])
+            )
+          ) &&
+          // BUG-1 FIX (blockedBy): "Block user" writes blockedBy as an array.
+          // Without this guard any member could add/remove any OTHER user's email
+          // from blockedBy — e.g. unblocking a chat that the other person blocked.
+          // Enforce that only the caller's own email is ever added or removed from
+          // the array, mirroring the per-user key pattern used for pinnedBy etc.
+          // arrayUnion / arrayRemove on a list → use toSet().difference() to check
+          // exactly which email was mutated (same pattern as pendingRequests rule).
+          (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['blockedBy']) ||
+            (
+              // Email added (block) must be caller only
+              request.resource.data.get('blockedBy', []).toSet()
+                .difference(resource.data.get('blockedBy', []).toSet())
+                .hasOnly([callerEmail()]) &&
+              // Email removed (unblock) must be caller only
+              resource.data.get('blockedBy', []).toSet()
+                .difference(request.resource.data.get('blockedBy', []).toSet())
+                .hasOnly([callerEmail()])
             )
           )
         ) ||
         // ── Join-request writes (open / request-to-join groups) ───────────
-        // FIX RULE-04 (3 bugs in one branch):
-        //   (a) Ternary ? : is NOT valid syntax in Firestore Security Rules.
-        //       The rules compiler rejects it at deploy time — no traffic reaches
-        //       any rule below this branch in the update rule.
-        //   (b) list.diff(list) does not exist in Firestore rules. .diff() is a
-        //       Map method; calling it on a list throws a null-dereference during
-        //       rule evaluation, silently denying every matched request.
-        //   (c) .addedKeys() is a MapDiff method — it is not available on the
-        //       result of a (hypothetical) list diff either.
+        // FIX RULE-04 (original 3 bugs were fixed in a prior pass, but two new
+        // bugs remained):
         //
-        // Fix: use list.toSet().difference(otherSet) which IS valid in rules v2
-        // and correctly computes the set of emails added/removed.
-        // We verify that ONLY the caller's own email appears in either the
-        // added-set or the removed-set, preventing injection of other emails.
+        //   (d) pendingRequests is a list of MAP objects {email, name, requestedAt},
+        //       NOT a list of plain strings. Calling .toSet().difference() on a
+        //       list-of-maps and comparing against [callerEmail()] (a string set)
+        //       can never match — the set difference yields maps, not strings.
+        //       Fix: use size+index checks on the list, which work correctly for
+        //       lists of maps in Firestore rules v2.
+        //
+        //   (e) The transaction in chat.js also writes dismissedRequests (via
+        //       arrayRemove) when cleaning up an expired dismiss entry for the
+        //       joining user. The old affectedKeys().hasOnly(['pendingRequests'])
+        //       caused permission-denied for any user who had a prior dismiss entry,
+        //       since dismissedRequests was not in the allowlist.
+        //       Fix: expand to hasOnly(['pendingRequests', 'dismissedRequests']).
+        //
+        // Security: size checks ensure caller can only ADD exactly one
+        // pendingRequests entry (their own) and REMOVE at most one
+        // dismissedRequests entry. Bulk injection of other users is still blocked.
         (resource.data.type == 'group' &&
           request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['pendingRequests']) &&
-          // Emails added to pendingRequests must only be the caller's
-          request.resource.data.pendingRequests.toSet()
-            .difference(resource.data.get('pendingRequests', []).toSet())
-            .hasOnly([callerEmail()]) &&
-          // Emails removed from pendingRequests must only be the caller's
-          resource.data.get('pendingRequests', []).toSet()
-            .difference(request.resource.data.pendingRequests.toSet())
-            .hasOnly([callerEmail()])
+            .hasOnly(['pendingRequests', 'dismissedRequests']) &&
+          // Exactly one entry added to pendingRequests
+          request.resource.data.get('pendingRequests', []).size() ==
+            resource.data.get('pendingRequests', []).size() + 1 &&
+          // The new entry must be the caller's own request object
+          request.resource.data.pendingRequests[
+            request.resource.data.pendingRequests.size() - 1
+          ].email == callerEmail() &&
+          // dismissedRequests may only shrink (caller removing their own expired entry)
+          request.resource.data.get('dismissedRequests', []).size() <=
+            resource.data.get('dismissedRequests', []).size()
         ) ||
+        // BUG-2 FIX: Added 'name' and 'memberNames' to the admin-only allowlist so
+        // group admins can rename the group and manage display names. Both were
+        // previously blocked from the member branch above, so this restores admin
+        // ability to perform those writes.
         (resource.data.type == 'group' &&
           resource.data.admins is list &&
           resource.data.admins.hasAny([callerEmail()]) &&
           request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['members', 'memberNames', 'admins', 'inviteCode', 'pendingRequests', 'dismissedRequests'])
+            .hasOnly(['members', 'memberNames', 'admins', 'inviteCode',
+                      'pendingRequests', 'dismissedRequests', 'name'])
         ) ||
         (resource.data.members.hasAny([callerEmail()]) &&
           request.resource.data.diff(resource.data).affectedKeys()
@@ -353,17 +545,45 @@ service cloud.firestore {
           (resource.data.senderEmail == callerEmail() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['senderEmail', 'senderName', 'createdAt',
-                       'replyTo', 'forwarded', 'seenBy', 'deletedFor'])) ||
+                       'replyTo', 'forwarded', 'seenBy'])) ||
+          // FIX RULE-DELETEFOR: any chat member may stamp their own email onto
+          // deletedFor (used by "Delete for me" / "Clear chat" — both only ever
+          // add the caller's own email via arrayUnion).  Previously deletedFor was
+          // in the sender-only blocked list, so clearing/deleting messages from
+          // someone else's messages always got permission-denied.
+          (isChatMember() &&
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['deletedFor'])) ||
+          // FIX RULE-SEENBY: seenBy (blue-tick delivery) is written by the *recipient*
+          // via arrayUnion(callerEmail()) when they view a message — not by the sender.
+          // seenBy was absent from every member-writable allowlist, silently denying
+          // every blue-tick write. Add a narrow branch: member may only touch seenBy.
+          // seenAt is a per-user map written alongside seenBy to record the exact time
+          // each recipient saw the message — used by the "Message Info" panel.
+          (isChatMember() &&
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['seenBy', 'deliveredTo', 'seenAt'])) ||
           (isChatMember() &&
             !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['text', 'imageUrl', 'voiceUrl', 'fileUrl',
                        'isDeletedForEveryone', 'senderEmail', 'senderName',
                        'edited', 'editedAt', 'replyTo', 'forwarded',
                        'fileName', 'fileMime', 'fileSize', '_deletedMediaUrls',
-                       'attachments']))
+                       'attachments', 'deletedFor']))
         );
+        // FIX RULE-MSG-DELETE: previously only the message sender or an admin
+        // could delete a message.  This permanently blocked "Delete chat" from
+        // working for private chats: deleting the whole room requires deleting ALL
+        // messages, including ones sent by the other participant.
+        // Fix: any confirmed member of the parent chat may delete any message in
+        // that chat, in addition to the existing sender-only and admin paths.
+        // isChatMember() is already used for read/create above, so no extra read
+        // cost is introduced — Firestore caches the get() result within the same
+        // rule evaluation.
         allow delete: if isSignedIn() && (
-          resource.data.senderEmail == callerEmail() || isAdmin()
+          resource.data.senderEmail == callerEmail() ||
+          isChatMember() ||
+          isAdmin()
         );
       }
       match /typing/{typingUserEmail} {

@@ -1,6 +1,67 @@
 // ============================================================
-// Livechat.js — Global Real-Time Community Chat  (v11 — message loading fixes)
+// Livechat.js — Global Real-Time Community Chat  (v12 — production realtime fixes)
 // ============================================================
+//
+// ── v12 AUDIT SUMMARY — PRODUCTION REALTIME & RACE CONDITIONS ────────────────
+//
+// All v11 fixes retained (ML-08 through ML-15).
+//
+// FIX-REALTIME [CRITICAL] Phase 1 messages (the initial PAGE_SIZE docs loaded
+//   via getDocs) never received real-time edits, reaction toggles, or soft-
+//   deletes from other users. Phase 2 uses startAfter(_newestCursorDoc) with
+//   ascending order, so it only delivers events for documents NEWER than Phase 1.
+//   Any modification to a Phase 1 doc was invisible until the user reloaded.
+//   Fixed: added _buildPhase1ModListener() — a second onSnapshot on the same
+//   limit(PAGE_SIZE) desc query that processes only 'modified' events for docs
+//   already in messagesMap. 'added' is ignored (Phase 2 handles new messages).
+//   'removed' is ignored because limit() eviction fires as 'removed' when newer
+//   messages push old ones out of the window; soft-deletes arrive as 'modified'
+//   with isDeleted:true and are correctly handled. Hard-deletes (admin deleteDoc)
+//   require a page reload — acceptable given admin-exclusivity of that operation.
+//   _phase1ModSub is managed alongside liveChatSub in _cleanupSubs(), the fast-
+//   reopen path in subscribeToMessages, and subscribeToMessages entry teardown.
+//
+// FIX-RACE [CRITICAL] subscribeToMessages is async. If closeLiveChat() was called
+//   while Phase 1's getDocs was still in-flight, the bail-out only checked
+//   !_isMounted — but closeLiveChat does NOT set _isMounted=false (only
+//   teardownLiveChat does). Phase 1 would complete successfully, render the
+//   message list (invisible to the user), build Phase 2, assign liveChatSub, and
+//   call _buildPhase1ModListener. On next openLiveChat() the !liveChatSub guard
+//   prevented subscribeToMessages from being called again, so the chat opened
+//   stale with no Phase 2 reset. Fixed: all Phase 1 bail-out sites now check
+//   !_isMounted || !isOpen. A pre-Phase-2 guard was also added (the user may
+//   close between renderAllMessages and _buildPhase2Listener). Both listener
+//   builders are wrapped in the existing try/finally (ML-14).
+//
+// FIX-CLOSE-INIT [BUG] closeLiveChat did not reset _isInitialLoading. If Phase 1
+//   was in-flight during close and the new isOpen bail-out triggered, the rAF
+//   chain that resets the flag would no longer run. On next open, scroll-triggered
+//   pagination would be permanently suppressed. Fixed: closeLiveChat now resets
+//   _isInitialLoading = false alongside the other close-state resets.
+//
+// FIX-DELETE [BUG] deleteMessage's updateDoc payload nulled text / mediaUrl /
+//   attachments / voiceUrl but left mediaType / fileName / fileSize with their
+//   old values in Firestore. These are permitted by the update rule's hasOnly()
+//   allow-list. Stale metadata caused minor data inconsistency (the isDeleted
+//   flag makes renderMsgHTML short-circuit, so no visual impact, but the data
+//   was incorrect). Fixed: mediaType / fileName / fileSize are now also nulled.
+//
+// FIX-SUB-ERROR [UX] The Phase 2 onSnapshot error callback only called
+//   console.error(). If Firestore dropped the subscription (auth expiry, quota,
+//   network split), users received no indication that real-time updates were
+//   broken. Fixed: error callback now shows a warning toast when the chat is
+//   open and mounted.
+//
+// FIX-DEADSEP [BUG] appendNewMessagesToDom: the nextSepDate guard checked
+//   afterEl?.classList.contains('lc-date-sep') to avoid inserting a duplicate
+//   separator. But afterEl is always a .lc-msg-row (found by
+//   querySelectorAll('.lc-msg-row[data-msg-id]')), so the check was always false
+//   — the separator was inserted unconditionally when needsSep was true, relying
+//   entirely on the post-loop duplicate-separator cleanup scan. Fixed: the dead
+//   check is replaced with a correct one that looks at afterEl.previousElementSibling
+//   — which CAN be a separator just inserted by the current loop iteration — to
+//   avoid inserting a duplicate that would need the cleanup pass to remove.
+//
 //
 // ── v11 AUDIT SUMMARY — MESSAGE LOADING ──────────────────────────────────────
 //
@@ -475,6 +536,12 @@ const docSnapshotMap = new Map();
 // SYNC-04: replaces the sentinel `() => {}` pattern; prevents concurrent subscriptions
 let _subscribeInFlight = false;
 
+// FIX-REALTIME: Phase 2 uses startAfter(_newestCursorDoc), so it only receives
+// events for messages NEWER than Phase 1's window. To propagate edits, reactions,
+// and soft-deletes on Phase 1 history in real-time, a second listener subscribes
+// to the same Phase 1 window and processes only 'modified' events.
+let _phase1ModSub = null;
+
 // Pagination cursors
 let _paginationCursorDoc = null;
 let _newestCursorDoc     = null;
@@ -737,8 +804,9 @@ async function uploadWithRetry(file, folder, opts = {}) {
   let lastErr;
   for (let attempt = 0; attempt < UPLOAD_MAX_RETRIES; attempt++) {
     try {
-      const url = await uploadToCloudinary(file, folder, opts);
-      if (url) return url;
+      // uploadToCloudinary returns { url, thumbnailUrl } — not a plain string.
+      const result = await uploadToCloudinary(file, folder, opts);
+      if (result?.url) return result;
       throw new Error('Empty URL');
     } catch (err) {
       lastErr = err;
@@ -888,6 +956,13 @@ function initVideoPlayers(container = document) {
           if (err.name === 'AbortError') return; // navigation/rapid toggle — silent
           if (err.name === 'NotAllowedError') {
             showLCToast('Tap or click the video to enable playback', 'info');
+            return;
+          }
+          if (err.name === 'NotSupportedError') {
+            // Video has no valid src (e.g. stored as "[object Object]" by the
+            // old uploadWithRetry bug). Nothing to play — show a friendly message
+            // rather than logging a noisy console error.
+            showLCToast('This video could not be loaded. Please re-upload it.', 'error');
             return;
           }
           console.error('[LiveChat] video.play() failed:', err);
@@ -1390,11 +1465,35 @@ function buildMediaHTML(msg) {
     return buildVoiceBubbleHTML(msg);
   }
 
-  const attachments = msg.attachments?.length
-    ? msg.attachments
-    : msg.mediaUrl
-      ? [{ url: msg.mediaUrl, type: msg.mediaType, name: msg.fileName, size: msg.fileSize }]
+  // normalizeAtt: fix attachments where .url was stored as a { url, thumbnailUrl }
+  // object instead of a plain string, caused by the uploadWithRetry return-type bug.
+  const normalizeAtt = (att) => {
+    if (!att) return att;
+    let { url, thumbnailUrl } = att;
+    // Unwrap nested object: { url: { url: '...', thumbnailUrl: '...' } }
+    if (url && typeof url === 'object') {
+      thumbnailUrl = thumbnailUrl ?? url.thumbnailUrl ?? null;
+      url = url.url ?? null;
+    }
+    return { ...att, url: url ?? null, thumbnailUrl: thumbnailUrl ?? null };
+  };
+
+  // mediaUrl may also be stored as a nested object
+  const rawMediaUrl = msg.mediaUrl && typeof msg.mediaUrl === 'object'
+    ? (msg.mediaUrl.url ?? null)
+    : (msg.mediaUrl ?? null);
+
+  const BROKEN_URL = '[object Object]';
+  const rawAttachments = msg.attachments?.length
+    ? msg.attachments.map(normalizeAtt)
+    : rawMediaUrl
+      ? [{ url: rawMediaUrl, type: msg.mediaType, name: msg.fileName, size: msg.fileSize }]
       : [];
+
+  // Guard: skip any attachment whose URL is still missing or un-unwrappable.
+  const attachments = rawAttachments.filter(
+    a => a?.url && typeof a.url === 'string' && a.url !== BROKEN_URL
+  );
 
   if (!attachments.length) return '';
 
@@ -1845,15 +1944,15 @@ function appendNewMessagesToDom(newIds) {
     const msg = id ? messagesMap.get(id) : null;
     return msg ? tsToMs(msg.timestamp) : 0;
   };
-  const allRows = () => [...list.querySelectorAll('.lc-msg-row[data-msg-id]')];
 
   for (const msg of newMsgs) {
     if (list.querySelector(`.lc-msg-row[data-msg-id="${CSS.escape(msg.id)}"]`)) continue;
 
     const msgMs = tsToMs(msg.timestamp);
 
-    // Find insertion point: first existing row with a later timestamp
-    const rows    = allRows();
+    // Find insertion point: first existing row with a later timestamp.
+    // Re-query after each insertion so the live NodeList reflects changes.
+    const rows    = [...list.querySelectorAll('.lc-msg-row[data-msg-id]')];
     const afterEl = rows.find(r => getRowMs(r) > msgMs) ?? null;
 
     // Build the message element
@@ -1875,12 +1974,16 @@ function appendNewMessagesToDom(newIds) {
 
       const needsSep = !prevSep || prevSep.dataset.date !== d;
       if (needsSep) {
-        // Also check: is the next row (afterEl) the start of the same date?
-        // If so, no new separator needed — it already has one coming.
-        const nextSepDate = afterEl?.classList.contains('lc-date-sep')
-          ? afterEl.dataset.date
-          : null;
-        if (nextSepDate !== d) {
+        // FIX: afterEl is always a .lc-msg-row (found by querySelectorAll),
+        // never a .lc-date-sep, so checking afterEl.classList.contains('lc-date-sep')
+        // was always false (dead code). The correct guard is to check whether
+        // afterEl's own previousElementSibling — which may have just been mutated
+        // by a prior iteration of this loop — is already a separator for this date.
+        // If so, the separator was just inserted; don't duplicate it.
+        const immediatelyPrecededBySameDateSep =
+          afterEl?.previousElementSibling?.classList?.contains('lc-date-sep') &&
+          afterEl.previousElementSibling.dataset.date === d;
+        if (!immediatelyPrecededBySameDateSep) {
           tmp2.innerHTML = dateSepHTML(msg.timestamp);
           const sep = tmp2.firstElementChild;
           if (sep) {
@@ -1956,9 +2059,10 @@ function setHeaderBadge(n) {
 // Used by closeLiveChat so re-open avoids duplicate subs.
 // ─────────────────────────────────────────────────────────────────────────────
 function _cleanupSubs() {
-  liveChatSub?.(); liveChatSub = null;
-  presenceSub?.(); presenceSub = null;
-  typingSub?.();   typingSub   = null;
+  liveChatSub?.();   liveChatSub   = null;
+  presenceSub?.();   presenceSub   = null;
+  typingSub?.();     typingSub     = null;
+  _phase1ModSub?.(); _phase1ModSub = null;   // FIX-REALTIME: also unsub Phase 1 mod listener
   _subscribeInFlight = false;
 }
 
@@ -1981,7 +2085,9 @@ export function openLiveChat() {
   requestAnimationFrame(() => overlay.classList.add('lc-overlay--visible'));
   document.body.classList.add('lc-body-lock');
   _headerUnread = 0;
+  newMsgCount   = 0;
   setHeaderBadge(0);
+  hideNewMsgsBanner();
   setTimeout(() => $('lc-input')?.focus(), 400);
   // BUG-FIX-2: guard on both liveChatSub AND _subscribeInFlight so rapid
   // open→close→open cycles cannot start a second concurrent subscription
@@ -2007,10 +2113,19 @@ export function closeLiveChat() {
   closeGallery();
   if (editingMsgId) cancelEdit();
   if (replyingTo)   clearReply();
+  // Clear any in-progress file state so re-open starts clean.
+  clearPendingFiles();
+  isSending = false;
   // UX-01: clean up all real-time subs so re-open doesn't duplicate them
   _cleanupSubs();
   // UX-03: reset atBottom so re-open starts scroll tracking correctly
   atBottom = true;
+  // FIX: reset _isInitialLoading so that if Phase 1 was in-flight when close
+  // was called, the flag isn't left true permanently (scroll-to-paginate would
+  // be suppressed forever on the next open). The isOpen bail-out in Phase 1
+  // returns early now, but belt-and-suspenders reset here guarantees the flag
+  // is clean for the next openLiveChat() regardless of timing.
+  _isInitialLoading = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2040,8 +2155,9 @@ async function subscribeToMessages() {
   if (_subscribeInFlight) return;
   _subscribeInFlight = true;
 
-  // Tear down any existing subscription
-  if (liveChatSub) { liveChatSub(); liveChatSub = null; }
+  // Tear down any existing subscriptions (both Phase 2 and Phase 1 mod listener)
+  if (liveChatSub)   { liveChatSub();   liveChatSub   = null; }
+  if (_phase1ModSub) { _phase1ModSub(); _phase1ModSub = null; }
 
   // ML-04 FIX: if messagesMap already has data from a previous open session
   // (closeLiveChat preserves the map for fast re-open), skip Phase 1 and
@@ -2053,15 +2169,25 @@ async function subscribeToMessages() {
     // handler and trigger a spurious loadOlderMessages() call.
     _isInitialLoading = true;
     renderAllMessages(true);
+    // Use setTimeout(0) after two rAFs so the flag outlasts composited scroll
+    // events that fire synchronously during the programmatic scrollToLatest.
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => { _isInitialLoading = false; });
+      requestAnimationFrame(() => {
+        setTimeout(() => { _isInitialLoading = false; }, 0);
+      });
     });
     // ML-13 FIX: assign liveChatSub before clearing _subscribeInFlight to
     // prevent a second concurrent subscription on rapid re-open.
-    // ML-14 FIX: try/finally ensures _subscribeInFlight is always cleared even
-    // if _buildPhase2Listener() throws (e.g. Firestore not yet initialised).
+    // ML-14 FIX: try/finally ensures _subscribeInFlight and _isInitialLoading
+    // are always cleared even if either listener builder throws.
     try {
-      liveChatSub = _buildPhase2Listener();
+      liveChatSub   = _buildPhase2Listener();
+      // FIX-REALTIME: rebuild Phase 1 mod listener so fast re-open also
+      // receives real-time edits/reactions on the cached Phase 1 messages.
+      _phase1ModSub = _buildPhase1ModListener();
+    } catch (e) {
+      _isInitialLoading = false;
+      throw e;
     } finally {
       _subscribeInFlight = false;
     }
@@ -2087,10 +2213,13 @@ async function subscribeToMessages() {
       limit(PAGE_SIZE),
     ));
 
-    // ML-01 / ML-09: bail if unmounted during fetch.
-    // Both flags must be reset on every early-return path or they stay true
-    // permanently, blocking pagination and concurrent subscription guards.
-    if (!_isMounted) {
+    // ML-01 / ML-09 + FIX-RACE: bail if unmounted OR if the chat was closed during
+    // the async getDocs fetch. _isMounted stays true across close/open cycles —
+    // only teardownLiveChat sets it false. isOpen is the correct gate for
+    // close-during-fetch: without it Phase 1 continues, builds Phase 2, assigns
+    // liveChatSub, and prevents subscribeToMessages from running on next open
+    // (openLiveChat checks !liveChatSub before calling subscribeToMessages).
+    if (!_isMounted || !isOpen) {
       _isInitialLoading  = false;
       _subscribeInFlight = false;
       return;
@@ -2111,7 +2240,7 @@ async function subscribeToMessages() {
   } catch (err) {
     console.error('[LiveChat] initial load failed:', err);
     phase1Failed = true;
-    if (!_isMounted) { _subscribeInFlight = false; _isInitialLoading = false; return; }
+    if (!_isMounted || !isOpen) { _subscribeInFlight = false; _isInitialLoading = false; return; }
     showLCToast('Could not load messages. Check your connection.', 'error');
     // ML-05: show a proper error state instead of the misleading "No messages yet"
     // empty state that renderAllMessages() would produce with an empty map.
@@ -2129,7 +2258,9 @@ async function subscribeToMessages() {
   if (!phase1Failed) renderAllMessages(true);
 
   requestAnimationFrame(() => {
-    requestAnimationFrame(() => { _isInitialLoading = false; });
+    requestAnimationFrame(() => {
+      setTimeout(() => { _isInitialLoading = false; }, 0);
+    });
   });
 
   // ── Phase 2: real-time listener for NEW messages only ───────────────────────
@@ -2166,12 +2297,25 @@ async function subscribeToMessages() {
   // that are outside the Phase 2 window are updated when the user loads that
   // page via loadOlderMessages (getDocs returns the current server state).
 
-  // ML-14 FIX: wrap _buildPhase2Listener() in try/finally so that if it
+  // FIX-RACE: guard again — the chat may have been closed while renderAllMessages
+  // was executing (e.g. the user pressed Escape mid-load). Without this check,
+  // Phase 2 would be created and liveChatSub set, preventing subscribeToMessages
+  // from running on the next open (openLiveChat bails on !liveChatSub).
+  if (!_isMounted || !isOpen) {
+    _isInitialLoading  = false;
+    _subscribeInFlight = false;
+    return;
+  }
+
+  // ML-14 FIX: wrap both listener builders in try/finally so that if either
   // throws (e.g. Firestore not initialised, bad db reference), _subscribeInFlight
   // is always cleared. Without this, a throw here leaves the flag permanently
   // true, silently preventing any future subscription attempt.
   try {
-    liveChatSub = _buildPhase2Listener();
+    liveChatSub   = _buildPhase2Listener();
+    // FIX-REALTIME: build Phase 1 mod listener so edits/reactions/soft-deletes
+    // on the initial PAGE_SIZE messages propagate without a full page reload.
+    _phase1ModSub = _buildPhase1ModListener();
   } finally {
     _subscribeInFlight = false;
   }
@@ -2191,8 +2335,11 @@ function _buildPhase2Listener() {
       )
     : query(
         collection(db, 'global_chat'),
-        orderBy('timestamp', 'asc'),
-        // No cursor: subscribe to everything (only reached on phase1 failure)
+        orderBy('timestamp', 'desc'),
+        limit(PAGE_SIZE),
+        // No cursor: Phase 1 failed. Limit to PAGE_SIZE so we don't download
+        // unbounded history. Messages arrive desc here; appendNewMessagesToDom
+        // sorts by timestamp so order is correct in the DOM.
       );
 
   // ML-03: track whether the Phase 2 first snapshot has been processed.
@@ -2240,6 +2387,11 @@ function _buildPhase2Listener() {
           messagesMap.set(id, msg);
           docSnapshotMap.set(id, change.doc);
           newIds.add(id);
+          // Update _newestCursorDoc so fast-reopen after Phase 2 messages arrive
+          // starts the next Phase 2 listener from the latest doc, not Phase 1's cursor.
+          const newMs    = tsToMs(msg.timestamp);
+          const cursorMs = _newestCursorDoc ? tsToMs(_newestCursorDoc.data().timestamp) : 0;
+          if (newMs > cursorMs) _newestCursorDoc = change.doc;
         } else if (change.type === 'modified') {
           // Covers reactions, edits, soft-deletes, and the pending→real
           // timestamp transition for the sender's own messages.
@@ -2275,12 +2427,17 @@ function _buildPhase2Listener() {
             // the removed row was the last message in a multi-message group.
             const prevSibling = removedRow.previousElementSibling;
             removedRow.remove();
+            // Prune the date separator above if it now has no message rows
+            // in its group. Walk from the sep forward until we hit another sep
+            // or the end of the list; if no lc-msg-row is found, it's orphaned.
             if (prevSibling?.classList.contains('lc-date-sep')) {
-              const nextAfter = prevSibling.nextElementSibling;
-              // Orphaned: nothing follows, or the next element is another separator
-              if (!nextAfter || nextAfter.classList.contains('lc-date-sep')) {
-                prevSibling.remove();
+              let sibling = prevSibling.nextElementSibling;
+              let hasMsg  = false;
+              while (sibling && !sibling.classList.contains('lc-date-sep')) {
+                if (sibling.classList.contains('lc-msg-row')) { hasMsg = true; break; }
+                sibling = sibling.nextElementSibling;
               }
+              if (!hasMsg) prevSibling.remove();
             }
           }
         }
@@ -2310,10 +2467,66 @@ function _buildPhase2Listener() {
         }
       }
     },
-    err => console.error('[LiveChat] subscription error:', err),
+    err => {
+      console.error('[LiveChat] subscription error:', err);
+      // Only notify the user if the chat is currently open and mounted — avoid
+      // toasting during teardown or if the subscription fires after close.
+      if (_isMounted && isOpen) {
+        showLCToast('Real-time updates interrupted. Reopen chat to reconnect.', 'warning');
+      }
+    },
   );
 
   return unsub;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 1 MODIFICATIONS LISTENER
+//
+// FIX-REALTIME: Phase 2 uses startAfter(_newestCursorDoc) with ascending order,
+// meaning it only receives Firestore events for documents NEWER than Phase 1's
+// cursor. This is correct for new message delivery, but it means edits, reaction
+// toggles, and soft-deletes on the initial PAGE_SIZE messages are never surfaced
+// in real-time — users must reopen the chat to see them.
+//
+// This listener subscribes to the same window as Phase 1 (last PAGE_SIZE docs,
+// desc order) and processes ONLY 'modified' events for documents already in
+// messagesMap. 'added' events are ignored (Phase 2 handles new messages).
+// 'removed' events are also ignored because Firestore fires 'removed' when a
+// document leaves the limit() window as newer messages push it out — this is NOT
+// an actual deletion. Soft-deletes arrive as 'modified' with isDeleted:true and
+// ARE handled here. Hard-deletes (admin deleteDoc) are left until page reload;
+// that operation is already restricted to admins by Firestore rules.
+//
+// Double-patching: as Phase 2 docs accumulate over time, they enter this
+// listener's limit window and can receive duplicate 'modified' events (also
+// delivered by Phase 2). patchMsgInDOM() is idempotent, so this is harmless.
+// ─────────────────────────────────────────────────────────────────────────────
+function _buildPhase1ModListener() {
+  const q = query(
+    collection(db, 'global_chat'),
+    orderBy('timestamp', 'desc'),
+    limit(PAGE_SIZE),
+  );
+
+  return onSnapshot(
+    q,
+    { includeMetadataChanges: false },
+    snap => {
+      snap.docChanges().forEach(change => {
+        // Only process modifications — see function comment for rationale.
+        if (change.type !== 'modified') return;
+        const id = change.doc.id;
+        // Skip docs not currently rendered (not in Phase 1 map).
+        if (!messagesMap.has(id)) return;
+        const msg = { id, ...change.doc.data() };
+        messagesMap.set(id, msg);
+        docSnapshotMap.set(id, change.doc);
+        patchMsgInDOM(msg);
+      });
+    },
+    err => console.error('[LiveChat] phase1ModListener error:', err),
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2385,9 +2598,10 @@ async function loadOlderMessages() {
       // to the last snap doc. Without this guard the next loadOlderMessages()
       // call would fetch the exact same window again, looping forever on a
       // batch that is exactly PAGE_SIZE but contains no new data.
+      // NOTE: do NOT return early here — fall through so the finally block's
+      // updateLoadMoreBtn() always runs to reset the button state.
       if (olderMsgs.length === 0) {
         hasMoreMessages = false;
-        return; // jump to finally block via normal control flow
       }
 
       if (list && olderMsgs.length > 0) {
@@ -2577,7 +2791,10 @@ function subscribeToTyping() {
     const now    = Date.now();
     const myKey  = currentUser?.email ?? null;
     const active = _typingCache.filter(entry =>
-      entry.key !== myKey && now - entry.ts < TYPING_STALE_MS + 1500
+      entry.key !== myKey &&
+      // ts===0 means server timestamp not yet resolved (local cache optimistic write) —
+      // treat as "just now" so the indicator shows immediately, not after staleness check.
+      (entry.ts === 0 || now - entry.ts < TYPING_STALE_MS + 1500)
     );
     if (!active.length) { bar.classList.add('hidden'); return; }
     const names = active.map(e => e.name);
@@ -2607,10 +2824,12 @@ function subscribeToTyping() {
   );
 
   // Return a combined teardown that cleans up both the Firestore sub and the
-  // prune interval. Wrap in a closure so _cleanupSubs() can call typingSub().
-  const _origUnsub = typingSub;
+  // prune interval. Capture the raw onSnapshot unsub (stored in typingSub by
+  // onSnapshot()) before reassigning typingSub, so repeated calls to
+  // subscribeToTyping() don't chain closures and leak old intervals.
+  const _firestoreUnsub = typingSub;
   typingSub = () => {
-    _origUnsub?.();
+    _firestoreUnsub?.();
     if (_typingPruneInterval) { clearInterval(_typingPruneInterval); _typingPruneInterval = null; }
     _typingCache = [];
     const bar = $('lc-typing-bar');
@@ -2872,12 +3091,18 @@ async function sendMessage() {
           const mediaType  = file.type.startsWith('image/') ? 'image'
                            : file.type.startsWith('video/') ? 'video'
                            : 'document';
-          const url = await uploadWithRetry(compressed, folder, {
+          const { url, thumbnailUrl } = await uploadWithRetry(compressed, folder, {
             fileName:   file.name,
             onProgress: pct =>
               showUploadProgress(((done + pct / 100) / filesToUpload.length) * 100),
           });
-          attachments.push({ url, type: mediaType, name: file.name, size: file.size });
+          attachments.push({
+            url,
+            type: mediaType,
+            name: file.name,
+            size: file.size,
+            ...(thumbnailUrl && { thumbnailUrl }),
+          });
           done++;
         } catch (uploadErr) {
           console.error('[LiveChat] upload failed for', file.name, uploadErr);
@@ -2921,6 +3146,9 @@ async function sendMessage() {
       attachments:  attachments.length ? attachments : null,
     });
 
+    // Always scroll to latest after the user sends — they want to see their
+    // own message regardless of where they were scrolled.
+    atBottom = true;
     scrollToLatest(true);
   } catch (err) {
     console.error('[LiveChat] sendMessage error:', err);
@@ -3018,15 +3246,27 @@ function renderEditMediaPreviews() {
     </div>`;
   }).join('');
 
+  // BUG-FIX: collect old object URLs BEFORE wiping innerHTML — querying
+  // img[data-obj-url] after the wipe always returns empty (elements are gone).
+  const prevUrls = [];
+  fp.querySelectorAll('img[data-obj-url]').forEach(img => prevUrls.push(img.dataset.objUrl));
+  prevUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch { /* ignore */ } });
+
   fp.innerHTML = `<div class="lc-fp-list">${existingHTML}${newHTML}</div>`;
+
+  // Assign ObjectURLs for new-file image previews. Use a data attribute to
+  // track and revoke them on next render (the img.onload revoke only fires if
+  // the element stays in the DOM long enough to load, which isn't guaranteed
+  // when renderEditMediaPreviews is called repeatedly).
 
   pendingFiles.forEach((file, idx) => {
     if (!file.type.startsWith('image/')) return;
     const img = fp.querySelector(`img[data-new-idx="${idx}"]`);
     if (!img) return;
     const url = URL.createObjectURL(file);
+    img.dataset.objUrl = url;
     img.src   = url;
-    img.onload = () => URL.revokeObjectURL(url);
+    img.onload = () => { URL.revokeObjectURL(url); delete img.dataset.objUrl; };
   });
 
   fp.querySelectorAll('[data-edit-remove-idx]').forEach(btn =>
@@ -3072,12 +3312,18 @@ async function commitEdit() {
                        : file.type.startsWith('video/') ? 'lc_videos' : 'lc_files';
         const mediaType = file.type.startsWith('image/') ? 'image'
                         : file.type.startsWith('video/') ? 'video' : 'document';
-        const url = await uploadWithRetry(compressed, folder, {
+        const { url, thumbnailUrl } = await uploadWithRetry(compressed, folder, {
           fileName:   file.name,
           onProgress: pct =>
             showUploadProgress(((done + pct / 100) / filesToUpload.length) * 100),
         });
-        uploadedNew.push({ url, type: mediaType, name: file.name, size: file.size });
+        uploadedNew.push({
+          url,
+          type: mediaType,
+          name: file.name,
+          size: file.size,
+          ...(thumbnailUrl && { thumbnailUrl }),
+        });
         done++;
       } catch (uploadErr) {
         console.error('[LiveChat] edit upload failed for', file.name, uploadErr);
@@ -3088,7 +3334,6 @@ async function commitEdit() {
   }
 
   const finalAttachments = [...(editingMediaAttachments || []), ...uploadedNew];
-  cancelEdit();
 
   if (!newText && !finalAttachments.length) {
     showLCToast('Message cannot be empty', 'warning');
@@ -3107,9 +3352,11 @@ async function commitEdit() {
       fileSize:    first?.size ?? null,
       attachments: finalAttachments.length ? finalAttachments : null,
     });
+    // Only clear edit state after the write succeeds so the user can retry on failure.
+    cancelEdit();
   } catch (err) {
     console.error('[LiveChat] editMessage error:', err);
-    showLCToast('Failed to edit message', 'error');
+    showLCToast('Failed to edit message. Try again.', 'error');
   }
 }
 
@@ -3121,10 +3368,21 @@ async function deleteMessage(msgId) {
   if (!msg || msg.senderEmail !== currentUser?.email) return;
   const ok = await showLCConfirm('Delete this message for everyone?');
   if (!ok) return;
+  // If the message being deleted is currently open in the edit bar, cancel the edit.
+  if (editingMsgId === msgId) cancelEdit();
   try {
+    // FIX: also null mediaType / fileName / fileSize so Firestore holds no
+    // stale media metadata after a soft-delete. All five fields are explicitly
+    // permitted by the update rule's hasOnly() allow-list.
     await updateDoc(doc(db, 'global_chat', msgId), {
-      isDeleted: true, text: null, mediaUrl: null, attachments: null,
-      voiceUrl: null,
+      isDeleted:   true,
+      text:        null,
+      mediaUrl:    null,
+      mediaType:   null,
+      fileName:    null,
+      fileSize:    null,
+      attachments: null,
+      voiceUrl:    null,
     });
   } catch (err) {
     console.error('[LiveChat] deleteMessage error:', err);
@@ -3201,6 +3459,13 @@ function renderFilePreviews() {
   if (!fp) return;
   if (!pendingFiles.length) { fp.classList.add('hidden'); return; }
   fp.classList.remove('hidden');
+
+  // BUG-FIX: collect old object URLs BEFORE wiping innerHTML — querying
+  // img[data-obj-url] after the wipe always returns empty (elements are gone).
+  const prevFpUrls = [];
+  fp.querySelectorAll('img[data-obj-url]').forEach(img => prevFpUrls.push(img.dataset.objUrl));
+  prevFpUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch { /* ignore */ } });
+
   fp.innerHTML = `<div class="lc-fp-list">${pendingFiles.map((file, idx) => {
     const isImg = file.type.startsWith('image/');
     const isVid = file.type.startsWith('video/');
@@ -3229,8 +3494,9 @@ function renderFilePreviews() {
     const img = fp.querySelector(`img[data-idx="${idx}"]`);
     if (!img) return;
     const url = URL.createObjectURL(file);
+    img.dataset.objUrl = url;
     img.src   = url;
-    img.onload = () => URL.revokeObjectURL(url);
+    img.onload = () => { URL.revokeObjectURL(url); delete img.dataset.objUrl; };
   });
 
   fp.querySelectorAll('[data-remove-idx]').forEach(btn =>
@@ -3468,8 +3734,11 @@ function vnCancel() {
   const rec = _vnMediaRecorder;
   if (rec && rec.state !== 'inactive') {
     try {
-      rec.ondataavailable = null; // discard chunks
-      rec.onstop = null;
+      // BUG-VN-3: null handlers BEFORE calling stop() — on some browsers a
+      // final 'dataavailable' fires synchronously inside stop(), after which
+      // 'onstop' may fire. Nulling first guarantees both are discarded.
+      rec.ondataavailable = null;
+      rec.onstop          = null;
       rec.stop();
     } catch { /* ignore */ }
   }
@@ -3554,12 +3823,14 @@ async function vnUploadAndSend(blob, durationSec, mimeType, ext) {
   const audioFile = new File([blob], fileName, { type: mimeType });
 
   try {
-    const downloadURL = await uploadToCloudinary(audioFile, 'voice_notes', {
+    // uploadToCloudinary returns { url, thumbnailUrl } — destructure to get
+    // the plain string URL. Audio has no thumbnailUrl so we discard it.
+    const { url: voiceDownloadURL } = await uploadToCloudinary(audioFile, 'voice_notes', {
       fileName,
       onProgress: pct => showUploadProgress(pct),
     });
 
-    if (!downloadURL) throw new Error('Cloudinary returned an empty URL');
+    if (!voiceDownloadURL) throw new Error('Cloudinary returned an empty URL');
 
     const snapshotReply = replyingTo ? { ...replyingTo } : null;
     clearReply();
@@ -3567,7 +3838,7 @@ async function vnUploadAndSend(blob, durationSec, mimeType, ext) {
     await addDoc(collection(db, 'global_chat'), {
       text:          null,
       type:          'voice',
-      voiceUrl:      downloadURL,
+      voiceUrl:      voiceDownloadURL,
       voiceDuration: durationSec,
       voiceMime:     mimeType,
       senderEmail:   currentUser.email,
@@ -3588,9 +3859,14 @@ async function vnUploadAndSend(blob, durationSec, mimeType, ext) {
     hideUploadProgress();
     scrollToLatest(true);
   } catch (err) {
+    // BUG-VN-5: hideUploadProgress already called in finally — but we need
+    // to ensure UI state is always restored even on unexpected throws.
     hideUploadProgress();
     console.error('[LiveChat] vnUploadAndSend error:', err);
     showLCToast('Failed to send voice note. Try again.', 'error');
+  } finally {
+    // BUG-VN-5: guarantee progress bar is hidden on every exit path
+    hideUploadProgress();
   }
 }
 
@@ -3598,6 +3874,12 @@ async function vnUploadAndSend(blob, durationSec, mimeType, ext) {
 // A11Y-01: tabindex="0" on seek element (role="slider" requires it).
 // VN-15: waveform bar heights seeded from msg.id hash for distinct patterns.
 function buildVoiceBubbleHTML(msg) {
+  // Guard: voiceUrl may have been stored as a { url, thumbnailUrl } object
+  // by older code that called uploadToCloudinary without destructuring.
+  const rawVoiceUrl = msg.voiceUrl && typeof msg.voiceUrl === 'object'
+    ? (msg.voiceUrl.url ?? null)
+    : (msg.voiceUrl ?? null);
+
   const totalSec  = msg.voiceDuration || 0;
   const totalFmt  = fmtVNTime(totalSec);
   const barCount  = 28;
@@ -3618,7 +3900,7 @@ function buildVoiceBubbleHTML(msg) {
 
   return `
     <div class="lc-voice-bubble" data-msg-id="${esc(msg.id)}"
-         data-voice-url="${escUrl(msg.voiceUrl || '')}"
+         data-voice-url="${escUrl(rawVoiceUrl || '')}"
          data-voice-duration="${totalSec}"
          data-voice-mime="${esc(msg.voiceMime || 'audio/webm')}">
       <button class="lc-vb-play-btn" aria-label="Play voice note">
@@ -3682,15 +3964,17 @@ function initVoiceBubbles(container = document) {
     const vbAbort = new AbortController();
     const vbSig   = vbAbort.signal;
 
-    let audio      = null;
-    let _seeking   = false;
-    let _touchSeek = false;
+    let audio        = null;
+    let _seeking     = false;
+    let _touchSeek   = false;
+    let _chosenRate  = 1;   // BUG-VN-2: persists speed selection before first play
 
     const createAudio = () => {
       if (audio) return;
       audio = new Audio();
-      audio.preload = 'none';
-      audio.src     = url;
+      audio.preload      = 'none';
+      audio.src          = url;
+      audio.playbackRate = _chosenRate;  // BUG-VN-2: apply pre-selected speed
 
       audio.addEventListener('play', () => {
         if (_activeAudio && _activeAudio !== audio && !_activeAudio.paused) {
@@ -3772,13 +4056,16 @@ function initVoiceBubbles(container = document) {
     });
 
     seekEl?.addEventListener('mousedown', e => {
+      e.preventDefault();
       createAudio();
       _seeking = true;
       seekFromClientX(e.clientX);
     });
-    seekEl?.addEventListener('mousemove', e => {
+    // BUG-VN-1: mousemove must be on document, not seekEl — otherwise dragging
+    // outside the element stops updating the seek position mid-drag.
+    document.addEventListener('mousemove', e => {
       if (_seeking) seekFromClientX(e.clientX);
-    });
+    }, { signal: vbSig });
     // LEAK-01: document mouseup uses AbortController signal
     document.addEventListener('mouseup', () => { _seeking = false; }, { signal: vbSig });
 
@@ -3804,7 +4091,8 @@ function initVoiceBubbles(container = document) {
     });
 
     speedSel?.addEventListener('change', () => {
-      if (audio) audio.playbackRate = parseFloat(speedSel.value);
+      _chosenRate = parseFloat(speedSel.value) || 1;
+      if (audio) audio.playbackRate = _chosenRate;
     });
 
     dlBtn?.addEventListener('click', () =>
@@ -3924,12 +4212,20 @@ function openGallery() {
     if (!grid) return;
     const q = normalize(searchQuery);
     const allItems = getSortedMessages().flatMap(msg => {
-      const atts = msg.attachments?.length
-        ? msg.attachments
+      // BUG-VN-4: normalize nested url objects (same bug as buildMediaHTML)
+      const normUrl = v => (v && typeof v === 'object') ? (v.url ?? null) : (v ?? null);
+      const rawAtts = msg.attachments?.length
+        ? msg.attachments.map(a => ({
+            ...a,
+            url:          normUrl(a.url),
+            thumbnailUrl: normUrl(a.thumbnailUrl ?? (typeof a.url === 'object' ? a.url?.thumbnailUrl : null)),
+          }))
         : msg.mediaUrl
-          ? [{ url: msg.mediaUrl, type: msg.mediaType, name: msg.fileName, size: msg.fileSize }]
+          ? [{ url: normUrl(msg.mediaUrl), type: msg.mediaType, name: msg.fileName, size: msg.fileSize }]
           : [];
-      return atts
+      const BROKEN = '[object Object]';
+      return rawAtts
+        .filter(a => a?.url && typeof a.url === 'string' && a.url !== BROKEN)
         .filter(a => !q || normalize(a.name || '').includes(q))
         .map(a => ({ ...a, msgId: msg.id }));
     });
@@ -4120,8 +4416,8 @@ export function setupLiveChat() {
   const emojiBtn   = $('lc-emoji-btn');
   const galleryBtn = $('lc-gallery-btn');
 
-  closeBtn?.addEventListener('click', closeLiveChat);
-  backdrop?.addEventListener('click', closeLiveChat);
+  closeBtn?.addEventListener('click', closeLiveChat, { signal: sig });
+  backdrop?.addEventListener('click', closeLiveChat, { signal: sig });
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && isOpen) {
       if (_galleryOpen)     { closeGallery();    return; }
@@ -4130,7 +4426,7 @@ export function setupLiveChat() {
     }
   }, { signal: sig });
 
-  emojiBtn?.addEventListener('click', e => { e.stopPropagation(); openEmojiPicker(); });
+  emojiBtn?.addEventListener('click', e => { e.stopPropagation(); openEmojiPicker(); }, { signal: sig });
   document.addEventListener('click', e => {
     if (_emojiPickerOpen &&
         !e.target.closest('#lc-emoji-picker') &&
@@ -4139,12 +4435,12 @@ export function setupLiveChat() {
     }
   }, { signal: sig });
 
-  galleryBtn?.addEventListener('click', () => _galleryOpen ? closeGallery() : openGallery());
+  galleryBtn?.addEventListener('click', () => _galleryOpen ? closeGallery() : openGallery(), { signal: sig });
 
   sendBtn?.addEventListener('click', async () => {
     if (editingMsgId) await commitEdit();
     else              await sendMessage();
-  });
+  }, { signal: sig });
 
   input?.addEventListener('keydown', async e => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -4157,23 +4453,23 @@ export function setupLiveChat() {
       if (replyingTo)   { clearReply();     return; }
       clearPendingFiles();
     }
-  });
-  input?.addEventListener('input', () => { autoResizeInput(); onInputTyping(); });
+  }, { signal: sig });
+  input?.addEventListener('input', () => { autoResizeInput(); onInputTyping(); }, { signal: sig });
 
   attachBtn?.addEventListener('click', () => {
     if (fileInput) { fileInput.multiple = true; fileInput.accept = ACCEPTED_TYPES; fileInput.click(); }
-  });
+  }, { signal: sig });
   fileInput?.addEventListener('change', () => {
     Array.from(fileInput?.files || []).forEach(f => addPendingFile(f));
     if (fileInput) fileInput.value = '';
     if (editingMsgId !== null) renderEditMediaPreviews();
-  });
+  }, { signal: sig });
 
-  $('lc-reply-cancel')?.addEventListener('click', clearReply);
-  $('lc-edit-cancel')?.addEventListener('click', cancelEdit);
+  $('lc-reply-cancel')?.addEventListener('click', clearReply, { signal: sig });
+  $('lc-edit-cancel')?.addEventListener('click', cancelEdit, { signal: sig });
 
-  newMsgBar?.addEventListener('click', () => { scrollToLatest(true); hideNewMsgsBanner(); });
-  loadMore?.addEventListener('click', loadOlderMessages);
+  newMsgBar?.addEventListener('click', () => { scrollToLatest(true); hideNewMsgsBanner(); }, { signal: sig });
+  loadMore?.addEventListener('click', loadOlderMessages, { signal: sig });
 
   $('lc-messages-list')?.addEventListener('click', e => {
     const replyBtn     = e.target.closest('.lc-reply-btn');
@@ -4203,7 +4499,7 @@ export function setupLiveChat() {
         setTimeout(() => row.classList.remove('lc-msg-highlight'), 1500);
       }
     }
-  });
+  }, { signal: sig });
 
   // ML-04 + ML-05: rAF-throttled scroll handler; _isInitialLoading blocks pagination
   $('lc-messages-container')?.addEventListener('scroll', () => {
@@ -4220,7 +4516,7 @@ export function setupLiveChat() {
         }
       }
     });
-  }, { passive: true });
+  }, { passive: true, signal: sig });
 
   setupDragDrop();
   setupVoiceNote();
@@ -4228,4 +4524,164 @@ export function setupLiveChat() {
   window.addEventListener('beforeunload', () => {
     if (isOpen) markPresenceOffline();
   }, { signal: sig });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONE-TIME MIGRATION: fix messages whose mediaUrl / attachments[].url were
+// stored as "[object Object]" due to the uploadWithRetry return-type bug.
+//
+// Run once from the browser console (while signed in as admin or as the
+// original message sender) after deploying the Livechat.js fix:
+//
+//   import('/path/to/Livechat.js').then(m => m.repairBrokenMediaMessages())
+//   // or, if already loaded:
+//   window.__lcRepairMedia()
+//
+// The function:
+//   1. Scans every document in global_chat where mediaUrl === "[object Object]"
+//      OR any attachment url === "[object Object]".
+//   2. Marks those documents as deleted (isDeleted: true, text: null,
+//      mediaUrl: null, attachments: null) so they render as "Message deleted"
+//      instead of a broken black box.
+//
+// WHY mark-as-deleted instead of restoring the real URL?
+//   The real Cloudinary URL was never written to Firestore — only the string
+//   "[object Object]" was stored. The original File object is gone (it lived
+//   only in the browser session that sent the message). There is no record of
+//   the real URL anywhere server-side, so restoration is impossible.
+//   Marking as deleted is the cleanest UX: users see the standard "Message
+//   deleted" pill and can re-upload if needed.
+// ─────────────────────────────────────────────────────────────────────────────
+export async function repairBrokenMediaMessages() {
+  const BROKEN_STR = '[object Object]';
+
+  // A url value is broken if it is the string "[object Object]" OR if it is
+  // a plain object (meaning the { url, thumbnailUrl } result object was stored
+  // directly instead of its .url string).
+  const isBrokenUrl = (v) =>
+    v === BROKEN_STR || (v !== null && typeof v === 'object');
+
+  console.log('[lcRepair] Scanning global_chat for broken media …');
+
+  let snap;
+  try {
+    snap = await getDocs(collection(db, 'global_chat'));
+  } catch (err) {
+    console.error('[lcRepair] Could not read global_chat:', err);
+    return;
+  }
+
+  // Separate docs into two buckets:
+  //   repairable — has a nested object url we can unwrap to recover the real URL
+  //   deletable  — url is "[object Object]" string, real URL is unrecoverable
+  const toRepair = []; // { id, attachments, mediaUrl, mediaType, fileName, fileSize }
+  const toDelete = [];
+
+  snap.forEach(d => {
+    const data = d.data();
+    if (data.isDeleted) return;
+
+    const badMediaUrl     = data.mediaUrl != null && isBrokenUrl(data.mediaUrl);
+    const badAttachments  = Array.isArray(data.attachments) &&
+      data.attachments.some(a => a?.url != null && isBrokenUrl(a.url));
+    const badVoiceUrl     = data.voiceUrl != null && isBrokenUrl(data.voiceUrl);
+
+    if (!badMediaUrl && !badAttachments && !badVoiceUrl) return;
+
+    // Check if we can recover the real URL (nested object case)
+    const canRecover = (() => {
+      if (data.mediaUrl && typeof data.mediaUrl === 'object' && data.mediaUrl.url) return true;
+      if (data.voiceUrl && typeof data.voiceUrl === 'object' && data.voiceUrl.url) return true;
+      if (Array.isArray(data.attachments) &&
+          data.attachments.every(a => !isBrokenUrl(a?.url) || (typeof a.url === 'object' && a.url?.url)))
+        return true;
+      return false;
+    })();
+
+    if (canRecover) {
+      // Unwrap the nested objects to recover real URLs
+      const fixedAttachments = Array.isArray(data.attachments)
+        ? data.attachments.map(a => {
+            if (!a) return a;
+            let url = a.url;
+            let thumbnailUrl = a.thumbnailUrl ?? null;
+            if (url && typeof url === 'object') {
+              thumbnailUrl = thumbnailUrl ?? url.thumbnailUrl ?? null;
+              url = url.url ?? null;
+            }
+            return { ...a, url, thumbnailUrl };
+          })
+        : null;
+
+      const fixedMediaUrl = data.mediaUrl && typeof data.mediaUrl === 'object'
+        ? (data.mediaUrl.url ?? null)
+        : data.mediaUrl;
+
+      const fixedVoiceUrl = data.voiceUrl && typeof data.voiceUrl === 'object'
+        ? (data.voiceUrl.url ?? null)
+        : data.voiceUrl ?? null;
+
+      toRepair.push({ id: d.id, fixedAttachments, fixedMediaUrl, fixedVoiceUrl,
+        mediaType: data.mediaType, fileName: data.fileName, fileSize: data.fileSize });
+    } else {
+      toDelete.push(d.id);
+    }
+  });
+
+  const total = toRepair.length + toDelete.length;
+  if (!total) {
+    console.log('[lcRepair] No broken messages found. Nothing to do.');
+    return;
+  }
+
+  console.log(`[lcRepair] Found ${toRepair.length} recoverable, ${toDelete.length} unrecoverable.`);
+
+  let fixed = 0, failed = 0;
+
+  // Repair recoverable docs (unwrap nested url objects)
+  for (const { id, fixedAttachments, fixedMediaUrl, fixedVoiceUrl, mediaType, fileName, fileSize } of toRepair) {
+    try {
+      const first = fixedAttachments?.[0] ?? null;
+      const patch = {
+        mediaUrl:    fixedMediaUrl ?? first?.url ?? null,
+        mediaType:   mediaType     ?? first?.type ?? null,
+        fileName:    fileName      ?? first?.name ?? null,
+        fileSize:    fileSize      ?? first?.size ?? null,
+        attachments: fixedAttachments?.length ? fixedAttachments : null,
+      };
+      if (fixedVoiceUrl !== undefined) patch.voiceUrl = fixedVoiceUrl;
+      await updateDoc(doc(db, 'global_chat', id), patch);
+      console.log(`[lcRepair]  ✓ repaired: ${id}`);
+      fixed++;
+    } catch (err) {
+      console.error(`[lcRepair]  ✗ failed to repair ${id}:`, err.message);
+      failed++;
+    }
+  }
+
+  // Delete unrecoverable docs (real URL was never stored)
+  for (const id of toDelete) {
+    try {
+      await updateDoc(doc(db, 'global_chat', id), {
+        isDeleted: true, text: null, mediaUrl: null, mediaType: null,
+        fileName: null, fileSize: null, attachments: null, voiceUrl: null,
+      });
+      console.log(`[lcRepair]  ✓ marked deleted: ${id}`);
+      fixed++;
+    } catch (err) {
+      console.error(`[lcRepair]  ✗ failed to delete ${id}:`, err.message);
+      failed++;
+    }
+  }
+
+  console.log(`[lcRepair] Done. ${fixed} fixed/deleted, ${failed} failed.`);
+  if (failed) {
+    console.warn('[lcRepair] Failed docs may belong to another user. Sign in as admin and re-run, or delete them manually in the Firebase console.');
+  }
+}
+
+// Expose on window so it can be called directly from the browser console
+// without needing dynamic import:  window.__lcRepairMedia()
+if (typeof window !== 'undefined') {
+  window.__lcRepairMedia = repairBrokenMediaMessages;
 }

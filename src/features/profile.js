@@ -1,6 +1,7 @@
 import { db } from '../config/firebase.js';
 import { currentUser } from '../store/db.js';
 import { sanitize } from '../ui/templates.js';
+import { uploadImage } from '../utils/storage.js';
 import {
     doc, updateDoc, getDoc,
     collection, query, where, orderBy, getDocs
@@ -18,12 +19,147 @@ window.__registerPostRenderer = (renderFn, clickHandler) => {
 
 export function setupProfile() {
 
+    // ── Module-level state for the pending photo upload ────────────────────────
+    // Holds the Cloudinary URL once the user has selected + uploaded a new photo
+    // but before they hit "Save Changes".  Cleared after a successful form save.
+    let _pendingPhotoUrl = null;
+    // True while an upload is in flight — disables "Save Changes" to prevent
+    // saving before the URL is ready.
+    let _photoUploading  = false;
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    // Render the avatar element inside #profile-pic-avatar.
+    // Accepts a URL (photo) or null (fallback to initials).
+    function _renderOwnAvatar(photoUrl) {
+        const el = document.getElementById('profile-pic-avatar');
+        if (!el) return;
+        const initial = (currentUser?.name || 'U').charAt(0).toUpperCase();
+        if (photoUrl) {
+            el.style.background = 'none';
+            el.innerHTML = `
+                <img src="${sanitize(photoUrl)}" alt="${initial}"
+                     style="width:100%;height:100%;object-fit:cover;border-radius:50%;display:block"
+                     onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+                <span style="display:none;width:100%;height:100%;align-items:center;
+                             justify-content:center;font-size:2.4rem;font-weight:700;color:#fff">
+                    ${initial}
+                </span>`;
+        } else {
+            el.style.background = 'linear-gradient(135deg,#6366f1,#8b5cf6)';
+            el.textContent = initial;
+        }
+    }
+
+    // Pre-fill the edit form with the logged-in user's current data.
+    function _prefillForm() {
+        if (!currentUser) return;
+        _pendingPhotoUrl = null;
+        _photoUploading  = false;
+
+        const _set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
+        _set('profile-update-name',     currentUser.name);
+        _set('profile-update-major',    currentUser.major);
+        _set('profile-update-year',     currentUser.gradYear);
+        _set('profile-update-bio',      currentUser.bio);
+        _set('profile-update-skills',   (currentUser.skills || []).join(', '));
+        _set('profile-update-github',   currentUser.socialLinks?.github);
+        _set('profile-update-linkedin', currentUser.socialLinks?.linkedin);
+
+        _renderOwnAvatar(currentUser.picture || currentUser.photoURL || null);
+
+        const statusEl = document.getElementById('profile-pic-status');
+        if (statusEl) statusEl.textContent = '';
+    }
+
+    // ── Avatar click → open file picker ───────────────────────────────────────
+    const picWrapper = document.getElementById('profile-pic-wrapper');
+    const picInput   = document.getElementById('profile-pic-input');
+    const picOverlay = document.getElementById('profile-pic-overlay');
+
+    if (picWrapper && picInput) {
+        // Show camera overlay on hover
+        picWrapper.addEventListener('mouseenter', () => { if (picOverlay) picOverlay.style.opacity = '1'; });
+        picWrapper.addEventListener('mouseleave', () => { if (picOverlay) picOverlay.style.opacity = '0'; });
+        // Click → trigger file picker
+        picWrapper.addEventListener('click', () => picInput.click());
+
+        // File selected → preview immediately + upload in background
+        picInput.addEventListener('change', async () => {
+            const file = picInput.files?.[0];
+            if (!file) return;
+
+            // Validate: images only, max 8 MB
+            if (!file.type.startsWith('image/')) {
+                _setStatus('Only image files are allowed.', 'error');
+                return;
+            }
+            if (file.size > 8 * 1024 * 1024) {
+                _setStatus('Image must be under 8 MB.', 'error');
+                return;
+            }
+
+            // Show local blob preview immediately
+            const blobUrl = URL.createObjectURL(file);
+            _renderOwnAvatar(blobUrl);
+            _setStatus('Uploading…', 'info');
+            _photoUploading = true;
+
+            // Disable Save Changes while upload is in progress
+            const saveBtn = document.querySelector('#profile-update-form button[type="submit"]');
+            if (saveBtn) saveBtn.disabled = true;
+
+            try {
+                const uploadedUrl = await uploadImage(file, 'profile_pictures');
+                _pendingPhotoUrl = uploadedUrl;
+                // Switch preview from blob URL to permanent Cloudinary URL
+                URL.revokeObjectURL(blobUrl);
+                _renderOwnAvatar(uploadedUrl);
+                _setStatus('Photo ready — click Save Changes to apply.', 'success');
+            } catch (err) {
+                console.error('[profile] Photo upload failed:', err);
+                // Revert preview to whatever was there before
+                _renderOwnAvatar(currentUser?.picture || currentUser?.photoURL || null);
+                URL.revokeObjectURL(blobUrl);
+                _pendingPhotoUrl = null;
+                _setStatus('Upload failed. Please try again.', 'error');
+            } finally {
+                _photoUploading = false;
+                if (saveBtn) saveBtn.disabled = false;
+                // Reset the file input so the same file can be re-selected
+                picInput.value = '';
+            }
+        });
+    }
+
+    function _setStatus(msg, type) {
+        const el = document.getElementById('profile-pic-status');
+        if (!el) return;
+        el.textContent = msg;
+        el.style.color = type === 'error'   ? '#ef4444'
+                       : type === 'success' ? '#10b981'
+                       : '#6b7280';
+    }
+
+    // ── Pre-fill when the profile page becomes active ─────────────────────────
+    // Re-fill on every visit so data stays fresh after edits from elsewhere.
+    const _profileSection = document.getElementById('page-profile');
+    if (_profileSection) {
+        // MutationObserver watches for the 'hidden' class being removed (page shown)
+        new MutationObserver(() => {
+            if (!_profileSection.classList.contains('hidden')) _prefillForm();
+        }).observe(_profileSection, { attributes: true, attributeFilter: ['class'] });
+    }
+    // Also fill immediately in case the page is already visible on load
+    _prefillForm();
+
     // ==========================================
     // 1. UPDATE OWN PROFILE (The Form)
     // ==========================================
     document.getElementById('profile-update-form')?.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!currentUser) return;
+        if (_photoUploading) { _setStatus('Please wait — photo is still uploading.', 'error'); return; }
 
         const btn = e.target.querySelector('button[type="submit"]');
         btn.textContent = 'Saving...'; btn.disabled = true;
@@ -33,29 +169,40 @@ export function setupProfile() {
         const gradYear = document.getElementById('profile-update-year').value.trim();
         const bio      = document.getElementById('profile-update-bio').value.trim();
 
-        const skillsRaw  = document.getElementById('profile-update-skills')?.value || '';
+        const skillsRaw   = document.getElementById('profile-update-skills')?.value || '';
         const skillsArray = skillsRaw.split(',').map(s => s.trim().toLowerCase()).filter(s => s);
         const github   = document.getElementById('profile-update-github')?.value.trim()  || '';
         const linkedin = document.getElementById('profile-update-linkedin')?.value.trim() || '';
 
-        try {
-            await updateDoc(doc(db, 'users', currentUser.email), {
-                name, major, gradYear, bio,
-                skills: skillsArray,
-                socialLinks: { github, linkedin }
-            });
+        // Include the new photo URL only if one was uploaded in this session
+        const updatePayload = {
+            name, major, gradYear, bio,
+            skills: skillsArray,
+            socialLinks: { github, linkedin },
+        };
+        if (_pendingPhotoUrl) updatePayload.picture = _pendingPhotoUrl;
 
-            currentUser.name     = name;
-            currentUser.major    = major;
-            currentUser.gradYear = gradYear;
-            currentUser.bio      = bio;
-            currentUser.skills   = skillsArray;
+        try {
+            await updateDoc(doc(db, 'users', currentUser.email), updatePayload);
+
+            // Keep local currentUser in sync
+            currentUser.name        = name;
+            currentUser.major       = major;
+            currentUser.gradYear    = gradYear;
+            currentUser.bio         = bio;
+            currentUser.skills      = skillsArray;
             currentUser.socialLinks = { github, linkedin };
+            if (_pendingPhotoUrl) currentUser.picture = _pendingPhotoUrl;
+
+            _pendingPhotoUrl = null; // consumed
+            _setStatus('', '');
 
             const successMsg = document.getElementById('profile-update-success');
-            successMsg.textContent = 'Profile updated successfully!';
-            successMsg.classList.remove('hidden');
-            setTimeout(() => successMsg.classList.add('hidden'), 3000);
+            if (successMsg) {
+                successMsg.textContent = 'Profile updated successfully!';
+                successMsg.classList.remove('hidden');
+                setTimeout(() => successMsg.classList.add('hidden'), 3000);
+            }
 
         } catch (error) {
             console.error("Profile update failed:", error);
@@ -110,9 +257,23 @@ export function setupProfile() {
             }
 
             // ── Profile header HTML ───────────────────────────────────────
+            // FIX: user doc stores the profile photo under 'picture' (set from
+            // firebaseUser.photoURL in auth.js). Build an img tag when present,
+            // falling back to the gradient + initial avatar used everywhere else.
+            const _photoSrc = userData.picture || userData.photoURL || '';
+            const _initial  = (userData.name || 'U').charAt(0).toUpperCase();
+            const _avatarInner = _photoSrc
+                ? `<img src="${sanitize(_photoSrc)}" alt="${_initial}"
+                        style="width:100%;height:100%;object-fit:cover;border-radius:50%;display:block"
+                        onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+                  + `<span style="display:none;width:100%;height:100%;align-items:center;
+                                  justify-content:center;font-size:28px;font-weight:700;color:#fff">
+                         ${_initial}
+                     </span>`
+                : _initial;
             const profileCardHTML = `
                 <div class="up-profile-card">
-                    <div class="up-avatar">${(userData.name || 'U').charAt(0).toUpperCase()}</div>
+                    <div class="up-avatar" style="${_photoSrc ? 'background:none;overflow:hidden;padding:0' : ''}">${_avatarInner}</div>
                     <div class="up-info">
                         <h2 class="up-name">${sanitize(userData.name || 'Unknown')}</h2>
                         <p class="up-email">${sanitize(targetEmail)}</p>
@@ -280,6 +441,10 @@ function _injectProfileStyles() {
             background: #1c1c1f;
             border-color: #2a2a2e;
         }
+
+        /* ── Own-profile avatar picker ─── */
+        #profile-pic-wrapper:hover #profile-pic-overlay { opacity: 1 !important; }
+        #profile-pic-wrapper:hover #profile-pic-avatar  { filter: brightness(0.75); }
 
         /* ── Avatar ─── */
         .up-avatar {

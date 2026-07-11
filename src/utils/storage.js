@@ -8,12 +8,18 @@ function resourceTypeFor(file) {
     const type = file?.type || '';
     if (type.startsWith('image/')) return 'image';
     if (type.startsWith('video/')) return 'video';
+    if (type.startsWith('audio/')) return 'video';  // Cloudinary handles audio under the video API for streamable URLs
     return 'raw';
 }
 
 // ─── Image compression (uses browser-image-compression CDN lib) ───────────────
 async function compressImage(file) {
     if (!window.imageCompression) return file;
+    // Skip non-images, animated GIFs (compression flattens animation), and files
+    // already below the target size — re-encoding small files wastes CPU and can
+    // inflate PNG sizes due to format conversion overhead.
+    if (!file?.type?.startsWith('image/') || file.type === 'image/gif') return file;
+    if (file.size < 350 * 1024) return file;
     try {
         return await window.imageCompression(file, {
             maxSizeMB:        1,
@@ -129,9 +135,19 @@ export async function uploadToCloudinary(file, folder = 'uploads', opts = {}) {
 
             if (xhr.status >= 200 && xhr.status < 300 && data.secure_url) {
                 onProgress?.(100);
-                resolve(data.secure_url);
+                // For videos, derive a poster thumbnail via Cloudinary's so_0 transform.
+                // e.g. /video/upload/v123/file.mp4 → /video/upload/so_0/v123/file.jpg
+                let thumbnailUrl = null;
+                if (data.resource_type === 'video') {
+                    thumbnailUrl = data.secure_url
+                        .replace('/video/upload/', '/video/upload/so_0/')
+                        .replace(/\.[^.]+$/, '.jpg');
+                }
+                resolve({ url: data.secure_url, thumbnailUrl });
             } else {
-                reject(new Error(data.error?.message || `Upload failed (${xhr.status})`));
+                const uploadErr = new Error(data.error?.message || `Upload failed (${xhr.status})`);
+                uploadErr.status = xhr.status;   // propagate so uploadBytesWithRetry can skip retries on 4xx
+                reject(uploadErr);
             }
         };
 
@@ -145,7 +161,8 @@ export async function uploadImage(file, folder = 'uploads') {
     if (!file) return null;
     const compressed = await compressImage(file);
     try {
-        return await uploadToCloudinary(compressed, folder, { fileName: file.name });
+        const { url } = await uploadToCloudinary(compressed, folder, { fileName: file.name });
+        return url;
     } catch (err) {
         console.error('[storage] Image upload error:', err);
         throw err;
@@ -181,11 +198,11 @@ export async function uploadMediaFiles(files, folder = 'posts', onProgress) {
         if (isImage) toUpload = await compressImage(file);
 
         try {
-            const url = await uploadToCloudinary(toUpload, folder, {
+            const { url, thumbnailUrl } = await uploadToCloudinary(toUpload, folder, {
                 fileName:   file.name,
                 onProgress: (pct) => { progArr[i] = pct; reportProgress(); },
             });
-            results[i] = { url, type: isImage ? 'image' : isVideo ? 'video' : 'raw' };
+            results[i] = { url, type: isImage ? 'image' : isVideo ? 'video' : 'raw', ...(thumbnailUrl && { thumbnailUrl }) };
         } catch (err) {
             console.error(`[storage] Failed to upload file ${i} (${file.name}):`, err);
             results[i] = null;   // skip failed files, don't abort the whole batch
